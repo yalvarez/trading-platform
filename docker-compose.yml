@@ -1,0 +1,141 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: atp-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  # =========================
+  # MT5 ACCOUNTS (6)
+  # Each one exposes:
+  # - Web VNC: 3000
+  # - RPyC MT5 bridge: 8001
+  # =========================
+  mt5_acct1:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct1
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3001:3000"
+      - "8001:8001"
+    volumes:
+      - mt5_acct1_config:/config
+
+  mt5_acct2:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct2
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3002:3000"
+      - "8002:8001"
+    volumes:
+      - mt5_acct2_config:/config
+
+  mt5_acct3:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct3
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3003:3000"
+      - "8003:8001"
+    volumes:
+      - mt5_acct3_config:/config
+
+  mt5_acct4:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct4
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3004:3000"
+      - "8004:8001"
+    volumes:
+      - mt5_acct4_config:/config
+
+  mt5_acct5:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct5
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3005:3000"
+      - "8005:8001"
+    volumes:
+      - mt5_acct5_config:/config
+
+  mt5_acct6:
+    image: gmag11/metatrader5_vnc
+    container_name: atp-mt5-acct6
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3006:3000"
+      - "8006:8001"
+    volumes:
+      - mt5_acct6_config:/config
+
+  telegram_ingestor:
+    build: ./services/telegram_ingestor
+    container_name: atp-telegram-ingestor
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  router_parser:
+    build: ./services/router_parser
+    container_name: atp-router-parser
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  market_data:
+    build: ./services/market_data
+    container_name: atp-market-data
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - mt5_acct1
+    restart: unless-stopped
+
+  trade_orchestrator:
+    build: ./services/trade_orchestrator
+    container_name: atp-trade-orchestrator
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - mt5_acct1
+      - mt5_acct2
+      - mt5_acct3
+      - mt5_acct4
+      - mt5_acct5
+      - mt5_acct6
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  mt5_acct1_config:
+  mt5_acct2_config:
+  mt5_acct3_config:
+  mt5_acct4_config:
+  mt5_acct5_config:
+  mt5_acct6_config:

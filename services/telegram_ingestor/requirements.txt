@@ -1,0 +1,2 @@
+telethon==1.36.0
+redis==5.0.7
