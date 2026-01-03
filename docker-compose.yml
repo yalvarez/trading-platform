@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
@@ -103,6 +101,8 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    volumes:
+      - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
 
   router_parser:
     build:
@@ -138,11 +138,16 @@ services:
       - redis
       - mt5_acct1
       - mt5_acct2
-      - mt5_acct3
-      - mt5_acct4
-      - mt5_acct5
-      - mt5_acct6
     restart: unless-stopped
+    volumes:
+      - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /tmp/telegram_notifier.ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    ports:
+      - "8000:8000"
 
 volumes:
   redis_data:

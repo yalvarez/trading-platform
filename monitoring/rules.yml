@@ -1,0 +1,29 @@
+groups:
+  - name: trading_platform_alerts
+    rules:
+      - alert: InstanceDown
+        expr: up{job="trade_orchestrator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "trade_orchestrator instance down"
+          description: "Prometheus reports trade_orchestrator is down for more than 2 minutes."
+
+      - alert: ActiveTradesStuck
+        expr: increase(active_trades[5m]) > 0 and avg_over_time(active_trades[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Active trades for >10m"
+          description: "There are active trades for more than 10 minutes. Check trade manager."
+
+      - alert: PartialClosesSpike
+        expr: increase(trade_partial_closes_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in partial closes"
+          description: "More than 5 partial closes in 5m. Investigate trading behaviour."

@@ -8,6 +8,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import mt5_constants as mt5
+from prometheus_client import Counter, Gauge
+
+# Metrics
+TRADES_OPENED = Counter('trades_opened_total', 'Total trades opened')
+TP_HITS = Counter('trade_tp_hits_total', 'TP hits', ['tp'])
+PARTIAL_CLOSES = Counter('trade_partial_closes_total', 'Partial closes')
+ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
 
 @dataclass
 class ManagedTrade:
@@ -171,6 +178,11 @@ class TradeManager:
         self.group_addon_count.setdefault((account_name, gid), 0)
 
         print(f"[TM] ✅ registered ticket={tkt} acct={account_name} group={gid} provider={provider_tag} tps={tps} planned_sl={planned_sl}")
+        try:
+            TRADES_OPENED.inc()
+            ACTIVE_TRADES.set(len(self.trades))
+        except Exception:
+            pass
 
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
         t = self.trades.get(int(ticket))
@@ -223,7 +235,14 @@ class TradeManager:
                 if t.account_name != account["name"]:
                     continue
                 if ticket not in pos_by_ticket:
-                    del self.trades[ticket]
+                    try:
+                        del self.trades[ticket]
+                    except KeyError:
+                        pass
+            try:
+                ACTIVE_TRADES.set(len(self.trades))
+            except Exception:
+                pass
 
             # manage
             for ticket, t in list(self.trades.items()):
@@ -328,6 +347,10 @@ class TradeManager:
         ok = self.mt5.partial_close(account=account, ticket=int(ticket), percent=int(percent))
         if ok:
             print(f"[TM] 🎯 partial_close ticket={int(ticket)} percent={int(percent)} reason={reason}")
+            try:
+                PARTIAL_CLOSES.inc()
+            except Exception:
+                pass
         else:
             print(f"[TM] ❌ partial_close FAILED ticket={int(ticket)} percent={int(percent)} reason={reason}")
 
@@ -356,6 +379,10 @@ class TradeManager:
             pct = self.long_tp1_percent if long_mode else self.scalp_tp1_percent
             pct_eff = self._effective_close_percent(ticket=int(pos.ticket), desired_percent=int(pct))
             self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP1 ({pct}% -> {pct_eff}%)")
+            try:
+                TP_HITS.labels(tp='tp1').inc()
+            except Exception:
+                pass
 
             if self.enable_be_after_tp1 and pct_eff < 100:
                 self._do_be(account, pos.ticket, point, is_buy)
@@ -374,15 +401,27 @@ class TradeManager:
                 pct = self.long_tp2_percent
                 pct_eff = self._effective_close_percent(ticket=int(pos.ticket), desired_percent=int(pct))
                 self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP2 ({pct}% -> {pct_eff}%)")
+                try:
+                    TP_HITS.labels(tp='tp2').inc()
+                except Exception:
+                    pass
                 t.runner_enabled = True
             else:
                 pct = self.scalp_tp2_percent
                 self._do_partial_close(account, pos.ticket, pct, reason=f"TP2 ({pct}%)")
+                try:
+                    TP_HITS.labels(tp='tp2').inc()
+                except Exception:
+                    pass
 
         # TP3 (long)
         if long_mode and 3 not in t.tp_hit and len(t.tps) >= 3 and self._tp_hit(is_buy, current, float(t.tps[2]), buffer_price):
             t.tp_hit.add(3)
             self._do_partial_close(account, pos.ticket, 100, reason="TP3 (100%)")
+            try:
+                TP_HITS.labels(tp='tp3').inc()
+            except Exception:
+                pass
             return
 
         # Runner retrace

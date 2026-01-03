@@ -1,34 +1,103 @@
-import os, json, asyncio, logging
+import os, json, asyncio, logging, sys
 from common.config import Settings
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
 
 from mt5_executor import MT5Executor
 from trade_manager import TradeManager
+# Ensure services folder is on sys.path so sibling packages (telegram_ingestor) can be imported
+_svc_a = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+_svc_b = os.path.abspath(os.path.join(os.path.dirname(__file__), 'services'))
+if os.path.isdir(_svc_b):
+    sys.path.insert(0, _svc_b)
+elif os.path.isdir(_svc_a):
+    sys.path.insert(0, _svc_a)
+else:
+    # fallback: project root's services directory
+    _svc_c = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'services'))
+    if os.path.isdir(_svc_c):
+        sys.path.insert(0, _svc_c)
+import importlib.util
+
+# Try to dynamically load `services/telegram_ingestor/create_session.py` as a module
+tg_client = None
+try:
+    _tg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'telegram_ingestor', 'create_session.py'))
+    if os.path.exists(_tg_path):
+        spec = importlib.util.spec_from_file_location("telegram_create_session", _tg_path)
+        _mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_mod)
+        tg_client = getattr(_mod, 'client', None)
+except Exception:
+    tg_client = None
+from common.telegram_notifier import TelegramNotifier, NotificationConfig
+from prometheus_client import start_http_server
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log = logging.getLogger("trade_orchestrator")
 
-async def notifier(account_name: str, message: str):
-    # placeholder: aquí conectas Telegram notifier si quieres
-    log.info(f"[NOTIFY] {account_name}: {message}")
+class NotifierAdapter:
+    """Adapter exposing both async callable and notify() used across modules."""
+    def __init__(self, tg_notifier: TelegramNotifier):
+        self._tg = tg_notifier
+
+    async def __call__(self, account_name: str, message: str):
+        await self._tg.notify(account_name, message)
+
+    async def notify(self, account_name: str, message: str):
+        await self._tg.notify(account_name, message)
 
 async def main():
     s = Settings.load()
+    # start Prometheus metrics server
+    try:
+        metrics_port = int(os.getenv("METRICS_PORT", "8000"))
+        start_http_server(metrics_port)
+        log.info(f"Prometheus metrics server started on :{metrics_port}")
+    except Exception as e:
+        log.error(f"Failed to start Prometheus metrics server: {e}")
     r = await redis_client(s.redis_url)
     accounts = s.accounts()
+
+    # Initialize Telegram-based notifier (if configured)
+    notifier_adapter = None
+    if s.enable_notifications:
+        chat_list = os.getenv("TG_NOTIFY_TARGET") or os.getenv("TG_SOURCE_CHATS") or ""
+        first_chat = None
+        if chat_list:
+            try:
+                first_chat = int(chat_list.split(",")[0].strip())
+            except Exception:
+                first_chat = None
+
+        notify_configs = []
+        for a in accounts:
+            notify_configs.append(NotificationConfig(account_name=a.get("name"), chat_id=first_chat))
+
+        try:
+            tg_notifier = TelegramNotifier(tg_client, notify_configs)
+            notifier_adapter = NotifierAdapter(tg_notifier)
+            log.info("TelegramNotifier initialized")
+            # mark readiness for healthchecks
+            try:
+                with open('/tmp/telegram_notifier.ready', 'w', encoding='utf-8') as fh:
+                    fh.write('ready')
+            except Exception:
+                log.debug('Could not write readiness file for TelegramNotifier')
+        except Exception as e:
+            log.error(f"Failed to initialize TelegramNotifier: {e}")
 
     execu = MT5Executor(
         accounts,
         magic=987654,
-        notifier=notifier,
+        notifier=(notifier_adapter if notifier_adapter is not None else None),
         trading_windows=s.trading_windows,
         entry_wait_seconds=s.entry_wait_seconds,
         entry_poll_ms=s.entry_poll_ms,
         entry_buffer_points=s.entry_buffer_points,
     )
 
-    tm = TradeManager(execu, notifier=None)  # si quieres, pásale notifier real
+    tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None))  # attach notifier if available
 
     async def handle_signal(fields: dict):
         if not in_windows(parse_windows(s.trading_windows)):
@@ -67,6 +136,31 @@ async def main():
                 tps=tps,
                 planned_sl=float(sl) if sl else None,
             )
+
+        # Notify trade opened (friendly message) if notifier available
+        if notifier_adapter is not None:
+            try:
+                entry_price = None
+                if entry_tuple:
+                    entry_price = (float(entry_tuple[0]) + float(entry_tuple[1])) / 2.0
+                hint_price = float(fields.get("hint_price")) if fields.get("hint_price") else None
+                use_price = entry_price if entry_price is not None else hint_price or 0.0
+                for acct_name, ticket in res.tickets_by_account.items():
+                    asyncio.create_task(
+                        tg_notifier.notify_trade_opened(
+                            account_name=acct_name,
+                            ticket=ticket,
+                            symbol=symbol,
+                            direction=direction,
+                            entry_price=use_price,
+                            sl_price=float(sl) if sl else None,
+                            tp_prices=tps,
+                            lot=0.0,
+                            provider=provider_tag,
+                        )
+                    )
+            except Exception as e:
+                log.exception("failed to send trade_opened notifications: %s", e)
 
         if res.errors_by_account:
             await xadd(r, Streams.EVENTS, {"type":"open_errors", "errors": json.dumps(res.errors_by_account)})

@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'trade_orchestrator'
+    static_configs:
+      - targets: ['trade_orchestrator:8000']
+
+rule_files:
+  - '/etc/prometheus/rules/rules.yml'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']

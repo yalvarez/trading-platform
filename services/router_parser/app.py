@@ -1,93 +1,94 @@
 import os, re, json, logging
 from common.config import Settings
 from common.redis_streams import redis_client, xadd, xread_loop, Streams
+from common.signal_dedup import SignalDeduplicator
 from gb_filters import looks_like_followup
 from torofx_filters import looks_like_torofx_management
+from parsers_base import SignalParser, ParseResult
+from parsers_goldbro_fast import GoldBroFastParser
+from parsers_goldbro_long import GoldBroLongParser
+from parsers_goldbro_scalp import GoldBroScalpParser
+from parsers_torofx import ToroFxParser
+from parsers_daily_signal import DailySignalParser
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log = logging.getLogger("router_parser")
 
-def parse_signal(text: str) -> dict | None:
-    """
-    Parse MUY básico (placeholder). Tú lo irás refinando por proveedor:
-    - detect BUY/SELL + XAUUSD
-    - detect range @a-b
-    - SL
-    - TP1/TP2/TP3
-    """
-    up = (text or "").upper()
-
-    # símbolo
-    symbol = "XAUUSD" if ("XAU" in up or "ORO" in up) else None
-    if not symbol:
+class SignalRouter:
+    def __init__(self, redis_client, dedup_ttl=120.0):
+        self.parsers = [
+            DailySignalParser(),
+            ToroFxParser(),
+            GoldBroScalpParser(),
+            GoldBroLongParser(),
+            GoldBroFastParser(),
+        ]
+        self.deduplicator = SignalDeduplicator(redis_client, ttl_seconds=dedup_ttl)
+    
+    def parse_signal(self, text):
+        norm = text.strip()
+        for parser in self.parsers:
+            try:
+                result = parser.parse(norm)
+                if result:
+                    log.debug(f"[PARSE] {parser.format_tag} matched")
+                    return result
+            except Exception as e:
+                log.warning(f"[PARSE_ERROR] {parser.__class__.__name__}: {e}")
+                continue
         return None
-
-    direction = None
-    if "COMPRA" in up or "BUY" in up:
-        direction = "BUY"
-    if "VENDE" in up or "VENDER" in up or "SELL" in up:
-        direction = "SELL"
-
-    if not direction:
-        return None
-
-    m_range = re.search(r"@\s*(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", text)
-    entry_range = None
-    if m_range:
-        a = float(m_range.group(1)); b = float(m_range.group(2))
-        entry_range = (min(a,b), max(a,b))
-
-    m_sl = re.search(r"\bSL\s*[: ]?\s*(\d+(?:\.\d+)?)", up)
-    sl = float(m_sl.group(1)) if m_sl else None
-
-    tps = []
-    for k in ["TP1","TP2","TP3"]:
-        m = re.search(rf"\b{k}\s*[: ]?\s*(\d+(?:\.\d+)?)", up)
-        if m:
-            tps.append(float(m.group(1)))
-
-    # Requerimos al menos rango o SL para considerarlo “señal formal”
-    if entry_range is None and sl is None:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry_range": json.dumps(entry_range) if entry_range else "",
-        "sl": str(sl) if sl is not None else "",
-        "tps": json.dumps(tps),
-        "provider_tag": "GB_LONG" if len(tps) >= 3 else "GB_SCALP",
-        "fast": "false",
-    }
+    
+    def process_raw_signal(self, chat_id, text):
+        parse_result = self.parse_signal(text)
+        if not parse_result:
+            return None
+        
+        if self.deduplicator.is_duplicate(chat_id, parse_result):
+            log.info(f"[DEDUP] {parse_result.provider_tag}")
+            return None
+        
+        entry_range = json.dumps(parse_result.entry_range) if parse_result.entry_range else ""
+        tps = parse_result.tps or []
+        
+        return {
+            "symbol": parse_result.symbol,
+            "direction": parse_result.direction,
+            "entry_range": entry_range,
+            "sl": str(parse_result.sl) if parse_result.sl is not None else "",
+            "tps": json.dumps(tps),
+            "provider_tag": parse_result.provider_tag,
+            "format_tag": parse_result.format_tag,
+            "fast": "true" if parse_result.is_fast else "false",
+            "hint_price": str(parse_result.hint_price) if parse_result.hint_price else "",
+        }
 
 async def main():
     s = Settings.load()
     r = await redis_client(s.redis_url)
-
+    router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds)
+    
     async for msg_id, fields in xread_loop(r, Streams.RAW, last_id="$"):
         text = fields.get("text","")
         chat_id = fields.get("chat_id","")
-        # 1) Filtra followups GB que NO deben abrir trades
+        
         if looks_like_followup(text):
             await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
-            log.info("[MGMT] GB follow-up routed (no open).")
+            log.info("[MGMT] GB follow-up")
             continue
-
-        # 2) TOROFX management
+        
         if looks_like_torofx_management(text):
             await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
-            log.info("[MGMT] TOROFX management routed.")
+            log.info("[MGMT] TOROFX")
             continue
-
-        # 3) Señal
-        sig = parse_signal(text)
+        
+        sig = router.process_raw_signal(chat_id, text)
         if sig:
             sig["chat_id"] = chat_id
             sig["raw_text"] = text
             await xadd(r, Streams.SIGNALS, sig)
             log.info(f"[SIGNAL] {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
         else:
-            log.info("[DROP] Not recognized.")
+            log.debug("[DROP]")
 
 if __name__ == "__main__":
     import asyncio
