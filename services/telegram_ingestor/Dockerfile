@@ -4,4 +4,6 @@ COPY services/telegram_ingestor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY services/common ./common
 COPY services/telegram_ingestor/app.py .
+COPY services/telegram_ingestor/telegram_ingestor.session .
+
 CMD ["python", "app.py"]

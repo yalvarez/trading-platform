@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import asyncio, time, re
 
 from common.timewindow import parse_windows, in_windows
-from .mt5_client import MT5Client
+from mt5_client import MT5Client
 
 @dataclass
 class MT5OpenResult:

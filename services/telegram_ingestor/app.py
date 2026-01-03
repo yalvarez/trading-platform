@@ -15,7 +15,7 @@ async def main():
     phone = env("TG_PHONE")
     chats = [c.strip() for c in env("TG_SOURCE_CHATS","").split(",") if c.strip()]
 
-    client = TelegramClient("session_ingestor", api_id, api_hash)
+    client = TelegramClient("telegram_ingestor", api_id, api_hash)
 
     @client.on(events.NewMessage)
     async def handler(event):

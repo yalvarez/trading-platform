@@ -20,13 +20,18 @@ services:
     image: gmag11/metatrader5_vnc
     container_name: atp-mt5-acct1
     environment:
-      - CUSTOM_USER=${MT5_WEB_USER}
-      - PASSWORD=${MT5_WEB_PASS}
+      - CUSTOM_USER=yalvarezc
+      - PASSWORD=mt5VNCP@ss19375
     ports:
       - "3001:3000"
       - "8001:8001"
     volumes:
       - mt5_acct1_config:/config
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8001"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
 
   mt5_acct2:
     image: gmag11/metatrader5_vnc

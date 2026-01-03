@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-import MetaTrader5 as mt5
+import mt5_constants as mt5
 
 @dataclass
 class ManagedTrade:
@@ -208,7 +208,7 @@ class TradeManager:
             if not self.mt5.connect_to_account(account):
                 continue
 
-            positions = mt5.positions_get()
+            positions = self.mt5.positions_get()
             if not positions:
                 for ticket in list(self.trades.keys()):
                     if self.trades[ticket].account_name == account["name"]:
@@ -236,8 +236,8 @@ class TradeManager:
                 if pos.magic != self.mt5.magic:
                     continue
 
-                info = mt5.symbol_info(t.symbol)
-                tick = mt5.symbol_info_tick(t.symbol)
+                info = self.mt5.symbol_info(t.symbol)
+                tick = self.mt5.symbol_info_tick(t.symbol)
                 if not info or not tick:
                     continue
 
@@ -273,7 +273,7 @@ class TradeManager:
         return current <= (tp + buffer_price)
 
     def _do_be(self, account: dict, ticket: int, point: float, is_buy: bool):
-        pos_list = mt5.positions_get(ticket=int(ticket))
+        pos_list = self.mt5.positions_get(ticket=int(ticket))
         if not pos_list:
             return
         pos = pos_list[0]
@@ -282,26 +282,26 @@ class TradeManager:
         be = (entry + offset) if is_buy else (entry - offset)
 
         req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(ticket), "sl": float(be), "tp": 0.0}
-        res = mt5.order_send(req)
+        res = self.mt5.order_send(req)
         ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
         if ok:
             self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
         else:
             self._notify_bg(
                 account["name"],
-                f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}\nlast_error={mt5.last_error()}"
+                f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
             )
 
     def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
         if desired_percent >= 100:
             return 100
 
-        pos_list = mt5.positions_get(ticket=int(ticket))
+        pos_list = self.mt5.positions_get(ticket=int(ticket))
         if not pos_list:
             return desired_percent
         pos = pos_list[0]
 
-        info = mt5.symbol_info(pos.symbol)
+        info = self.mt5.symbol_info(pos.symbol)
         if not info:
             return desired_percent
 
@@ -438,8 +438,8 @@ class TradeManager:
         if (not is_buy) and current >= sl - (2.0 * buffer_price):
             return
 
-        info = mt5.symbol_info(t.symbol)
-        tick = mt5.symbol_info_tick(t.symbol)
+        info = self.mt5.symbol_info(t.symbol)
+        tick = self.mt5.symbol_info_tick(t.symbol)
         if not info or not tick:
             return
 
@@ -483,7 +483,7 @@ class TradeManager:
         }
 
         send = getattr(self.mt5, "_order_send_with_filling_fallback", None)
-        res = send(req) if callable(send) else mt5.order_send(req)
+        res = send(req) if callable(send) else self.mt5.order_send(req)
 
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             addon_ticket = int(res.order)
@@ -542,7 +542,7 @@ class TradeManager:
             return
 
         req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(pos.ticket), "sl": float(new_sl), "tp": 0.0}
-        res = mt5.order_send(req)
+        res = self.mt5.order_send(req)
         ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
 
         if ok:
@@ -607,7 +607,7 @@ class TradeManager:
             if not self.mt5.connect_to_account(account):
                 continue
 
-            positions = mt5.positions_get()
+            positions = self.mt5.positions_get()
             if not positions:
                 continue
             pos_by_ticket = {p.ticket: p for p in positions}
@@ -627,7 +627,7 @@ class TradeManager:
                     if not pos or pos.magic != self.mt5.magic:
                         continue
 
-                    info = mt5.symbol_info(t.symbol)
+                    info = self.mt5.symbol_info(t.symbol)
                     if not info:
                         continue
                     point = float(info.point)
@@ -694,7 +694,7 @@ class TradeManager:
                     if not pos or pos.magic != self.mt5.magic:
                         continue
 
-                    info = mt5.symbol_info(t.symbol)
+                    info = self.mt5.symbol_info(t.symbol)
                     if not info:
                         continue
                     point = float(info.point)
