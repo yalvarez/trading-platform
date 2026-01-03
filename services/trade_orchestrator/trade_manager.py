@@ -9,7 +9,6 @@ from typing import Optional
 
 import MetaTrader5 as mt5
 
-
 @dataclass
 class ManagedTrade:
     account_name: str
