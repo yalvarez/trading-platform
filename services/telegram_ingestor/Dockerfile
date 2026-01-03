@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 WORKDIR /app
-COPY requirements.txt .
+COPY services/telegram_ingestor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY ../common ./common
-COPY app.py .
+COPY services/common ./common
+COPY services/telegram_ingestor/app.py .
 CMD ["python", "app.py"]

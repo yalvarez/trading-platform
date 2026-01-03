@@ -89,7 +89,9 @@ services:
       - mt5_acct6_config:/config
 
   telegram_ingestor:
-    build: ./services/telegram_ingestor
+    build:
+      context: .
+      dockerfile: services/telegram_ingestor/Dockerfile
     container_name: atp-telegram-ingestor
     env_file:
       - .env
@@ -98,7 +100,9 @@ services:
     restart: unless-stopped
 
   router_parser:
-    build: ./services/router_parser
+    build:
+      context: .
+      dockerfile: services/router_parser/Dockerfile
     container_name: atp-router-parser
     env_file:
       - .env
@@ -107,7 +111,9 @@ services:
     restart: unless-stopped
 
   market_data:
-    build: ./services/market_data
+    build:
+      context: .
+      dockerfile: services/market_data/Dockerfile
     container_name: atp-market-data
     env_file:
       - .env
@@ -117,7 +123,9 @@ services:
     restart: unless-stopped
 
   trade_orchestrator:
-    build: ./services/trade_orchestrator
+    build:
+      context: .
+      dockerfile: services/trade_orchestrator/Dockerfile
     container_name: atp-trade-orchestrator
     env_file:
       - .env
