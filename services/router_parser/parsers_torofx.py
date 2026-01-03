@@ -6,24 +6,28 @@ Also handles position management commands: "tomar parcial", "cierro mi entrada",
 import re
 from typing import Optional
 from parsers_base import SignalParser, ParseResult
+import logging
+
+log = logging.getLogger("router_parser")
 
 
 class ToroFxParser(SignalParser):
     format_tag = "TOROFX"
     
-    # ToroFX signals mention specific brokers or FOREX pairs (not gold)
-    SYMBOL_PATTERN = re.compile(r'\b(eur|gbp|usd|nzd|cad|jpy|aud|chf)\w*\b', re.IGNORECASE)
+    # ToroFX signals mention currency pairs and sometimes crypto (BTC/ETH)
+    # Soporta símbolos con barra (XAU/USD, BTC/USD, etc) y sin barra
+    SYMBOL_PATTERN = re.compile(r'([A-Z]{3,5}/[A-Z]{3,5}|[A-Z]{6,7}|eur|gbp|usd|nzd|cad|jpy|aud|chf|btc|eth)', re.IGNORECASE)
     BUY_PATTERN = re.compile(r'\bBUY\b', re.IGNORECASE)
     SELL_PATTERN = re.compile(r'\bSELL\b', re.IGNORECASE)
     
-    # Entry: 1.2500-1.2510
+    # Entry: 1.2500-1.2510 or integers like 90000-90200
     ENTRY_PATTERN = re.compile(
-        r'entry[\s:]*(\d+\.\d{3,5})\s*[-–]\s*(\d+\.\d{3,5})',
+        r'entry[\s:]*(\d+(?:\.\d{1,5})?)\s*[-–]\s*(\d+(?:\.\d{1,5})?)',
         re.IGNORECASE
     )
     
-    # SL: 1.2490
-    SL_PATTERN = re.compile(r'sl[\s:]*(\d+\.\d{3,5})', re.IGNORECASE)
+    # SL: 1.2490 o Stop Loss: 1.2490
+    SL_PATTERN = re.compile(r'(?:sl|stop\s*loss)[\s:]*(\d+(?:\.\d{1,5})?)', re.IGNORECASE)
     
     # TP: 1.2550, 1.2600
     TP_PATTERN = re.compile(r'tp[\s:]*(\d+\.\d{3,5})', re.IGNORECASE)
@@ -38,14 +42,17 @@ class ToroFxParser(SignalParser):
     
     def parse(self, text: str) -> Optional[ParseResult]:
         norm = self.normalize(text)
+        log.debug("[TOROFX_PARSE] norm=%r", norm[:400])
         
         # Check for management commands first (these are not entry signals)
         if self.PARTIAL_PATTERN.search(norm) or (self.CLOSE_PATTERN.search(norm) and not self.BUY_PATTERN.search(norm) and not self.SELL_PATTERN.search(norm)):
-            # These should be handled as management messages, not entry signals
+            log.debug("[TOROFX_PARSE] management command detected")
             return None
         
         # Must have a known currency pair
-        if not self.SYMBOL_PATTERN.search(norm):
+        has_symbol = bool(self.SYMBOL_PATTERN.search(norm))
+        log.debug("[TOROFX_PARSE] has_symbol=%s", has_symbol)
+        if not has_symbol:
             return None
         
         # Must have direction
@@ -54,14 +61,28 @@ class ToroFxParser(SignalParser):
         if not (is_buy or is_sell):
             return None
         
-        # Must have entry range
+        # Must have entry range (allow integer ranges or decimal ranges)
         entry_match = self.ENTRY_PATTERN.search(norm)
+        if not entry_match:
+            alt = re.search(r'@?(\d+(?:\.\d{1,5})?)\s*[-–]\s*(\d+(?:\.\d{1,5})?)', norm)
+            if alt:
+                entry_match = alt
+        # fallback: single entry price like 'Entry Price: 90187' or 'Entry: 1.2500'
+        single_entry = None
+        if not entry_match:
+            se = re.search(r'entry(?:\s*price)?[\s:\-]*@?(\d+(?:\.\d{1,5})?)', norm, re.IGNORECASE)
+            if se:
+                single_entry = float(se.group(1))
+                entry_match = se
+
+        log.debug("[TOROFX_PARSE] entry_match=%s single_entry=%s", bool(entry_match), single_entry)
         if not entry_match:
             return None
         
         try:
+            # if single entry, group(2) may be None; treat as range with same value
             entry_min = float(entry_match.group(1))
-            entry_max = float(entry_match.group(2))
+            entry_max = float(entry_match.group(2)) if entry_match.lastindex and entry_match.lastindex >= 2 and entry_match.group(2) else entry_min
         except (ValueError, IndexError):
             return None
         
@@ -84,11 +105,15 @@ class ToroFxParser(SignalParser):
             except (ValueError, IndexError):
                 pass
         
-        # Extract symbol from text (e.g., EURUSD, GBPUSD)
-        symbol_match = re.search(r'\b([A-Z]{3}[A-Z]{3})\b', norm.upper())
-        symbol = symbol_match.group(1) if symbol_match else "EURUSD"
+        # Extraer símbolo: XAU/USD, BTC/USD, EURUSD, etc
+        symbol_match = re.search(r'([A-Z]{3,5}/[A-Z]{3,5}|[A-Z]{6,7})', norm.upper())
+        symbol = symbol_match.group(1).replace("/", "") if symbol_match else "EURUSD"
         
         direction = "BUY" if is_buy else "SELL"
+        # Si Target: open, no hay TP
+        if re.search(r'target\s*:\s*open', norm, re.IGNORECASE):
+            tps = []
+
         return ParseResult(
             format_tag=self.format_tag,
             provider_tag="TOROFX",

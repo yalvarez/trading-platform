@@ -9,6 +9,9 @@ from typing import Optional
 
 import mt5_constants as mt5
 from prometheus_client import Counter, Gauge
+import logging
+
+log = logging.getLogger("trade_orchestrator.trade_manager")
 
 # Metrics
 TRADES_OPENED = Counter('trades_opened_total', 'Total trades opened')
@@ -139,7 +142,7 @@ class TradeManager:
         try:
             asyncio.create_task(self.notifier.notify(account_name, message))
         except RuntimeError:
-            print(f"[NOTIFY][NO_LOOP] {account_name}: {message}")
+            log.warning("[NOTIFY][NO_LOOP] %s: %s", account_name, message)
 
     # ----------------------------
     # Register
@@ -177,7 +180,7 @@ class TradeManager:
 
         self.group_addon_count.setdefault((account_name, gid), 0)
 
-        print(f"[TM] ✅ registered ticket={tkt} acct={account_name} group={gid} provider={provider_tag} tps={tps} planned_sl={planned_sl}")
+        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", tkt, account_name, gid, provider_tag, tps, planned_sl)
         try:
             TRADES_OPENED.inc()
             ACTIVE_TRADES.set(len(self.trades))
@@ -305,11 +308,13 @@ class TradeManager:
         ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
         if ok:
             self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
+            log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
         else:
             self._notify_bg(
                 account["name"],
                 f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
             )
+            log.warning("[TM] BE failed ticket=%s retcode=%s comment=%s", int(ticket), getattr(res,'retcode',None), getattr(res,'comment',None))
 
     def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
         if desired_percent >= 100:
@@ -346,13 +351,13 @@ class TradeManager:
     def _do_partial_close(self, account: dict, ticket: int, percent: int, reason: str):
         ok = self.mt5.partial_close(account=account, ticket=int(ticket), percent=int(percent))
         if ok:
-            print(f"[TM] 🎯 partial_close ticket={int(ticket)} percent={int(percent)} reason={reason}")
+            log.info("[TM] 🎯 partial_close ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
             try:
                 PARTIAL_CLOSES.inc()
             except Exception:
                 pass
         else:
-            print(f"[TM] ❌ partial_close FAILED ticket={int(ticket)} percent={int(percent)} reason={reason}")
+            log.warning("[TM] ❌ partial_close FAILED ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
 
     # ----------------------------
     # TP / Runner / BE
@@ -587,7 +592,7 @@ class TradeManager:
         if ok:
             t.last_trailing_sl = float(new_sl)
             t.last_trailing_ts = now
-            print(f"[TM] 🔄 trailing update ticket={pos.ticket} sl={new_sl:.5f}")
+            log.info("[TM] 🔄 trailing update ticket=%s sl=%.5f", int(pos.ticket), new_sl)
             self._notify_bg(account["name"], f"🔄 Trailing actualizado | Ticket: {int(pos.ticket)} | SL: {new_sl:.5f}")
 
     # ======================================================================

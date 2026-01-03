@@ -13,5 +13,6 @@ COPY services/trade_orchestrator/mt5_client.py .
 COPY services/trade_orchestrator/mt5_executor.py .
 COPY services/trade_orchestrator/mt5_constants.py .
 COPY services/trade_orchestrator/trade_manager.py .
+COPY services/trade_orchestrator/introspect_mt5_rpyc.py .
 
 CMD ["python", "app.py"]

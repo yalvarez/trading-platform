@@ -19,7 +19,7 @@ class GoldBroFastParser(SignalParser):
     SELL_PATTERN = re.compile(r'\b(vende|vender|vendan|venta|sell|short|salida)\b', re.IGNORECASE)
     
     # Must indicate urgency
-    URGENCY_PATTERN = re.compile(r'\b(ahora|now|ya|inmediato|asap)\b', re.IGNORECASE)
+    URGENCY_PATTERN = re.compile(r'\b(ahora|now|ya|inmediato|asap|de\s+nuevo|nuevamente)\b', re.IGNORECASE)
     
     # Optional hint price (3-5 digit number)
     PRICE_PATTERN = re.compile(r'\b(\d{3,5}(?:\.\d{1,2})?)\b')

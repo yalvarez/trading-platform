@@ -7,6 +7,9 @@ import hashlib
 import time
 from typing import Optional
 from redis import Redis
+import logging
+
+log = logging.getLogger("router_parser.dedup")
 
 
 class SignalDeduplicator:
@@ -44,22 +47,30 @@ class SignalDeduplicator:
         raw = "|".join(parts)
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
     
-    def is_duplicate(self, chat_id: str, parse_result) -> bool:
+    async def is_duplicate(self, chat_id: str, parse_result) -> bool:
         """
         Check if signal was already seen recently.
         Returns True if duplicate, False if new signal.
         """
         sig = self._signature_from_parse_result(chat_id, parse_result)
         redis_key = f"{self.key_prefix}{sig}"
-        
-        # Check if exists
-        exists = self.redis.exists(redis_key) > 0
-        
-        if exists:
+
+        # Check if exists (async)
+        try:
+            exists = await self.redis.exists(redis_key)
+        except Exception as e:
+            log.warning("[DEDUP] exists check failed sig=%s err=%s", sig, e)
+            exists = 0
+
+        if exists and int(exists) > 0:
+            log.debug("[DEDUP] duplicate chat=%s sig=%s", chat_id, sig)
             return True  # Duplicate
-        
+
         # Mark as seen with TTL
-        self.redis.setex(redis_key, int(self.ttl_seconds), "1")
+        try:
+            await self.redis.setex(redis_key, int(self.ttl_seconds), "1")
+        except Exception as e:
+            log.warning("[DEDUP] failed to setex sig=%s err=%s", sig, e)
         return False  # New signal
     
     def cleanup(self) -> int:

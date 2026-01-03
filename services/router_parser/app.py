@@ -1,4 +1,4 @@
-import os, re, json, logging
+import os, re, json, logging, uuid
 from common.config import Settings
 from common.redis_streams import redis_client, xadd, xread_loop, Streams
 from common.signal_dedup import SignalDeduplicator
@@ -36,15 +36,16 @@ class SignalRouter:
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] {parser.__class__.__name__}: {e}")
                 continue
+        log.debug("[PARSE] no parser matched")
         return None
     
-    def process_raw_signal(self, chat_id, text):
+    async def process_raw_signal(self, chat_id, text):
         parse_result = self.parse_signal(text)
         if not parse_result:
             return None
-        
-        if self.deduplicator.is_duplicate(chat_id, parse_result):
-            log.info(f"[DEDUP] {parse_result.provider_tag}")
+
+        if await self.deduplicator.is_duplicate(chat_id, parse_result):
+            log.info("[DEDUP] %s", parse_result.provider_tag)
             return None
         
         entry_range = json.dumps(parse_result.entry_range) if parse_result.entry_range else ""
@@ -70,6 +71,7 @@ async def main():
     async for msg_id, fields in xread_loop(r, Streams.RAW, last_id="$"):
         text = fields.get("text","")
         chat_id = fields.get("chat_id","")
+        log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])
         
         if looks_like_followup(text):
             await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
@@ -81,14 +83,16 @@ async def main():
             log.info("[MGMT] TOROFX")
             continue
         
-        sig = router.process_raw_signal(chat_id, text)
+        sig = await router.process_raw_signal(chat_id, text)
         if sig:
+            trace_id = uuid.uuid4().hex[:8]
             sig["chat_id"] = chat_id
             sig["raw_text"] = text
+            sig["trace"] = trace_id
             await xadd(r, Streams.SIGNALS, sig)
-            log.info(f"[SIGNAL] {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
+            log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
         else:
-            log.debug("[DROP]")
+            log.debug("[DROP] chat=%s parsed=None", chat_id)
 
 if __name__ == "__main__":
     import asyncio

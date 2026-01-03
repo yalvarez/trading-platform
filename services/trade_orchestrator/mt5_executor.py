@@ -4,6 +4,9 @@ from typing import Optional, Tuple
 import asyncio, time, re
 
 from common.timewindow import parse_windows, in_windows
+import logging
+
+log = logging.getLogger("trade_orchestrator.mt5_executor")
 from mt5_client import MT5Client
 
 @dataclass
@@ -83,6 +86,8 @@ class MT5Executor:
         tickets: dict[str, int] = {}
         errors: dict[str, str] = {}
 
+        log.info("open_complete_trade start provider=%s symbol=%s direction=%s entry=%s sl=%s tps=%s", provider_tag, symbol, direction, str(entry_range), str(sl), str(tps))
+
         # ✅ No intentar ni conectar fuera de horario
         if not self._should_operate_now():
             reason = "Outside trading windows (London/NY)."
@@ -125,7 +130,9 @@ class MT5Executor:
             res = client.order_send(req)
             if res and getattr(res, "retcode", None) == 10009:  # DONE
                 tickets[name] = int(getattr(res, "order", 0))
+                log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
             else:
                 errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
 
         return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)

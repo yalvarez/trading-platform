@@ -33,7 +33,7 @@ async def main():
                 "text": text
             }
             await xadd(r, Streams.RAW, payload)
-            log.info(f"[RAW] chat={chat_id} msg_id={event.id} len={len(text)}")
+            log.info(f"[RAW] chat={chat_id} msg_id={event.id} len={len(text)} :: {text.replace(chr(10), ' | ')}")
         except Exception as e:
             log.exception(e)
 

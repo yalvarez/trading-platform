@@ -1,4 +1,4 @@
-import os, json, asyncio, logging, sys
+import os, json, asyncio, logging, sys, uuid
 from common.config import Settings
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
@@ -100,9 +100,11 @@ async def main():
     tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None))  # attach notifier if available
 
     async def handle_signal(fields: dict):
+        trace_id = uuid.uuid4().hex[:8]
+        log.info("[SIGNAL] recv trace=%s fields=%s", trace_id, json.dumps(fields, ensure_ascii=False))
         if not in_windows(parse_windows(s.trading_windows)):
-            log.info("[SKIP] signal outside windows (no connect).")
-            await xadd(r, Streams.EVENTS, {"type":"skip", "reason":"outside_windows"})
+            log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
+            await xadd(r, Streams.EVENTS, {"type":"skip", "reason":"outside_windows", "trace": trace_id})
             return
 
         symbol = fields.get("symbol")
@@ -116,6 +118,7 @@ async def main():
         # ✅ wait 60s for price to enter range (if provided)
         # For scaffold simplicity, we skip the async price wait here; you can hook it in next iteration.
 
+        log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s entry=%s sl=%s tps=%s", trace_id, provider_tag, symbol, direction, str(entry_tuple), str(sl), str(tps))
         res = execu.open_complete_trade(
             provider_tag=provider_tag,
             symbol=symbol,
@@ -125,8 +128,11 @@ async def main():
             tps=tps,
         )
 
+        log.info("[SIGNAL] open_complete_trade done trace=%s tickets=%s errors=%s", trace_id, json.dumps(res.tickets_by_account), json.dumps(res.errors_by_account))
+
         # register opened
         for acct_name, ticket in res.tickets_by_account.items():
+            log.info("[SIGNAL] registering trade trace=%s acct=%s ticket=%s symbol=%s", trace_id, acct_name, ticket, symbol)
             tm.register_trade(
                 account_name=acct_name,
                 ticket=ticket,
@@ -136,6 +142,7 @@ async def main():
                 tps=tps,
                 planned_sl=float(sl) if sl else None,
             )
+            log.info("[SIGNAL] registered trade trace=%s acct=%s ticket=%s", trace_id, acct_name, ticket)
 
         # Notify trade opened (friendly message) if notifier available
         if notifier_adapter is not None:

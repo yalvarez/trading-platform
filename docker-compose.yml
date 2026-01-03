@@ -15,7 +15,7 @@ services:
   # - RPyC MT5 bridge: 8001
   # =========================
   mt5_acct1:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct1
     environment:
       - CUSTOM_USER=yalvarezc
@@ -32,7 +32,7 @@ services:
       retries: 10
 
   mt5_acct2:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct2
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
@@ -44,7 +44,7 @@ services:
       - mt5_acct2_config:/config
 
   mt5_acct3:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct3
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
@@ -56,7 +56,7 @@ services:
       - mt5_acct3_config:/config
 
   mt5_acct4:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct4
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
@@ -68,7 +68,7 @@ services:
       - mt5_acct4_config:/config
 
   mt5_acct5:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct5
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
@@ -80,7 +80,7 @@ services:
       - mt5_acct5_config:/config
 
   mt5_acct6:
-    image: gmag11/metatrader5_vnc
+    image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct6
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}

@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  mt5:
+    build: .
+    ports:
+      - "3000:3000"  # VNC web
+      - "8001:8001"  # rpyc
+    volumes:
+      - ./config:/config
+    container_name: mt5-rpyc

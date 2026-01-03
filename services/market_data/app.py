@@ -169,6 +169,8 @@ async def main():
 
     # Symbols to monitor - Vantage symbols
     symbols = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]
+    # preserve original requested list for resolution
+    requested_symbols = symbols
     
     # Retry logic for mt5_acct1 connection (may need significant startup time)
     mt5 = await connect_mt5(host="mt5_acct1", port=8001, max_attempts=30)
