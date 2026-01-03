@@ -38,6 +38,9 @@ async def fetch_tick_data(mt5, symbol):
                 "ask": str(getattr(tick, "ask", 0.0)),
                 "time": str(getattr(tick, "time", 0)),
             }
+        else:
+            log.info(f"symbol_info_tick returned None for {symbol}")
+            return None
     except Exception as e:
         log.warning(f"Error fetching tick for {symbol}: {e}")
         return None
@@ -51,8 +54,19 @@ async def main():
     
     # Retry logic for mt5_acct1 connection (may need significant startup time)
     mt5 = await connect_mt5(host="mt5_acct1", port=8001, max_attempts=30)
+    
+    # Try to get basic info about MT5 connection
+    try:
+        account_info = mt5.account_info()
+        log.info(f"Connected MT5 account: {account_info}")
+    except Exception as e:
+        log.warning(f"Could not get account info: {e}")
+    
     reconnect_attempts = 0
     max_reconnect_attempts = 5
+    
+    log.info(f"Starting main loop, will fetch from symbols: {symbols}")
+    
     while True:
         try:
             # Attempt to fetch tick data from all symbols
@@ -60,8 +74,11 @@ async def main():
                 tick_data = await fetch_tick_data(mt5, sym)
                 if tick_data:
                     await xadd(r, "market_ticks", tick_data)
+                    log.info(f"Published tick for {sym}: bid={tick_data['bid']}, ask={tick_data['ask']}")
                     # Reset reconnection counter on successful data fetch
                     reconnect_attempts = 0
+                else:
+                    log.info(f"No tick data for {sym}")
             
             await asyncio.sleep(0.5)
             
