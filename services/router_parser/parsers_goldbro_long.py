@@ -98,7 +98,7 @@ class GoldBroLongParser(SignalParser):
         return ParseResult(
             format_tag=self.format_tag,
             provider_tag="GB_LONG",
-            symbol="XAUUSD",
+            symbol="NO-SYMBOL",
             direction=direction,
             entry_range=(entry_min, entry_max),
             sl=sl,

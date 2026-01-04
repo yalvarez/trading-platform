@@ -21,7 +21,9 @@ async def main():
     async def handler(event):
         try:
             chat_id = str(event.chat_id)
+            log.debug(f"[CHAT_FILTER] chat_id={chat_id} chats={chats}")
             if chats and chat_id not in chats:
+                log.debug(f"[CHAT_FILTER] Ignorado chat_id={chat_id} (no está en chats)")
                 return
             text = (event.raw_text or "").strip()
             if not text:

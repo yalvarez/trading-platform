@@ -105,9 +105,16 @@ class ToroFxParser(SignalParser):
             except (ValueError, IndexError):
                 pass
         
-        # Extraer símbolo: XAU/USD, BTC/USD, EURUSD, etc
-        symbol_match = re.search(r'([A-Z]{3,5}/[A-Z]{3,5}|[A-Z]{6,7})', norm.upper())
-        symbol = symbol_match.group(1).replace("/", "") if symbol_match else "EURUSD"
+
+        # Extraer símbolo: si hay 'BUY MARKET XXX' o 'SELL MARKET XXX', tomar la palabra después de MARKET
+        market_symbol = re.search(r'(?:BUY|SELL)\s+MARKET\s+([A-Z]{3,10})', norm.upper())
+        if market_symbol:
+            symbol = market_symbol.group(1)
+        else:
+            symbol_match = re.search(r'([A-Z]{3,5}/[A-Z]{3,5}|[A-Z]{6,7})', norm.upper())
+            symbol = symbol_match.group(1).replace("/", "") if symbol_match else None
+        if not symbol:
+            symbol = "NO-SYMBOL"
         
         direction = "BUY" if is_buy else "SELL"
         # Si Target: open, no hay TP

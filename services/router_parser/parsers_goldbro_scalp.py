@@ -29,8 +29,11 @@ class GoldBroScalpParser(SignalParser):
         norm = self.normalize(text)
 
         # Must have symbol
-        if not self.SYMBOL_PATTERN.search(norm):
-            return None
+        symbol_match = self.SYMBOL_PATTERN.search(norm)
+        if symbol_match:
+            symbol = symbol_match.group(1).upper()
+        else:
+            symbol = "NO-SYMBOL"
 
         # Accept direction in English or Spanish
         is_buy = self.BUY_PATTERN.search(norm) is not None

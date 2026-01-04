@@ -1,4 +1,5 @@
 import os, json, asyncio, logging, sys, uuid
+import aioredis
 from common.config import Settings
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
@@ -101,7 +102,8 @@ async def main():
 
     async def handle_signal(fields: dict):
         trace_id = uuid.uuid4().hex[:8]
-        log.info("[SIGNAL] recv trace=%s fields=%s", trace_id, json.dumps(fields, ensure_ascii=False))
+        orig_trace = fields.get("trace", "NO_TRACE")
+        log.info("[SIGNAL] recv trace=%s orig_trace=%s fields=%s", trace_id, orig_trace, json.dumps(fields, ensure_ascii=False))
         if not in_windows(parse_windows(s.trading_windows)):
             log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
             await xadd(r, Streams.EVENTS, {"type":"skip", "reason":"outside_windows", "trace": trace_id})
@@ -119,7 +121,7 @@ async def main():
         # For scaffold simplicity, we skip the async price wait here; you can hook it in next iteration.
 
         log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s entry=%s sl=%s tps=%s", trace_id, provider_tag, symbol, direction, str(entry_tuple), str(sl), str(tps))
-        res = execu.open_complete_trade(
+        res = await execu.open_complete_trade(
             provider_tag=provider_tag,
             symbol=symbol,
             direction=direction,
@@ -181,14 +183,40 @@ async def main():
             # aquí puedes enrutar a handle_bg_* si quieres
             pass
 
+    REDIS_OFFSET_KEY = "signals:last_id"
+
+    async def get_last_id():
+        try:
+            redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+            redis = await aioredis.from_url(redis_url, decode_responses=True)
+            last_id = await redis.get(REDIS_OFFSET_KEY)
+            await redis.close()
+            return last_id or "$"
+        except Exception as e:
+            log.warning(f"[OFFSET] Could not get last_id from Redis: {e}")
+            return "$"
+
+    async def set_last_id(last_id):
+        try:
+            redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+            redis = await aioredis.from_url(redis_url, decode_responses=True)
+            await redis.set(REDIS_OFFSET_KEY, last_id)
+            await redis.close()
+        except Exception as e:
+            log.warning(f"[OFFSET] Could not set last_id in Redis: {e}")
+
     async def loop_signals():
-        async for _, fields in xread_loop(r, Streams.SIGNALS, last_id="$"):
+        last_id = await get_last_id()
+        async for msg_id, fields in xread_loop(r, Streams.SIGNALS, last_id=last_id):
             await handle_signal(fields)
+            await set_last_id(msg_id)
 
     async def loop_mgmt():
         async for _, fields in xread_loop(r, Streams.MGMT, last_id="$"):
             await handle_mgmt(fields)
 
+    # Lanzar el loop de gestión de trades en background
+    asyncio.create_task(tm.run_forever())
     await asyncio.gather(loop_signals(), loop_mgmt())
 
 if __name__ == "__main__":

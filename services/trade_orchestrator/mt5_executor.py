@@ -73,7 +73,8 @@ class MT5Executor:
             await asyncio.sleep(self.entry_poll_ms / 1000.0)
         return 0.0
 
-    def open_complete_trade(
+
+    async def open_complete_trade(
         self,
         *,
         provider_tag: str,
@@ -88,35 +89,65 @@ class MT5Executor:
 
         log.info("open_complete_trade start provider=%s symbol=%s direction=%s entry=%s sl=%s tps=%s", provider_tag, symbol, direction, str(entry_range), str(sl), str(tps))
 
-        # ✅ No intentar ni conectar fuera de horario
         if not self._should_operate_now():
             reason = "Outside trading windows (London/NY)."
             for a in [x for x in self.accounts if x.get("active")]:
                 errors[a["name"]] = reason
             return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)
 
-        for account in [a for a in self.accounts if a.get("active")]:
+        async def send_order(account):
             name = account["name"]
             client = self._client_for(account)
-
-            # ensure symbol
             client.symbol_select(symbol, True)
-
-            # ✅ entry range gate (wait up to N seconds)
             price = client.tick_price(symbol, direction)
-            if entry_range:
-                lo, hi = float(entry_range[0]), float(entry_range[1])
-                # wait (async friendly)
-                # NOTE: called sync here; orchestrator will call the async helper and pass final price
-                # keep sync fallback:
-                pass
+            order_type = 0 if direction == "BUY" else 1
 
-            # open at market with SL/TP=0 (TPs handled by manager)
-            order_type = 0 if direction == "BUY" else 1  # BUY=0, SELL=1 (mt5linux mirrors MT5)
+            # --- LOTE DINÁMICO O FIJO ---
+            lot = 0.01
+            fixed_lot = float(account.get("fixed_lot", 0))
+            risk_percent = float(account.get("risk_percent", 0))
+            balance = 0.0
+            if fixed_lot > 0:
+                lot = fixed_lot
+            elif risk_percent > 0 and sl and float(sl) > 0:
+                # Obtener balance actual
+                try:
+                    acc_info = client.mt5.account_info()
+                    if acc_info and hasattr(acc_info, "balance"):
+                        balance = float(acc_info.balance)
+                except Exception as e:
+                    log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
+                # Calcular riesgo monetario
+                risk_money = balance * (risk_percent / 100.0)
+                # Calcular distancia SL en precio
+                sl_distance = abs(float(price) - float(sl))
+                # Obtener info de símbolo
+                try:
+                    symbol_info = client.symbol_info(symbol)
+                    tick_value = float(getattr(symbol_info, "tick_value", 0.0))
+                    tick_size = float(getattr(symbol_info, "tick_size", 0.0))
+                    lot_step = float(getattr(symbol_info, "volume_step", 0.01))
+                    min_lot = float(getattr(symbol_info, "volume_min", 0.03))
+                except Exception as e:
+                    log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
+                    tick_value = 0.0
+                    tick_size = 0.0
+                    lot_step = 0.01
+                    min_lot = 0.03
+                log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
+                if tick_value > 0 and tick_size > 0 and sl_distance > 0:
+                    lot = risk_money / (sl_distance * (tick_value / tick_size))
+                    lot = max(min_lot, round(lot / lot_step) * lot_step)
+                    log.info(f"[LOTE][{name}] lotaje calculado={lot}")
+                else:
+                    log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
+                    lot = 0.03
+            # --- FIN LOTE ---
+
             req = {
-                "action": 1,  # TRADE_ACTION_DEAL
+                "action": 1,
                 "symbol": symbol,
-                "volume": 0.01,  # placeholder; tú lo conectarás con risk calc si quieres
+                "volume": float(lot),
                 "type": order_type,
                 "price": float(price),
                 "sl": float(sl),
@@ -127,12 +158,17 @@ class MT5Executor:
                 "type_time": 0,
                 "type_filling": 1,
             }
-            res = client.order_send(req)
-            if res and getattr(res, "retcode", None) == 10009:  # DONE
+            import asyncio
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, client.order_send, req)
+            log.warning("order_send response acct=%s: %s", name, res)
+            if res and getattr(res, "retcode", None) == 10009:
                 tickets[name] = int(getattr(res, "order", 0))
                 log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
             else:
                 errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
                 log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
 
+        accounts = [a for a in self.accounts if a.get("active")]
+        await asyncio.gather(*(send_order(account) for account in accounts))
         return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)

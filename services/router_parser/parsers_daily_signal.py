@@ -14,6 +14,7 @@ log = logging.getLogger("router_parser")
 class DailySignalParser(SignalParser):
     format_tag = "DAILY_SIGNAL"
 
+
     # Detect MARKET or AHORA
     MARKET_PATTERN = re.compile(r'\b(MARKET|AHORA)\b', re.IGNORECASE)
     BUY_PATTERN = re.compile(r'\b(BUY|COMPRA)\b', re.IGNORECASE)
@@ -21,6 +22,8 @@ class DailySignalParser(SignalParser):
 
     # Símbolo: palabra mayúscula tras BUY/SELL MARKET
     SYMBOL_EXTRACT_PATTERN = re.compile(r'(?:BUY|SELL)\s+MARKET\s+([A-Z]{3,10})', re.IGNORECASE)
+    # General: detecta símbolos tipo BTCUSD, XAUUSD, EURUSD, etc.
+    SYMBOL_PATTERN = re.compile(r'\b([A-Z]{3,10}|BTCUSD|ETHUSD|XAUUSD|XAGUSD|EURUSD|GBPUSD|USDJPY|USDCAD|AUDUSD|NZDUSD)\b', re.IGNORECASE)
 
     # Entry: Entry Price: 2500, Entry: 2500-2505, @2500-2505
     ENTRY_PATTERN = re.compile(
@@ -38,16 +41,21 @@ class DailySignalParser(SignalParser):
         norm = self.normalize(text)
         log.debug("[DAILY_PARSE] norm=%r", norm[:400])
 
-        # Extraer símbolo real
-        symbol = "XAUUSD"
-        symbol_match = self.SYMBOL_EXTRACT_PATTERN.search(norm)
-        if symbol_match:
-            symbol = symbol_match.group(1).upper()
+
+        # Extraer símbolo: si hay 'BUY MARKET XXX' o 'SELL MARKET XXX', tomar la palabra después de MARKET
+        symbol = None
+        market_symbol = re.search(r'(?:BUY|SELL)\s+MARKET\s+([A-Z]{3,10})', norm.upper())
+        if market_symbol:
+            symbol = market_symbol.group(1).upper()
+            log.debug(f"[DAILY_PARSE] market_symbol detectado: {symbol}")
         else:
-            # fallback: buscar primera palabra mayúscula de 3-10 letras
-            fallback = re.search(r'\b([A-Z]{3,10})\b', norm)
-            if fallback:
-                symbol = fallback.group(1).upper()
+            symbol_match = self.SYMBOL_EXTRACT_PATTERN.search(norm)
+            if symbol_match:
+                symbol = symbol_match.group(1).upper()
+                log.debug(f"[DAILY_PARSE] symbol_match detectado: {symbol}")
+        if not symbol:
+            symbol = "NO-SYMBOL"
+        log.debug(f"[DAILY_PARSE] symbol final: {symbol}")
 
         # Debe tener MARKET
         has_market = bool(self.MARKET_PATTERN.search(norm))
@@ -118,81 +126,3 @@ class DailySignalParser(SignalParser):
             tps=tps if tps else None,
         )
     
-    def parse(self, text: str) -> Optional[ParseResult]:
-        norm = self.normalize(text)
-        log.debug("[DAILY_PARSE] norm=%r", norm[:400])
-
-        # Must have symbol
-        has_symbol = bool(self.SYMBOL_PATTERN.search(norm))
-        log.debug("[DAILY_PARSE] has_symbol=%s", has_symbol)
-        if not has_symbol:
-            return None
-
-        # Must have MARKET keyword (distinguishes from other formats)
-        has_market = bool(self.MARKET_PATTERN.search(norm))
-        log.debug("[DAILY_PARSE] has_market=%s", has_market)
-        if not has_market:
-            return None
-
-        # Must have direction
-        is_buy = self.BUY_PATTERN.search(norm) is not None
-        is_sell = self.SELL_PATTERN.search(norm) is not None
-        if not (is_buy or is_sell):
-            return None
-
-        # Must have entry range (accept "Entry: 2500-2505" or shorthand like "@4471-4468")
-        entry_match = self.ENTRY_PATTERN.search(norm)
-        if not entry_match:
-            # try alternative shorthand: @1234-1220 or just 1234-1220
-            alt = re.search(r'@?(\d{3,5}(?:\.\d{1,2})?)\s*[-–]\s*(\d{3,5}(?:\.\d{1,2})?)', norm)
-            if alt:
-                entry_match = alt
-
-        # fallback: single entry like 'Entry Price: 4471' or lines like '@4471'
-        single_entry = None
-        if not entry_match:
-            se = re.search(r'entry(?:\s*price)?[\s:\-]*@?(\d{3,5}(?:\.\d{1,2})?)', norm, re.IGNORECASE)
-            if se:
-                single_entry = float(se.group(1))
-                entry_match = se
-
-        log.debug("[DAILY_PARSE] entry_match=%s single_entry=%s", bool(entry_match), single_entry)
-        if not entry_match:
-            return None
-
-        try:
-            entry_min = float(entry_match.group(1))
-            entry_max = float(entry_match.group(2)) if entry_match.lastindex and entry_match.lastindex >= 2 and entry_match.group(2) else entry_min
-        except (ValueError, IndexError):
-            log.debug("[DAILY_PARSE] entry parse failed groups=%s", entry_match.groups() if entry_match else None)
-            return None
-        
-        # Extract SL
-        sl = None
-        sl_match = self.SL_PATTERN.search(norm)
-        if sl_match:
-            try:
-                sl = float(sl_match.group(1))
-            except (ValueError, IndexError):
-                pass
-        
-        # Extract TPs
-        tps = []
-        for tp_match in self.TP_PATTERN.finditer(norm):
-            try:
-                tp = float(tp_match.group(1))
-                if tp not in tps:
-                    tps.append(tp)
-            except (ValueError, IndexError):
-                pass
-        
-        direction = "BUY" if is_buy else "SELL"
-        return ParseResult(
-            format_tag=self.format_tag,
-            provider_tag="DAILY_SIGNAL",
-            symbol="XAUUSD",
-            direction=direction,
-            entry_range=(entry_min, entry_max),
-            sl=sl,
-            tps=tps if tps else None,
-        )
