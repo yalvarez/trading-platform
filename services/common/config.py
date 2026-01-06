@@ -27,7 +27,6 @@ class Settings:
     entry_poll_ms: int
     entry_buffer_points: float
     accounts_json: str
-    
     # Advanced trading settings
     dedup_ttl_seconds: float
     enable_notifications: bool
@@ -55,7 +54,6 @@ class Settings:
             entry_poll_ms=env_int("ENTRY_POLL_MS", 500),
             entry_buffer_points=env_float("ENTRY_BUFFER_POINTS", 0.0),
             accounts_json=env("ACCOUNTS_JSON", "[]"),
-            
             # Advanced settings
             dedup_ttl_seconds=env_float("DEDUP_TTL_SECONDS", 120.0),
             enable_notifications=env_bool("ENABLE_NOTIFICATIONS", True),
@@ -76,3 +74,7 @@ class Settings:
 
     def accounts(self) -> list[dict[str, Any]]:
         return json.loads(self.accounts_json)
+
+
+# FAST signal update window (seconds)
+FAST_UPDATE_WINDOW_SECONDS = float(os.getenv("FAST_UPDATE_WINDOW_SECONDS", "30"))

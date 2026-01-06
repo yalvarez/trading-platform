@@ -48,6 +48,66 @@ class ManagedTrade:
 
 
 class TradeManager:
+    # --- Scaling out para trades sin TP (ej. TOROFX) ---
+    async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
+        # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
+        if t.tps:
+            return
+        if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
+            return
+        # Configurables
+        tramo_pips = getattr(self, 'scaling_tramo_pips', 30.0)
+        percent_per_tramo = getattr(self, 'scaling_percent_per_tramo', 25)
+        # Estado: guardar tramos ya ejecutados en t.actions_done
+        entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
+        profit_pips = ((current - entry) / point) if is_buy else ((entry - current) / point)
+        if profit_pips < tramo_pips:
+            return
+        max_tramos = int(100 // percent_per_tramo)
+        for tramo in range(1, max_tramos + 1):
+            nivel = tramo * tramo_pips
+            action_key = f"SCALING_{percent_per_tramo}_AT_{int(nivel)}"
+            if profit_pips >= nivel and action_key not in t.actions_done:
+                t.actions_done.add(action_key)
+                pct = percent_per_tramo
+                # Si es el último tramo, cierra el 100% restante
+                if tramo == max_tramos:
+                    pct = 100
+                await self._do_partial_close(account, pos.ticket, pct, reason=f"ScalingOut {pct}% @ +{int(nivel)}pips")
+                self._notify_bg(
+                    account["name"],
+                    f"✂️ ScalingOut ejecutado\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips | Cierre: {pct}%"
+                )
+
+    def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
+        # Forzar SL por defecto si falta
+        default_sl = getattr(self, 'default_sl', None)
+        if planned_sl is None or planned_sl == 0.0:
+            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl})")
+            if default_sl is not None:
+                planned_sl = float(default_sl)
+        """
+        Registers a new trade in the manager. Used when a trade is opened externally (e.g., by signal handler).
+        """
+        gid = int(group_id) if group_id is not None else int(ticket)
+        self.trades[int(ticket)] = ManagedTrade(
+            account_name=account_name,
+            ticket=int(ticket),
+            symbol=symbol,
+            direction=direction,
+            provider_tag=provider_tag,
+            group_id=gid,
+            tps=list(tps or []),
+            planned_sl=float(planned_sl) if planned_sl is not None else None,
+        )
+        self.group_addon_count.setdefault((account_name, gid), 0)
+        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, gid, provider_tag, tps, planned_sl)
+        try:
+            TRADES_OPENED.inc()
+            ACTIVE_TRADES.set(len(self.trades))
+        except Exception:
+            pass
+
     async def notify_sl(self, account, pos, t):
         await self.notify_trade_event(
             'sl',
@@ -122,6 +182,12 @@ class TradeManager:
         torofx_close_entry_tolerance_pips: float = 10.0,  # para “cierro mi entrada 4330”
         torofx_provider_tag_match: str = "TOROFX",  # substring en provider_tag
 
+        # --- Scaling out config ---
+        scaling_tramo_pips: float = 30.0,
+        scaling_percent_per_tramo: int = 25,
+
+        default_sl: float = 60.0,  # SL por defecto en pips
+
         notifier=None,
         notify_connect: bool | None = None,  # compat
     ):
@@ -134,6 +200,7 @@ class TradeManager:
 
         self.long_tp1_percent = long_tp1_percent
         self.long_tp2_percent = long_tp2_percent
+        self.default_sl = default_sl
         self.runner_retrace_pips = runner_retrace_pips
         self.buffer_pips = buffer_pips
 
@@ -161,6 +228,9 @@ class TradeManager:
         self.torofx_close_entry_tolerance_pips = float(torofx_close_entry_tolerance_pips)
         self.torofx_provider_tag_match = (torofx_provider_tag_match or "TOROFX").upper()
 
+        self.scaling_tramo_pips = float(scaling_tramo_pips)
+        self.scaling_percent_per_tramo = int(scaling_percent_per_tramo)
+
         self.notifier = notifier
         self.trades: dict[int, ManagedTrade] = {}
 
@@ -186,101 +256,28 @@ class TradeManager:
         if not self.notifier:
             return
         account_name = kwargs.get('account_name')
+        msg = None
         if event == 'opened':
-            await self.notifier.notify_trade_opened(
-                account_name=account_name,
-                ticket=kwargs.get('ticket'),
-                symbol=kwargs.get('symbol'),
-                direction=kwargs.get('direction'),
-                entry_price=kwargs.get('entry_price'),
-                sl_price=kwargs.get('sl_price'),
-                tp_prices=kwargs.get('tp_prices'),
-                lot=kwargs.get('lot', 0.0),
-                provider=kwargs.get('provider', 'UNKNOWN'),
-            )
+            msg = f"🎯 TRADE OPENED | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} {kwargs.get('direction')} | Entry: {kwargs.get('entry_price')} | SL: {kwargs.get('sl_price')} | TP: {kwargs.get('tp_prices')} | Lote: {kwargs.get('lot')} | Provider: {kwargs.get('provider')}"
         elif event == 'tp':
-            await self.notifier.notify_tp_hit(
-                account_name=account_name,
-                ticket=kwargs.get('ticket'),
-                symbol=kwargs.get('symbol'),
-                tp_index=kwargs.get('tp_index'),
-                tp_price=kwargs.get('tp_price'),
-                current_price=kwargs.get('current_price'),
-            )
+            msg = f"🎯 TP HIT | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | TP{kwargs.get('tp_index')}: {kwargs.get('tp_price')} | Precio actual: {kwargs.get('current_price')}"
         elif event == 'partial':
-            await self.notifier.notify_partial_close(
-                account_name=account_name,
-                ticket=kwargs.get('ticket'),
-                symbol=kwargs.get('symbol'),
-                close_percent=kwargs.get('close_percent'),
-                close_price=kwargs.get('close_price'),
-                closed_volume=kwargs.get('closed_volume'),
-            )
+            msg = f"🎯 Partial Close | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | {kwargs.get('close_percent')}% | Motivo: {kwargs.get('reason')}"
         elif event == 'sl':
-            await self.notifier.notify_sl_hit(
-                account_name=account_name,
-                ticket=kwargs.get('ticket'),
-                symbol=kwargs.get('symbol'),
-                sl_price=kwargs.get('sl_price'),
-                close_price=kwargs.get('close_price'),
-            )
+            msg = f"❌ SL HIT | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | SL: {kwargs.get('sl_price')} | Close: {kwargs.get('close_price')}"
         elif event == 'be':
-            await self.notifier.notify(account_name, kwargs.get('message'))
+            msg = kwargs.get('message')
         elif event == 'trailing':
-            await self.notifier.notify(account_name, kwargs.get('message'))
+            msg = kwargs.get('message')
         elif event == 'addon':
-            await self.notifier.notify_addon_entry(
-                account_name=account_name,
-                ticket=kwargs.get('ticket'),
-                symbol=kwargs.get('symbol'),
-                addon_price=kwargs.get('addon_price'),
-                addon_lot=kwargs.get('addon_lot'),
-            )
+            msg = f"➕ Addon | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | Precio: {kwargs.get('addon_price')} | Lote: {kwargs.get('addon_lot')}"
         elif event == 'close':
-            await self.notifier.notify(account_name, kwargs.get('message'))
-
-    # ----------------------------
-    # Register
-    # ----------------------------
-    def register_trade(
-        self,
-        *,
-        account_name: str,
-        ticket: int,
-        symbol: str,
-        direction: str,
-        provider_tag: str,
-        tps: list[float],
-        planned_sl: Optional[float] = None,
-        group_id: Optional[int] = None,
-    ) -> None:
-        tkt = int(ticket)
-
-        gid: int
-        if group_id is None and self._looks_like_recovery(provider_tag):
-            gid = self._infer_group_for_recovery(account_name, symbol, direction) or tkt
+            msg = kwargs.get('message')
         else:
-            gid = int(group_id) if group_id is not None else tkt
+            msg = kwargs.get('message')
+        if msg:
+            await self.notifier.notify(account_name, msg)
 
-        self.trades[tkt] = ManagedTrade(
-            account_name=account_name,
-            ticket=tkt,
-            symbol=symbol,
-            direction=direction,
-            provider_tag=provider_tag,
-            group_id=gid,
-            tps=list(tps or []),
-            planned_sl=float(planned_sl) if planned_sl is not None else None,
-        )
-
-        self.group_addon_count.setdefault((account_name, gid), 0)
-
-        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", tkt, account_name, gid, provider_tag, tps, planned_sl)
-        try:
-            TRADES_OPENED.inc()
-            ACTIVE_TRADES.set(len(self.trades))
-        except Exception:
-            pass
 
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
         t = self.trades.get(int(ticket))
@@ -320,7 +317,10 @@ class TradeManager:
             await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
             tick_count += 1
             if tick_count % 60 == 0:
-                log.info(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
+                if tick_count % 600 == 0:
+                    log.info(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
+                else:
+                    log.debug(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
             await asyncio.sleep(self.loop_sleep_sec)
 
     async def _tick_once_account(self, account):
@@ -386,6 +386,9 @@ class TradeManager:
                 # 1) Gestión de Take Profits
                 await self._maybe_take_profits(account, pos, point, is_buy, current, t)
 
+                # 1b) Scaling out para trades sin TP (solo si no tiene TP)
+                await self._maybe_scaling_out_no_tp(account, pos, point, is_buy, current, t)
+
                 # 2) Addon midpoint (añadir posición si corresponde)
                 if self.enable_addon:
                     await self._maybe_addon_midpoint(account, pos, point, is_buy, current, t)
@@ -394,7 +397,17 @@ class TradeManager:
                 if self.enable_trailing:
                     await self._maybe_trailing(account, pos, point, is_buy, current, t)
         except Exception as e:
-            log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
+            # Supresión de errores de conexión repetidos
+            if hasattr(self, '_last_conn_error') and self._last_conn_error == str(e):
+                self._conn_error_count = getattr(self, '_conn_error_count', 0) + 1
+                if self._conn_error_count <= 3:
+                    log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
+                elif self._conn_error_count == 4:
+                    log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e} (suprimido, repite)")
+            else:
+                self._last_conn_error = str(e)
+                self._conn_error_count = 1
+                log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
             # Intentar reconectar en el siguiente ciclo
             return
 
@@ -488,8 +501,17 @@ class TradeManager:
                     if self.enable_trailing:
                         await self._maybe_trailing(account, pos, point, is_buy, current, t)
             except Exception as e:
-                log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
-                # Intentar reconectar en el siguiente ciclo
+                # Supresión de errores de conexión repetidos
+                if hasattr(self, '_last_conn_error') and self._last_conn_error == str(e):
+                    self._conn_error_count = getattr(self, '_conn_error_count', 0) + 1
+                    if self._conn_error_count <= 3:
+                        log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
+                    elif self._conn_error_count == 4:
+                        log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e} (suprimido, repite)")
+                else:
+                    self._last_conn_error = str(e)
+                    self._conn_error_count = 1
+                    log.error(f"[TM] Error en gestión de cuenta {account.get('name')}: {e}")
                 continue
 
     # ----------------------------
@@ -507,55 +529,112 @@ class TradeManager:
         """
         Aplica break-even (SL a precio de entrada + offset) con soporte para override por símbolo/cuenta.
         """
-        pos_list = self.mt5.positions_get(ticket=int(ticket))
-        if not pos_list:
-            return
-        pos = pos_list[0]
-        entry = float(pos.price_open)
-        symbol = getattr(pos, 'symbol', None)
-        acc_name = account.get('name')
-        be_offset = self.be_offset_pips
-        if hasattr(self, 'config'):
-            try:
-                be_offset = self.config.get('be_offset_pips', {}).get(acc_name, {}).get(symbol, be_offset)
-            except Exception:
-                pass
-        offset = be_offset * point
-        be = (entry + offset) if is_buy else (entry - offset)
+        import asyncio
+        log.info(f"[BE-DEBUG] INICIO _do_be | account={account.get('name')} ticket={ticket} is_buy={is_buy}")
+        client = self.mt5._client_for(account)
+        max_retries = 3
+        delay_seconds = 2
+        for attempt in range(1, max_retries + 1):
+            pos_list = client.positions_get(ticket=int(ticket))
+            log.info(f"[BE-DEBUG] positions_get result | ticket={ticket} pos_list={pos_list}")
+            if not pos_list:
+                log.warning(f"[BE-DEBUG] No position found for ticket={ticket} en _do_be (attempt {attempt})")
+                if attempt < max_retries:
+                    await asyncio.sleep(delay_seconds)
+                    continue
+                return
+            pos = pos_list[0]
+            entry = float(pos.price_open)
+            symbol = getattr(pos, 'symbol', None)
+            acc_name = account.get('name')
+            be_offset = self.be_offset_pips
+            if hasattr(self, 'config'):
+                try:
+                    be_offset = self.config.get('be_offset_pips', {}).get(acc_name, {}).get(symbol, be_offset)
+                    log.info(f"[BE-DEBUG] be_offset override | acc={acc_name} symbol={symbol} be_offset={be_offset}")
+                except Exception as e:
+                    log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
+            offset = be_offset * point
+            be = (entry + offset) if is_buy else (entry - offset)
+            log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
 
-        req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(ticket), "sl": float(be), "tp": 0.0}
-        res = self.mt5.order_send(req)
-        ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
-        if ok:
-            self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
-            log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
-            await self.notify_trade_event(
-                'be',
-                account_name=account["name"],
-                message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
-            )
-        else:
-            self._notify_bg(
-                account["name"],
-                f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-            )
-            log.warning("[TM] BE failed ticket=%s retcode=%s comment=%s", int(ticket), getattr(res,'retcode',None), getattr(res,'comment',None))
-            await self.notify_trade_event(
-                'be',
-                account_name=account["name"],
-                message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-            )
+            # Chequeo de volumen mínimo
+            info = client.symbol_info(symbol) if symbol else None
+            v = float(getattr(pos, 'volume', 0.0))
+            vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
+            if v < vmin or v == 0.0:
+                log.warning(f"[BE-DEBUG] Volumen insuficiente para modificar SL | ticket={ticket} v={v} vmin={vmin}")
+                self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})")
+                await self.notify_trade_event(
+                    'be',
+                    account_name=account["name"],
+                    message=f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})"
+                )
+                return
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": int(ticket),
+                "symbol": symbol,
+                "sl": float(be),
+                "tp": 0.0,
+                "volume": v,
+                "deviation": getattr(self, "deviation", 20),
+            }
+            log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
+            res = client.order_send(req)
+            log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+            # Manejo de filling mode no soportado
+            if res and getattr(res, 'retcode', None) == 10030 and 'Unsupported filling mode' in getattr(res, 'comment', ''):
+                log.warning(f"[TM] BE failed ticket={ticket} retcode=10030 comment=Unsupported filling mode (no reintentar)")
+                self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode")
+                await self.notify_trade_event(
+                    'be',
+                    account_name=account["name"],
+                    message=f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode"
+                )
+                return
+            ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
+            if ok:
+                self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
+                log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
+                await self.notify_trade_event(
+                    'be',
+                    account_name=account["name"],
+                    message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
+                )
+                log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
+                return
+            else:
+                log.warning("[TM] BE failed ticket=%s retcode=%s comment=%s (attempt %d)", int(ticket), getattr(res,'retcode',None), getattr(res,'comment',None), attempt)
+                if attempt < max_retries:
+                    await asyncio.sleep(delay_seconds)
+                    continue
+                self._notify_bg(
+                    account["name"],
+                    f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
+                )
+                await self.notify_trade_event(
+                    'be',
+                    account_name=account["name"],
+                    message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
+                )
+                log.info(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket}")
+                return
 
     def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
         if desired_percent >= 100:
             return 100
 
-        pos_list = self.mt5.positions_get(ticket=int(ticket))
+        # Use the first active account for context (should be refactored to always have account)
+        account = next((a for a in self.mt5.accounts if a.get("active")), None)
+        client = self.mt5._client_for(account) if account else None
+        pos_list = client.positions_get(ticket=int(ticket)) if client else []
         if not pos_list:
             return desired_percent
         pos = pos_list[0]
 
-        info = self.mt5.symbol_info(pos.symbol)
+        info = client.symbol_info(pos.symbol) if client else None
         if not info:
             return desired_percent
 
@@ -579,8 +658,11 @@ class TradeManager:
         return desired_percent
 
     async def _do_partial_close(self, account: dict, ticket: int, percent: int, reason: str):
-        ok = self.mt5.partial_close(account=account, ticket=int(ticket), percent=int(percent))
-        pos_list = self.mt5.positions_get(ticket=int(ticket))
+        log.info(f"[DEBUG] Entering _do_partial_close | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")
+        client = self.mt5._client_for(account)
+        ok = client.partial_close(account=account, ticket=int(ticket), percent=int(percent))
+        log.info(f"[DEBUG] Result of client.partial_close: ok={ok} | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")
+        pos_list = client.positions_get(ticket=int(ticket))
         pos = pos_list[0] if pos_list else None
         symbol = getattr(pos, 'symbol', '') if pos else ''
         volume = float(getattr(pos, 'volume', 0.0)) if pos else 0.0
@@ -600,6 +682,11 @@ class TradeManager:
                 close_price=getattr(pos, 'price_current', 0.0) if pos else 0.0,
                 closed_volume=close_vol,
             )
+            # Si el cierre es total, auditar solo si el trade existe
+            if percent >= 100:
+                t_audit = self.trades.get(int(ticket))
+                if t_audit is not None:
+                    await self.audit_trade_close(account["name"], int(ticket), t_audit, reason, pos)
         else:
             log.warning("[TM] ❌ partial_close FAILED ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
             await self.notify_trade_event(
@@ -616,14 +703,10 @@ class TradeManager:
     # TP / Runner / BE
     # ----------------------------
     async def _maybe_take_profits(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
-        log.info(f"[TP-DEBUG] Gestionando TP | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} current={current} tps={t.tps} tp_hit={t.tp_hit}")
-        for idx, tp in enumerate(t.tps):
-            hit = self._tp_hit(is_buy, current, float(tp), buffer_price)
-            log.info(f"[TP-DEBUG] TP{idx+1} check | tp={tp} hit={hit} already_hit={((idx+1) in t.tp_hit)}")
+        # Solo loguear eventos relevantes, no cada tick
+        buffer_price = self.buffer_pips * point
         if not t.tps:
             return
-
-        buffer_price = self.buffer_pips * point
         long_mode = self._is_long_mode(t)
 
         if long_mode:
@@ -635,33 +718,52 @@ class TradeManager:
                 if (not is_buy) and current < t.mfe_peak_price:
                     t.mfe_peak_price = current
 
-        # TP1
-        if 1 not in t.tp_hit and len(t.tps) >= 1 and self._tp_hit(is_buy, current, float(t.tps[0]), buffer_price):
-            t.tp_hit.add(1)
-            pct = self.long_tp1_percent if long_mode else self.scalp_tp1_percent
-            pct_eff = self._effective_close_percent(ticket=int(pos.ticket), desired_percent=int(pct))
-            log.info(f"[AUDIT] TP1 hit | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} tp={float(t.tps[0]):.5f} close_pct={pct_eff}")
-            await self.notify_trade_event(
-                'tp',
-                account_name=account["name"],
-                ticket=int(pos.ticket),
-                symbol=t.symbol,
-                tp_index=0,
-                tp_price=float(t.tps[0]),
-                current_price=current,
-            )
-            pct = self.long_tp1_percent if long_mode else self.scalp_tp1_percent
-            pct_eff = self._effective_close_percent(ticket=int(pos.ticket), desired_percent=int(pct))
-            await self._do_partial_close(account, pos.ticket, pct_eff, reason="TP1")
-            if self.enable_be_after_tp1:
-                await self._do_be(account, pos.ticket, point, is_buy)
-            if long_mode:
-                t.runner_enabled = True
-            try:
-                TP_HITS.labels(tp="tp1").inc()
-            except Exception:
-                pass
-            return
+        # TP1, TP2, TP3+ (dinámico)
+        tp_percents = [
+            self.long_tp1_percent if long_mode else self.scalp_tp1_percent,
+            self.long_tp2_percent if long_mode else self.scalp_tp2_percent,
+        ]
+        # Si hay más de 2 TPs, los siguientes usan el 100% restante
+        for idx, tp in enumerate(t.tps):
+            tp_idx = idx + 1
+            if tp_idx not in t.tp_hit and self._tp_hit(is_buy, current, float(tp), buffer_price):
+                # Determinar el porcentaje a cerrar
+                if idx < len(tp_percents):
+                    pct = tp_percents[idx]
+                else:
+                    pct = 100  # TP3+ cierra todo lo que queda
+                pct_eff = self._effective_close_percent(ticket=int(pos.ticket), desired_percent=int(pct))
+                log.info(f"[AUDIT] TP{tp_idx} hit | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} tp={float(tp):.5f} close_pct={pct_eff}")
+                await self.notify_trade_event(
+                    'tp',
+                    account_name=account["name"],
+                    ticket=int(pos.ticket),
+                    symbol=t.symbol,
+                    tp_index=idx,
+                    tp_price=float(tp),
+                    current_price=current,
+                )
+                log.info(f"[DEBUG] Calling _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
+                await self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP{tp_idx}")
+                log.info(f"[DEBUG] Finished _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
+                t.tp_hit.add(tp_idx)
+                # BE solo tras TP1
+                if tp_idx == 1 and self.enable_be_after_tp1:
+                    log.info(f"[BE-DEBUG] Intentando aplicar BE | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} entry={t.entry_price} tp1={float(tp)}")
+                    await self._do_be(account, pos.ticket, point, is_buy)
+                    log.info(f"[BE-DEBUG] BE ejecutado | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol}")
+                # Runner solo tras TP2
+                if tp_idx == 2 and long_mode:
+                    t.runner_enabled = True
+                # Trailing post TP3+
+                if tp_idx >= 3:
+                    t.runner_enabled = True  # Forzar trailing
+                try:
+                    TP_HITS.labels(tp=f"tp{tp_idx}").inc()
+                except Exception:
+                    pass
+                # Solo procesar un TP por tick
+                return
 
         # Runner retrace
         if long_mode and t.runner_enabled and t.mfe_peak_price is not None:
@@ -682,6 +784,17 @@ class TradeManager:
                     message=f"🔚 RUNNER retrace close | Ticket: {int(pos.ticket)} | {t.symbol} | {t.direction}\nMFE: {t.mfe_peak_price:.5f} | Current: {current:.5f}"
                 )
                 await self._do_partial_close(account, pos.ticket, 100, reason="RUNNER retrace")
+
+    # --- AUDITORÍA DE CIERRE DE TRADE ---
+    async def audit_trade_close(self, account_name, ticket, t: ManagedTrade, reason: str, pos=None):
+        """Loguea un resumen de la gestión del trade al cerrarse."""
+        log.info(
+            f"[AUDIT] TRADE CLOSED | account={account_name} ticket={ticket} symbol={t.symbol} dir={t.direction} "
+            f"provider={t.provider_tag} group={t.group_id} entry={t.entry_price} initial_vol={t.initial_volume} "
+            f"TPs={t.tps} TP_hit={sorted(t.tp_hit)} runner={t.runner_enabled} SL={t.planned_sl} reason={reason} "
+            f"pos={getattr(pos, 'price_current', None) if pos else None}"
+        )
+        # Aquí se puede extender para guardar en base de datos, enviar a otro sistema, etc.
 
     # ----------------------------
     # ✅ Addon MIDPOINT Entry–SL (NO pirámide en ganancia)
@@ -728,8 +841,9 @@ class TradeManager:
         if (not is_buy) and current >= sl - (2.0 * buffer_price):
             return
 
-        info = self.mt5.symbol_info(t.symbol)
-        tick = self.mt5.symbol_info_tick(t.symbol)
+        client = self.mt5._client_for(account)
+        info = client.symbol_info(t.symbol)
+        tick = client.symbol_info_tick(t.symbol)
         if not info or not tick:
             return
 
@@ -772,8 +886,9 @@ class TradeManager:
             "type_filling": getattr(self.mt5, "_best_filling", lambda s: mt5.ORDER_FILLING_IOC)(t.symbol),
         }
 
-        send = getattr(self.mt5, "_order_send_with_filling_fallback", None)
-        res = send(req) if callable(send) else self.mt5.order_send(req)
+        client = self.mt5._client_for(account)
+        send = getattr(client, "_order_send_with_filling_fallback", None)
+        res = send(req) if callable(send) else client.order_send(req)
 
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             addon_ticket = int(res.order)
@@ -835,12 +950,8 @@ class TradeManager:
                     trailing_activation_after_tp2 = cfg.get('activation_after_tp2', trailing_activation_after_tp2)
             except Exception:
                 pass
-        if (now - t.last_trailing_ts) < trailing_cooldown_sec:
-            return
-
-        open_price = float(pos.price_open)
+        open_price = getattr(pos, 'price_open', 0.0) if pos else 0.0
         profit_pips = ((current - open_price) / point) if is_buy else ((open_price - current) / point)
-
         activate = profit_pips >= trailing_activation_pips
         if trailing_activation_after_tp2 and (t.runner_enabled or (2 in t.tp_hit)):
             activate = True
@@ -863,7 +974,8 @@ class TradeManager:
             return
 
         req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(pos.ticket), "sl": float(new_sl), "tp": 0.0}
-        res = self.mt5.order_send(req)
+        client = self.mt5._client_for(account)
+        res = client.order_send(req)
         ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
 
         if ok:
@@ -933,7 +1045,8 @@ class TradeManager:
             if not self.mt5.connect_to_account(account):
                 continue
 
-            positions = self.mt5.positions_get()
+            client = self.mt5._client_for(account)
+            positions = client.positions_get()
             if not positions:
                 continue
             pos_by_ticket = {p.ticket: p for p in positions}
@@ -995,12 +1108,11 @@ class TradeManager:
                     if action_key in t.actions_done:
                         continue
 
-                    any_matched_trade = True
-                    t.actions_done.add(action_key)
+            t.actions_done.add(action_key)
 
-                    # aplica BE directo (sin offset) usando executor
-                    self.mt5.set_be(account=account, ticket=int(ticket))
-                continue
+            # aplica BE directo (sin offset) usando executor
+            self.mt5.set_be(account=account, ticket=int(ticket))
+            continue
 
             # ---- 3) Parcial por pips ----
             if wants_partial:

@@ -2,6 +2,12 @@ from mt5linux import MetaTrader5
 
 
 class MT5Client:
+    def symbol_info_tick(self, symbol: str):
+        """
+        Devuelve el tick info del símbolo usando la API subyacente de MetaTrader5.
+        """
+        return self.mt5.symbol_info_tick(symbol)
+
     def partial_close(self, account: dict, ticket: int, percent: int) -> bool:
         """
         Realiza un cierre parcial de la posición indicada por ticket, cerrando el porcentaje especificado.
@@ -27,15 +33,21 @@ class MT5Client:
             print(f"[MT5Client] Volumen inválido o símbolo no encontrado para ticket {ticket}")
             return False
         # Calcular volumen a cerrar
-        close_vol = volume * (float(percent) / 100.0)
-        # Ajustar a step mínimo
         info = self.mt5.symbol_info(symbol)
         step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
         min_vol = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
-        close_vol = step * round(close_vol / step)
-        if close_vol < min_vol or close_vol <= 0:
-            print(f"[MT5Client] Volumen a cerrar menor al mínimo, cerrando todo: {volume}")
-            close_vol = volume  # fallback: cerrar todo
+        raw_close = volume * (float(percent) / 100.0)
+        # Redondear hacia abajo al múltiplo de step
+        close_vol = step * int(raw_close / step)
+        if close_vol < min_vol:
+            if volume > min_vol:
+                print(f"[MT5Client] Volumen a cerrar menor al mínimo, usando min_vol: {min_vol}")
+                close_vol = min_vol
+            else:
+                print(f"[MT5Client] Volumen a cerrar menor al mínimo, cerrando todo: {volume}")
+                close_vol = volume  # fallback: cerrar todo
+        if close_vol > volume:
+            close_vol = volume
         # Determinar tipo de orden opuesta
         order_type = 1 if getattr(pos, 'type', 0) == 0 else 0  # 0=buy, 1=sell
         price = self.tick_price(symbol, 'SELL' if order_type == 1 else 'BUY')
@@ -74,8 +86,8 @@ class MT5Client:
             return 0.0
         return float(t.ask if direction == "BUY" else t.bid)
 
-    def positions_get(self):
-        return self.mt5.positions_get()
+    def positions_get(self, *args, **kwargs):
+        return self.mt5.positions_get(*args, **kwargs)
 
     def order_send(self, req: dict):
         return self.mt5.order_send(req)

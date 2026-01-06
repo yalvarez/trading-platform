@@ -20,18 +20,7 @@ else:
         sys.path.insert(0, _svc_c)
 import importlib.util
 
-# Try to dynamically load `services/telegram_ingestor/create_session.py` as a module
-tg_client = None
-try:
-    _tg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'telegram_ingestor', 'create_session.py'))
-    if os.path.exists(_tg_path):
-        spec = importlib.util.spec_from_file_location("telegram_create_session", _tg_path)
-        _mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_mod)
-        tg_client = getattr(_mod, 'client', None)
-except Exception:
-    tg_client = None
-from common.telegram_notifier import TelegramNotifier, NotificationConfig
+from common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
 from prometheus_client import start_http_server
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
@@ -39,8 +28,23 @@ log = logging.getLogger("trade_orchestrator")
 
 class NotifierAdapter:
     """Adapter exposing both async callable and notify() used across modules."""
-    def __init__(self, tg_notifier: TelegramNotifier):
+
+    def __init__(self, tg_notifier):
         self._tg = tg_notifier
+
+    async def notify_tp_hit(self, account_name: str, ticket: int, symbol: str, tp_index: int, tp_price: float, current_price: float):
+        return await self._tg.notify_tp_hit(
+            account_name=account_name,
+            ticket=ticket,
+            symbol=symbol,
+            tp_index=tp_index,
+            tp_price=tp_price,
+            current_price=current_price,
+        )
+
+    async def notify_partial_close(self, *args, **kwargs):
+        if hasattr(self._tg, "notify_partial_close"):
+            return await self._tg.notify_partial_close(*args, **kwargs)
 
     async def __call__(self, account_name: str, message: str):
         await self._tg.notify(account_name, message)
@@ -76,17 +80,11 @@ async def main():
             notify_configs.append(NotificationConfig(account_name=a.get("name"), chat_id=first_chat))
 
         try:
-            tg_notifier = TelegramNotifier(tg_client, notify_configs)
+            tg_notifier = RemoteTelegramNotifier(os.getenv("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
             notifier_adapter = NotifierAdapter(tg_notifier)
-            log.info("TelegramNotifier initialized")
-            # mark readiness for healthchecks
-            try:
-                with open('/tmp/telegram_notifier.ready', 'w', encoding='utf-8') as fh:
-                    fh.write('ready')
-            except Exception:
-                log.debug('Could not write readiness file for TelegramNotifier')
+            log.info("RemoteTelegramNotifier initialized")
         except Exception as e:
-            log.error(f"Failed to initialize TelegramNotifier: {e}")
+            log.error(f"Failed to initialize RemoteTelegramNotifier: {e}")
 
     execu = MT5Executor(
         accounts,

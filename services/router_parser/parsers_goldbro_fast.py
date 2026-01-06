@@ -3,7 +3,9 @@ Gold Brother FAST parser - detects urgent/fast signals
 Format: "Compra/Vende ORO/GOLD ahora @2500" with optional price hint
 """
 
+
 import re
+import os
 from typing import Optional
 from parsers_base import SignalParser, ParseResult
 
@@ -32,28 +34,28 @@ class GoldBroFastParser(SignalParser):
     
     def parse(self, text: str) -> Optional[ParseResult]:
         norm = self.normalize(text)
-        
+
         # Skip if looks like complete signal with TP/SL
         if self.COMPLETE_SIGNAL_PATTERN.search(norm):
             return None
-        
+
         # Must have symbol
-            symbol_match = self.SYMBOL_PATTERN.search(norm)
-            if symbol_match:
-                symbol = symbol_match.group(1).upper()
-            else:
-                symbol = "NO-SYMBOL"
-        
+        symbol_match = self.SYMBOL_PATTERN.search(norm)
+        if symbol_match:
+            symbol = symbol_match.group(1).upper()
+        else:
+            symbol = "NO-SYMBOL"
+
         # Must have direction
         is_buy = self.BUY_PATTERN.search(norm) is not None
         is_sell = self.SELL_PATTERN.search(norm) is not None
         if not (is_buy or is_sell):
             return None
-        
+
         # Must have urgency indicator
         if not self.URGENCY_PATTERN.search(norm):
             return None
-        
+
         # Extract optional price hint
         hint = None
         price_match = self.PRICE_PATTERN.search(norm)
@@ -64,7 +66,16 @@ class GoldBroFastParser(SignalParser):
                     hint = v
             except (ValueError, IndexError):
                 pass
-        
+
+        # SL temporal configurable
+        sl_pips = float(os.getenv("FAST_TEMP_SL_PIPS", "70"))
+        sl = None
+        if hint is not None:
+            if is_buy:
+                sl = hint - sl_pips
+            elif is_sell:
+                sl = hint + sl_pips
+
         direction = "BUY" if is_buy else "SELL"
         return ParseResult(
             format_tag=self.format_tag,
@@ -73,4 +84,5 @@ class GoldBroFastParser(SignalParser):
             direction=direction,
             is_fast=True,
             hint_price=hint,
+            sl=sl,
         )

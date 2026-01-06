@@ -7,7 +7,21 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
+
+import httpx
 from telethon import TelegramClient
+class RemoteTelegramNotifier:
+    """
+    Sends notifications to a remote HTTP API endpoint (e.g., FastAPI Telegram notification service).
+    """
+    def __init__(self, api_url: str):
+        self.api_url = api_url.rstrip("/")
+
+    async def notify(self, chat_id: str, message: str):
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{self.api_url}/notify", json={"chat_id": chat_id, "message": message})
+            resp.raise_for_status()
+            return resp.json()
 
 log = logging.getLogger("telegram_notifier")
 
@@ -228,7 +242,11 @@ class TelegramNotifier:
         if not config or not config.chat_id or not config.enabled:
             log.debug(f"[NOTIFY][SKIP] {account_name}: notification disabled or no chat_id")
             return
-        
+
+        if self.client is None:
+            log.error(f"[NOTIFY][CRITICAL] {account_name}: Telegram client is None. Cannot send message. Check initialization.")
+            return
+
         try:
             await self.client.send_message(config.chat_id, message)
             log.info(f"[NOTIFY] → {account_name} (chat_id={config.chat_id}): notification sent")

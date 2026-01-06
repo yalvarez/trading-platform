@@ -1,6 +1,37 @@
-import asyncio
 import redis.asyncio as redis
 from typing import Any, Dict, Optional
+
+import redis.asyncio as redis
+from typing import Any, Dict, Optional
+
+async def create_consumer_group(r: "redis.Redis", stream: str, group: str):
+    try:
+        await r.xgroup_create(stream, group, id='0', mkstream=True)
+    except Exception as e:
+        if 'BUSYGROUP' in str(e):
+            return  # Grupo ya existe
+        raise
+
+async def xreadgroup_loop(
+    r: "redis.Redis",
+    stream: str,
+    group: str,
+    consumer: str,
+    block_ms: int = 2000,
+    count: int = 50,
+    ): 
+    while True:
+        resp = await r.xreadgroup(group, consumer, {stream: '>'}, block=block_ms, count=count)
+        if not resp:
+            continue
+        for _, msgs in resp:
+            for msg_id, fields in msgs:
+                yield msg_id, fields
+
+async def xack(r: "redis.Redis", stream: str, group: str, msg_id: str):
+    await r.xack(stream, group, msg_id)
+
+import asyncio
 
 class Streams:
     RAW = "raw_messages"
@@ -8,16 +39,16 @@ class Streams:
     MGMT = "mgmt_messages"
     EVENTS = "trade_events"
 
-async def redis_client(redis_url: str) -> redis.Redis:
+async def redis_client(redis_url: str) -> "redis.Redis":
     r = redis.from_url(redis_url, decode_responses=True)
     await r.ping()
     return r
 
-async def xadd(r: redis.Redis, stream: str, data: Dict[str, Any]) -> str:
+async def xadd(r: "redis.Redis", stream: str, data: Dict[str, Any]) -> str:
     return await r.xadd(stream, data, maxlen=10000, approximate=True)
 
 async def xread_loop(
-    r: redis.Redis,
+    r: "redis.Redis",
     stream: str,
     last_id: str = "$",
     block_ms: int = 2000,
