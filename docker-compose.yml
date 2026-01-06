@@ -48,53 +48,53 @@ services:
     volumes:
       - mt5_acct2_config:/config
 
-  # mt5_acct3:
-  #   image: gmag11/metatrader5_vnc:latest
-  #   container_name: atp-mt5-acct3
-  #   environment:
-  #     - CUSTOM_USER=${MT5_WEB_USER}
-  #     - PASSWORD=${MT5_WEB_PASS}
-  #   ports:
-  #     - "3003:3000"
-  #     - "8003:8001"
-  #   volumes:
-  #     - mt5_acct3_config:/config
+  mt5_acct3:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct3
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3003:3000"
+      - "8003:8001"
+    volumes:
+      - mt5_acct3_config:/config
 
-  # mt5_acct4:
-  #   image: gmag11/metatrader5_vnc:latest
-  #   container_name: atp-mt5-acct4
-  #   environment:
-  #     - CUSTOM_USER=${MT5_WEB_USER}
-  #     - PASSWORD=${MT5_WEB_PASS}
-  #   ports:
-  #     - "3004:3000"
-  #     - "8004:8001"
-  #   volumes:
-  #     - mt5_acct4_config:/config
+  mt5_acct4:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct4
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3004:3000"
+      - "8004:8001"
+    volumes:
+      - mt5_acct4_config:/config
 
-  # mt5_acct5:
-  #   image: gmag11/metatrader5_vnc:latest
-  #   container_name: atp-mt5-acct5
-  #   environment:
-  #     - CUSTOM_USER=${MT5_WEB_USER}
-  #     - PASSWORD=${MT5_WEB_PASS}
-  #   ports:
-  #     - "3005:3000"
-  #     - "8005:8001"
-  #   volumes:
-  #     - mt5_acct5_config:/config
+  mt5_acct5:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct5
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3005:3000"
+      - "8005:8001"
+    volumes:
+      - mt5_acct5_config:/config
 
-  # mt5_acct6:
-  #   image: gmag11/metatrader5_vnc:latest
-  #   container_name: atp-mt5-acct6
-  #   environment:
-  #     - CUSTOM_USER=${MT5_WEB_USER}
-  #     - PASSWORD=${MT5_WEB_PASS}
-  #   ports:
-  #     - "3006:3000"
-  #     - "8006:8001"
-  #   volumes:
-  #     - mt5_acct6_config:/config
+  mt5_acct6:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct6
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3006:3000"
+      - "8006:8001"
+    volumes:
+      - mt5_acct6_config:/config
 
   telegram_ingestor:
     build:
@@ -166,7 +166,7 @@ volumes:
   redis_data:
   mt5_acct1_config:
   mt5_acct2_config:
-  # mt5_acct3_config:
-  # mt5_acct4_config:
-  # mt5_acct5_config:
-  # mt5_acct6_config:
+  mt5_acct3_config:
+  mt5_acct4_config:
+  mt5_acct5_config:
+  mt5_acct6_config:
