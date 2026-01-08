@@ -164,6 +164,7 @@ class MT5Executor:
                     lot = 0.03
             # --- FIN LOTE ---
 
+            log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
             req = {
                 "action": 1,
                 "symbol": symbol,

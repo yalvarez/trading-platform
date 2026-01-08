@@ -20,12 +20,14 @@ from common.config import FAST_UPDATE_WINDOW_SECONDS
 
 class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0):
+        from parsers_limitless import LimitlessParser
         self.parsers = [
             DailySignalParser(),
             ToroFxParser(),
             GoldBroScalpParser(),
             GoldBroLongParser(),
             GoldBroFastParser(),
+            LimitlessParser(),
         ]
         self.deduplicator = SignalDeduplicator(redis_client, ttl_seconds=dedup_ttl)
         # Ventana de actualización para señales FAST (segundos)
