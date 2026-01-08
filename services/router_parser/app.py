@@ -5,11 +5,13 @@ from common.signal_dedup import SignalDeduplicator
 from gb_filters import looks_like_followup
 from torofx_filters import looks_like_torofx_management
 from parsers_base import SignalParser, ParseResult
+
 from parsers_goldbro_fast import GoldBroFastParser
 from parsers_goldbro_long import GoldBroLongParser
 from parsers_goldbro_scalp import GoldBroScalpParser
 from parsers_torofx import ToroFxParser
 from parsers_daily_signal import DailySignalParser
+from parsers_hannah import HannahParser
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log = logging.getLogger("router_parser")
@@ -22,6 +24,7 @@ class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0):
         from parsers_limitless import LimitlessParser
         self.parsers = [
+            HannahParser(),
             DailySignalParser(),
             ToroFxParser(),
             GoldBroScalpParser(),
