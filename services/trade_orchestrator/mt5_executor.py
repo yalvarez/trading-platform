@@ -89,11 +89,25 @@ class MT5Executor:
 
         log.info("open_complete_trade start provider=%s symbol=%s direction=%s entry=%s sl=%s tps=%s", provider_tag, symbol, direction, str(entry_range), str(sl), str(tps))
 
+
+        # --- Forzar SL por defecto si no viene ---
+        default_sl_pips = 60.0  # Puedes parametrizar esto si lo deseas
+        async def get_forced_sl(client, symbol, direction, price):
+            # Calcula un SL a X pips del precio de entrada
+            info = client.symbol_info(symbol)
+            point = float(getattr(info, "point", 0.01)) if info else 0.01
+            sl_distance = default_sl_pips * point
+            if direction == "BUY":
+                return price - sl_distance
+            else:
+                return price + sl_distance
+
         if not self._should_operate_now():
             reason = "Outside trading windows (London/NY)."
             for a in [x for x in self.accounts if x.get("active")]:
                 errors[a["name"]] = reason
             return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)
+
 
         async def send_order(account):
             name = account["name"]
@@ -102,6 +116,12 @@ class MT5Executor:
             price = client.tick_price(symbol, direction)
             order_type = 0 if direction == "BUY" else 1
 
+            # --- Forzar SL si es necesario ---
+            forced_sl = sl
+            if not forced_sl or float(forced_sl) == 0.0:
+                forced_sl = await get_forced_sl(client, symbol, direction, price)
+                log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
+
             # --- LOTE DINÁMICO O FIJO ---
             lot = 0.01
             fixed_lot = float(account.get("fixed_lot", 0))
@@ -109,7 +129,7 @@ class MT5Executor:
             balance = 0.0
             if fixed_lot > 0:
                 lot = fixed_lot
-            elif risk_percent > 0 and sl and float(sl) > 0:
+            elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
                 # Obtener balance actual
                 try:
                     acc_info = client.mt5.account_info()
@@ -120,7 +140,7 @@ class MT5Executor:
                 # Calcular riesgo monetario
                 risk_money = balance * (risk_percent / 100.0)
                 # Calcular distancia SL en precio
-                sl_distance = abs(float(price) - float(sl))
+                sl_distance = abs(float(price) - float(forced_sl))
                 # Obtener info de símbolo
                 try:
                     symbol_info = client.symbol_info(symbol)
@@ -150,7 +170,7 @@ class MT5Executor:
                 "volume": float(lot),
                 "type": order_type,
                 "price": float(price),
-                "sl": float(sl),
+                "sl": float(forced_sl),
                 "tp": 0.0,
                 "deviation": int(self.default_deviation),
                 "magic": int(self.magic),
