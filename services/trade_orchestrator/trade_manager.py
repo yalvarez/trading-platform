@@ -48,6 +48,40 @@ class ManagedTrade:
 
 
 class TradeManager:
+    def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
+        if desired_percent >= 100:
+            return 100
+
+        # Use the first active account for context (should be refactored to always have account)
+        account = next((a for a in self.mt5.accounts if a.get("active")), None)
+        client = self.mt5._client_for(account) if account else None
+        pos_list = client.positions_get(ticket=int(ticket)) if client else []
+        if not pos_list:
+            return desired_percent
+        pos = pos_list[0]
+
+        info = client.symbol_info(pos.symbol) if client else None
+        if not info:
+            return desired_percent
+
+        v = float(pos.volume)
+        step = float(info.volume_step) if float(info.volume_step) > 0 else 0.0
+        vmin = float(info.volume_min) if float(info.volume_min) > 0 else 0.0
+
+        if v <= 0 or step <= 0 or vmin <= 0:
+            return desired_percent
+
+        raw_close = v * (float(desired_percent) / 100.0)
+        close_vol = step * round(raw_close / step)
+
+        if close_vol < vmin or close_vol <= 0:
+            return 100
+
+        remaining = v - close_vol
+        if remaining > 0 and remaining < vmin:
+            return 100
+
+        return desired_percent
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
         # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
