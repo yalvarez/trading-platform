@@ -17,13 +17,20 @@ async def main():
                 log.warning(f"[WATCHDOG] ⚠️ No se reciben mensajes desde hace {int(now-last)}s. Posible desconexión o bloqueo.")
             await asyncio.sleep(60)
 
+    import json
+    from common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s.redis_url)
 
     api_id = int(env("TG_API_ID"))
     api_hash = env("TG_API_HASH")
     phone = env("TG_PHONE")
-    chats = [c.strip() for c in env("TG_SOURCE_CHATS","").split(",") if c.strip()]
+    try:
+        channels_config = json.loads(CHANNELS_CONFIG_JSON)
+        chats = list(channels_config.keys())
+    except Exception as e:
+        log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
+        chats = []
 
     client = TelegramClient("telegram_ingestor", api_id, api_hash)
 

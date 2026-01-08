@@ -28,6 +28,10 @@ class HannahParser(SignalParser):
         lines = [l.strip() for l in norm.splitlines() if l.strip()]
         if not lines:
             return None
+        # Hannah signals must start with 'BUY NOW' or 'SELL NOW'
+        first_line = lines[0].upper()
+        if not (first_line.startswith('GOLD BUY NOW') or first_line.startswith('GOLD SELL NOW')):
+            return None
         # Symbol
         symbol = None
         for l in lines:
@@ -39,13 +43,10 @@ class HannahParser(SignalParser):
             return None
         # Direction
         direction = None
-        for l in lines:
-            if self.BUY_PATTERN.search(l):
-                direction = "BUY"
-                break
-            if self.SELL_PATTERN.search(l):
-                direction = "SELL"
-                break
+        if 'BUY' in first_line:
+            direction = "BUY"
+        elif 'SELL' in first_line:
+            direction = "SELL"
         if not direction:
             return None
         # Entry range

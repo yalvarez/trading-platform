@@ -21,25 +21,32 @@ log = logging.getLogger("router_parser")
 from common.config import FAST_UPDATE_WINDOW_SECONDS
 
 class SignalRouter:
-    def __init__(self, redis_client, dedup_ttl=120.0):
+    def __init__(self, redis_client, dedup_ttl=120.0, channels_config=None):
         from parsers_limitless import LimitlessParser
-        self.parsers = [
-            HannahParser(),
-            DailySignalParser(),
-            ToroFxParser(),
-            GoldBroScalpParser(),
-            GoldBroLongParser(),
-            GoldBroFastParser(),
-            LimitlessParser(),
-        ]
+        self.parser_map = {
+            'hannah': HannahParser(),
+            'goldbro_long': GoldBroLongParser(),
+            'goldbro_fast': GoldBroFastParser(),
+            'goldbro_scalp': GoldBroScalpParser(),
+            'torofx': ToroFxParser(),
+            'daily_signal': DailySignalParser(),
+            'limitless': LimitlessParser(),
+        }
+        self.channels_config = channels_config or {}
         self.deduplicator = SignalDeduplicator(redis_client, ttl_seconds=dedup_ttl)
-        # Ventana de actualización para señales FAST (segundos)
         self.fast_update_window = FAST_UPDATE_WINDOW_SECONDS
         self.redis = redis_client
 
-    def parse_signal(self, text):
+    def parse_signal(self, text, chat_id=None):
         norm = text.strip()
-        for parser in self.parsers:
+        parsers = []
+        if chat_id and str(chat_id) in self.channels_config:
+            parser_names = self.channels_config[str(chat_id)]
+            parsers = [self.parser_map[name] for name in parser_names if name in self.parser_map]
+        # Si no hay parsers configurados para el canal, usar todos
+        if not parsers:
+            parsers = list(self.parser_map.values())
+        for parser in parsers:
             try:
                 result = parser.parse(norm)
                 if result:
@@ -52,7 +59,7 @@ class SignalRouter:
         return None
 
     async def process_raw_signal(self, chat_id, text):
-        parse_result = self.parse_signal(text)
+        parse_result = self.parse_signal(text, chat_id=chat_id)
         if not parse_result:
             return None
 
@@ -94,9 +101,16 @@ class SignalRouter:
         }
 
 async def main():
+    import json
+    from common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s.redis_url)
-    router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds)
+    try:
+        channels_config = json.loads(CHANNELS_CONFIG_JSON)
+    except Exception as e:
+        log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
+        channels_config = {}
+    router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds, channels_config=channels_config)
     group = "router_group"
     consumer = f"consumer_{os.getpid()}"
     await create_consumer_group(r, Streams.RAW, group)
