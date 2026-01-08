@@ -11,6 +11,41 @@ from typing import Optional
 import httpx
 from telethon import TelegramClient
 class RemoteTelegramNotifier:
+    async def notify_trade_opened(self, account_name: str, ticket: int, symbol: str, direction: str, entry_price: float, sl_price: float, tp_prices: list, lot: float, provider: str):
+        import os, json
+        msg = f"""
+🎯 TRADE OPENED
+━━━━━━━━━━━━━━━━
+📊 Account: `{account_name}`
+🏷️ Provider: `{provider}`
+📈 Symbol: `{symbol}` {direction}
+🎲 Ticket: `{ticket}`
+📍 Entry: `{entry_price}`
+"""
+        if lot > 0:
+            msg += f"📦 Lot: `{lot:.2f}`\n"
+        if sl_price is not None:
+            msg += f"🛑 SL: `{sl_price}`\n"
+        if tp_prices:
+            msg += "🎁 TPs:\n"
+            for i, tp in enumerate(tp_prices, 1):
+                msg += f"   TP{i}: `{tp}`\n"
+
+        # Leer ACCOUNTS_JSON y buscar el chat_id de la cuenta
+        accounts_env = os.getenv('ACCOUNTS_JSON', '[]')
+        try:
+            accounts_list = json.loads(accounts_env)
+        except Exception:
+            accounts_list = []
+        chat_id = None
+        for acct in accounts_list:
+            if acct.get('name') == account_name:
+                chat_id = acct.get('chat_id')
+                break
+        if not chat_id:
+            return
+        await self.notify(chat_id, msg)
+
     """
     Sends notifications to a remote HTTP API endpoint (e.g., FastAPI Telegram notification service).
     """
