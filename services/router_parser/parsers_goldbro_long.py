@@ -38,10 +38,18 @@ class GoldBroLongParser(SignalParser):
         log.debug("[GB_LONG_PARSE] norm=%r", norm[:400])
         
         # Must have symbol
-        has_symbol = bool(self.SYMBOL_PATTERN.search(norm))
+        symbol_match = self.SYMBOL_PATTERN.search(norm)
+        has_symbol = bool(symbol_match)
         log.debug("[GB_LONG_PARSE] has_symbol=%s", has_symbol)
         if not has_symbol:
             return None
+
+        # Map alias to standard symbol
+        symbol_raw = symbol_match.group(1).lower() if symbol_match else None
+        if symbol_raw in ["gold", "oro", "xau", "xauusd"]:
+            symbol = "XAUUSD"
+        else:
+            symbol = symbol_raw.upper() if symbol_raw else "NO-SYMBOL"
         
         # Must have direction
         is_buy = self.BUY_PATTERN.search(norm) is not None
@@ -98,7 +106,7 @@ class GoldBroLongParser(SignalParser):
         return ParseResult(
             format_tag=self.format_tag,
             provider_tag="GB_LONG",
-            symbol="NO-SYMBOL",
+            symbol=symbol,
             direction=direction,
             entry_range=(entry_min, entry_max),
             sl=sl,
