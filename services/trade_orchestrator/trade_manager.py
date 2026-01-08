@@ -545,97 +545,105 @@ class TradeManager:
                 return
             pos = pos_list[0]
             entry = float(pos.price_open)
-            symbol = getattr(pos, 'symbol', None)
-            acc_name = account.get('name')
-            be_offset = self.be_offset_pips
-            if hasattr(self, 'config'):
-                try:
-                    be_offset = self.config.get('be_offset_pips', {}).get(acc_name, {}).get(symbol, be_offset)
-                    log.info(f"[BE-DEBUG] be_offset override | acc={acc_name} symbol={symbol} be_offset={be_offset}")
-                except Exception as e:
-                    log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
-            offset = be_offset * point
-            be = (entry + offset) if is_buy else (entry - offset)
-            log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
+            import asyncio
+            log.info(f"[BE-DEBUG] INICIO _do_be | account={account.get('name')} ticket={ticket} is_buy={is_buy}")
+            client = self.mt5._client_for(account)
+            max_retries = 3
+            delay_seconds = 2
+            for attempt in range(1, max_retries + 1):
+                pos_list = client.positions_get(ticket=int(ticket))
+                log.info(f"[BE-DEBUG] positions_get result | ticket={ticket} pos_list={pos_list}")
+                if not pos_list:
+                    log.warning(f"[BE-DEBUG] No position found for ticket={ticket} en _do_be (attempt {attempt})")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay_seconds)
+                        continue
+                    log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - No position found")
+                    self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nNo se encontró la posición para aplicar BE.")
+                    await self.notify_trade_event(
+                        'be',
+                        account_name=account["name"],
+                        message=f"❌ BE falló | Ticket: {int(ticket)}\nNo se encontró la posición para aplicar BE."
+                    )
+                    return
+                pos = pos_list[0]
+                entry = float(pos.price_open)
+                symbol = getattr(pos, 'symbol', None)
+                acc_name = account.get('name')
+                be_offset = self.be_offset_pips
+                if hasattr(self, 'config'):
+                    try:
+                        be_offset = self.config.get('be_offset_pips', {}).get(acc_name, {}).get(symbol, be_offset)
+                        log.info(f"[BE-DEBUG] be_offset override | acc={acc_name} symbol={symbol} be_offset={be_offset}")
+                    except Exception as e:
+                        log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
+                offset = be_offset * point
+                be = (entry + offset) if is_buy else (entry - offset)
+                log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
+                # Chequeo de volumen mínimo
+                info = client.symbol_info(symbol) if symbol else None
+                v = float(getattr(pos, 'volume', 0.0))
+                vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
+                if v < vmin or v == 0.0:
+                    log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - Volumen insuficiente v={v} vmin={vmin}")
+                    self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})")
+                    await self.notify_trade_event(
+                        'be',
+                        account_name=account["name"],
+                        message=f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})"
+                    )
+                    return
 
-            # Chequeo de volumen mínimo
-            info = client.symbol_info(symbol) if symbol else None
-            v = float(getattr(pos, 'volume', 0.0))
-            vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
-            if v < vmin or v == 0.0:
-                log.warning(f"[BE-DEBUG] Volumen insuficiente para modificar SL | ticket={ticket} v={v} vmin={vmin}")
-                self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})")
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})"
-                )
-                return
-
-            req = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": int(ticket),
-                "symbol": symbol,
-                "sl": float(be),
-                "tp": 0.0,
-                "volume": v,
-                "deviation": getattr(self, "deviation", 20),
-            }
-            log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
-            res = client.order_send(req)
-            log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-            # Manejo de filling mode no soportado
-            if res and getattr(res, 'retcode', None) == 10030 and 'Unsupported filling mode' in getattr(res, 'comment', ''):
-                log.warning(f"[TM] BE failed ticket={ticket} retcode=10030 comment=Unsupported filling mode (no reintentar)")
-                self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode")
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode"
-                )
-                return
-            ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
-            if ok:
-                self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
-                log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
-                )
-                log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
-                return
-            else:
-                log.warning("[TM] BE failed ticket=%s retcode=%s comment=%s (attempt %d)", int(ticket), getattr(res,'retcode',None), getattr(res,'comment',None), attempt)
-                if attempt < max_retries:
-                    await asyncio.sleep(delay_seconds)
-                    continue
-                self._notify_bg(
-                    account["name"],
-                    f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-                )
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-                )
-                log.info(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket}")
-                return
-
-    def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
-        if desired_percent >= 100:
-            return 100
-
-        # Use the first active account for context (should be refactored to always have account)
-        account = next((a for a in self.mt5.accounts if a.get("active")), None)
-        client = self.mt5._client_for(account) if account else None
-        pos_list = client.positions_get(ticket=int(ticket)) if client else []
-        if not pos_list:
-            return desired_percent
-        pos = pos_list[0]
-
-        info = client.symbol_info(pos.symbol) if client else None
-        if not info:
+                req = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": int(ticket),
+                    "symbol": symbol,
+                    "sl": float(be),
+                    "tp": 0.0,
+                    "volume": v,
+                    "deviation": getattr(self, "deviation", 20),
+                }
+                log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
+                res = client.order_send(req)
+                log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+                # Manejo de filling mode no soportado
+                if res and getattr(res, 'retcode', None) == 10030 and 'Unsupported filling mode' in getattr(res, 'comment', ''):
+                    log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - Unsupported filling mode")
+                    self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode")
+                    await self.notify_trade_event(
+                        'be',
+                        account_name=account["name"],
+                        message=f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode"
+                    )
+                    return
+                ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
+                if ok:
+                    self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
+                    log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
+                    await self.notify_trade_event(
+                        'be',
+                        account_name=account["name"],
+                        message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
+                    )
+                    log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
+                    return
+                else:
+                    retcode = getattr(res, 'retcode', None)
+                    comment = getattr(res, 'comment', None)
+                    log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment} (attempt {attempt})")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay_seconds)
+                        continue
+                    self._notify_bg(
+                        account["name"],
+                        f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
+                    )
+                    await self.notify_trade_event(
+                        'be',
+                        account_name=account["name"],
+                        message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
+                    )
+                    return
             return desired_percent
 
         v = float(pos.volume)
