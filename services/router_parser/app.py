@@ -134,7 +134,15 @@ async def main():
                             sig_dict[k] = str(v).lower()
                         elif k == "entry_range" and v is not None:
                             try:
-                                sig_dict[k] = json.dumps(v)
+                                # Si ya es string, intentar cargar y volver a serializar
+                                if isinstance(v, str):
+                                    try:
+                                        val = json.loads(v)
+                                        sig_dict[k] = json.dumps(val)
+                                    except Exception:
+                                        sig_dict[k] = json.dumps([v])
+                                else:
+                                    sig_dict[k] = json.dumps(v)
                             except Exception:
                                 sig_dict[k] = str(v)
                         elif isinstance(v, (list, tuple)):
