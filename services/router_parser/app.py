@@ -43,8 +43,9 @@ class SignalRouter:
 
     def parse_signal(self, text, chat_id=None):
         norm = text.strip()
-        # --- PRIORIDAD LIMITLESS: si contiene 'Risk Price', forzar LimitlessParser ---
-        if 'risk price' in norm.lower():
+        # --- 1. LIMITLESS si tiene 'Risk Price' ---
+        norm_lower = norm.lower()
+        if 'risk price' in norm_lower:
             from parsers_limitless import LimitlessParser
             parser = LimitlessParser()
             try:
@@ -61,7 +62,37 @@ class SignalRouter:
                     return result
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] LimitlessParser: {e}")
-        # --- Normal routing ---
+            return None
+        # --- 2. TOROFX si tiene 'Target: open' ---
+        if 'target: open' in norm_lower:
+            from parsers_torofx import ToroFxParser
+            parser = ToroFxParser()
+            try:
+                result = parser.parse(norm)
+                if result:
+                    if hasattr(result, 'entry_range') and result.entry_range is not None:
+                        try:
+                            entry_range = list(map(float, result.entry_range))
+                            result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
+                        except Exception as e:
+                            log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
+                            result = result.__class__(**{**result.__dict__, 'entry_range': None})
+                    log.debug(f"[PARSE] {parser.format_tag} matched (TOROFX priority)")
+                    return result
+            except Exception as e:
+                log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
+            return None
+        # --- 3. HANNAH si hace match ---
+        from parsers_hannah import HannahParser
+        hannah_parser = HannahParser()
+        try:
+            result = hannah_parser.parse(norm)
+            if result:
+                log.debug(f"[PARSE] {hannah_parser.format_tag} matched (HANNAH priority)")
+                return result
+        except Exception as e:
+            log.warning(f"[PARSE_ERROR] HannahParser: {e}")
+        # --- 4. Normal routing ---
         parsers = []
         if chat_id and str(chat_id) in self.channels_config:
             parser_names = self.channels_config[str(chat_id)]
