@@ -1,3 +1,4 @@
+import os
 # Configuración unificada de canales y parsers
 CHANNELS_CONFIG_JSON = os.getenv("CHANNELS_CONFIG_JSON", "{}")
 import os, json
