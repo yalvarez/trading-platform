@@ -142,19 +142,26 @@ async def main():
                                         v_clean = v_clean[1:-1]
                                         parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
                                         sig_dict[k] = json.dumps(parts)
+                                        # Sobrescribe el valor en el objeto original para downstream
+                                        sig[k] = json.dumps(parts)
                                     else:
                                         # Si es string pero no formato tupla, intenta cargar como JSON
                                         try:
                                             val = json.loads(v)
                                             sig_dict[k] = json.dumps(val)
+                                            sig[k] = json.dumps(val)
                                         except Exception:
                                             sig_dict[k] = json.dumps([])
+                                            sig[k] = json.dumps([])
                                 elif isinstance(v, (tuple, list)):
                                     sig_dict[k] = json.dumps(list(v))
+                                    sig[k] = json.dumps(list(v))
                                 else:
                                     sig_dict[k] = json.dumps([])
+                                    sig[k] = json.dumps([])
                             except Exception:
                                 sig_dict[k] = json.dumps([])
+                                sig[k] = json.dumps([])
                         elif isinstance(v, (list, tuple)):
                             sig_dict[k] = json.dumps(v)
                         elif v is None:
