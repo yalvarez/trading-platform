@@ -5,7 +5,7 @@ Format: GOLD MARKET BUY Entry: 2500, SL: 2490, TP1: 2515, TP2: 2530, TP3: 2550
 
 import re
 from typing import Optional
-from .parsers_base import SignalParser, ParseResult
+from parsers_base import SignalParser, ParseResult
 import logging
 
 log = logging.getLogger("router_parser")

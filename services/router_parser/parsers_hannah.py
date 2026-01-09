@@ -10,7 +10,7 @@ TP2 4466
 
 import re
 from typing import Optional
-from .parsers_base import SignalParser, ParseResult
+from parsers_base import SignalParser, ParseResult
 
 class HannahParser(SignalParser):
     format_tag = "HANNAH"
