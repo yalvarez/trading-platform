@@ -8,7 +8,8 @@ log = logging.getLogger("router_parser")
 class LimitlessParser(SignalParser):
     format_tag = "LIMITLESS"
 
-    SYMBOL_PATTERN = re.compile(r'\b(GOLD|XAUUSD|XAU|ORO)\b', re.IGNORECASE)
+    # Accept GOLD, XAUUSD, ORO, and any symbol like BTCUSD, ETHUSD, etc.
+    SYMBOL_PATTERN = re.compile(r'\b([A-Z]{3,6}USD|GOLD|XAUUSD|XAU|ORO)\b', re.IGNORECASE)
     SELL_PATTERN = re.compile(r'\bSELL\b', re.IGNORECASE)
     BUY_PATTERN = re.compile(r'\bBUY\b', re.IGNORECASE)
     ZONE_PATTERN = re.compile(r'Zone[:\s]*([\d.]+)\s*[-–]\s*([\d.]+)', re.IGNORECASE)
@@ -22,7 +23,7 @@ class LimitlessParser(SignalParser):
         symbol_match = self.SYMBOL_PATTERN.search(norm)
         if not symbol_match:
             return None
-        symbol = "XAUUSD"
+        symbol = symbol_match.group(1).upper()
 
         is_buy = self.BUY_PATTERN.search(norm) is not None
         is_sell = self.SELL_PATTERN.search(norm) is not None
