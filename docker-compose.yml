@@ -1,4 +1,18 @@
+version: "3.9"
 services:
+  db:
+    image: postgres:15-alpine
+    container_name: atp-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=trading_platform
+      - POSTGRES_USER=atpuser
+      - POSTGRES_PASSWORD=atppass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./backend/alembic/versions:/migrations:ro
   redis:
     image: redis:7-alpine
     container_name: atp-redis
@@ -103,7 +117,11 @@ services:
     container_name: atp-telegram-ingestor
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://atpuser:atppass@db:5432/trading_platform
     depends_on:
+      db:
+        condition: service_started
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -119,6 +137,8 @@ services:
     container_name: atp-router-parser
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://atpuser:atppass@db:5432/trading_platform
     depends_on:
       redis:
         condition: service_healthy
@@ -132,6 +152,8 @@ services:
     env_file:
       - .env
     depends_on:
+      db:
+        condition: service_started
       mt5_acct1:
         condition: service_healthy
       redis:
@@ -145,7 +167,11 @@ services:
     container_name: atp-trade-orchestrator
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://atpuser:atppass@db:5432/trading_platform
     depends_on:
+      db:
+        condition: service_started
       mt5_acct1:
         condition: service_started
       mt5_acct2:
@@ -206,10 +232,11 @@ services:
     restart: unless-stopped
 
 volumes:
-  redis_data:
-  mt5_acct1_config:
-  mt5_acct2_config:
-  mt5_acct3_config:
-  mt5_acct4_config:
-  mt5_acct5_config:
-  mt5_acct6_config:
+  redis_data: {}
+  mt5_acct1_config: {}
+  mt5_acct2_config: {}
+  mt5_acct3_config: {}
+  mt5_acct4_config: {}
+  mt5_acct5_config: {}
+  mt5_acct6_config: {}
+  pg_data: {}
