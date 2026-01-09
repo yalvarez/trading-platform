@@ -2,6 +2,27 @@ from mt5linux import MetaTrader5
 
 
 class MT5Client:
+    def get_pip_size(self, symbol: str) -> float:
+        """
+        Returns the pip size for a given symbol using symbol_info.
+        Tries pip_size, then tick_size, then point as fallback.
+        """
+        info = self.symbol_info(symbol)
+        if not info:
+            return 0.0
+        # Try pip_size (custom attribute, not always present)
+        pip_size = getattr(info, 'pip_size', None)
+        if pip_size and pip_size > 0:
+            return float(pip_size)
+        # Try tick_size (MetaTrader5 standard)
+        tick_size = getattr(info, 'tick_size', None)
+        if tick_size and tick_size > 0:
+            return float(tick_size)
+        # Fallback to point (MetaTrader5 standard)
+        point = getattr(info, 'point', None)
+        if point and point > 0:
+            return float(point)
+        return 0.0
     def symbol_info_tick(self, symbol: str):
         """
         Devuelve el tick info del símbolo usando la API subyacente de MetaTrader5.

@@ -98,8 +98,17 @@ class TradeManager:
         fixed_tramo_volume = getattr(self, 'scaling_fixed_tramo_volume', 0.02)  # Nuevo: volumen fijo por tramo
         # Estado: guardar tramos ya ejecutados en t.actions_done
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
-        profit_pips = ((current - entry) / point) if is_buy else ((entry - current) / point)
+        # --- Cálculo de pips correcto por símbolo ---
+        symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
+        client = self.mt5._client_for(account)
+        pip_size = 0.0
+        if hasattr(client, 'get_pip_size'):
+            pip_size = client.get_pip_size(symbol)
+        if not pip_size or pip_size <= 0:
+            pip_size = point  # fallback
+        profit_pips = ((current - entry) / pip_size) if is_buy else ((entry - current) / pip_size)
         if profit_pips < tramo_pips:
+            log.info(f"[SCALING-DEBUG] NO scaling: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} < tramo_pips={tramo_pips}")
             return
         info = self.mt5._client_for(account).symbol_info(pos.symbol)
         step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
@@ -114,6 +123,7 @@ class TradeManager:
             nivel = tramo * tramo_pips
             action_key = f"SCALING_FIXED_{fixed_tramo_volume}_AT_{int(nivel)}"
             if profit_pips >= nivel and action_key not in t.actions_done:
+                log.info(f"[SCALING-DEBUG] ScalingOut: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} nivel={nivel} tramo={tramo}/{max_tramos} fixed_tramo_volume={fixed_tramo_volume} v={v} step={step} vmin={vmin}")
                 t.actions_done.add(action_key)
                 # Último tramo: activa runner
                 if tramo == max_tramos:
@@ -725,26 +735,17 @@ class TradeManager:
                         message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
                     )
                     return
-            return desired_percent
+            return 100
 
         v = float(pos.volume)
         step = float(info.volume_step) if float(info.volume_step) > 0 else 0.0
         vmin = float(info.volume_min) if float(info.volume_min) > 0 else 0.0
 
         if v <= 0 or step <= 0 or vmin <= 0:
-            return desired_percent
-
-        raw_close = v * (float(desired_percent) / 100.0)
-        close_vol = step * round(raw_close / step)
-
-        if close_vol < vmin or close_vol <= 0:
             return 100
 
-        remaining = v - close_vol
-        if remaining > 0 and remaining < vmin:
-            return 100
-
-        return desired_percent
+        # The following logic is not relevant for BE, just return 100
+        return 100
 
     async def _do_partial_close(self, account: dict, ticket: int, percent: int, reason: str):
         log.info(f"[DEBUG] Entering _do_partial_close | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")

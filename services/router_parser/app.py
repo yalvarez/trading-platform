@@ -144,12 +144,31 @@ async def main():
                 sig = ToroFxParser().parse(text)
                 if sig:
                     trace_id = uuid.uuid4().hex[:8]
-                    # Always ensure entry_range is a valid JSON array
-                    entry_range = json.dumps(list(map(float, sig.entry_range))) if sig.entry_range is not None else json.dumps([])
                     sig_dict = {}
+                    # --- SERIALIZACIÓN ROBUSTA DE entry_range ---
+                    entry_range_val = sig.entry_range
+                    import json
+                    if entry_range_val is None:
+                        entry_range_json = json.dumps([])
+                    elif isinstance(entry_range_val, str):
+                        v_clean = entry_range_val.strip()
+                        if v_clean.startswith('(') and v_clean.endswith(')'):
+                            v_clean = v_clean[1:-1]
+                            parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
+                            entry_range_json = json.dumps(parts)
+                        else:
+                            try:
+                                val = json.loads(v_clean)
+                                entry_range_json = json.dumps(val)
+                            except Exception:
+                                entry_range_json = json.dumps([])
+                    elif isinstance(entry_range_val, (tuple, list)):
+                        entry_range_json = json.dumps(list(entry_range_val))
+                    else:
+                        entry_range_json = json.dumps([])
                     for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
                         if k == "entry_range":
-                            sig_dict[k] = entry_range
+                            sig_dict[k] = entry_range_json
                         elif isinstance(v, bool):
                             sig_dict[k] = str(v).lower()
                         elif isinstance(v, (list, tuple)):
