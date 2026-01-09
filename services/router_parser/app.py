@@ -13,7 +13,11 @@ from parsers_torofx import ToroFxParser
 from parsers_daily_signal import DailySignalParser
 from parsers_hannah import HannahParser
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+
+# Add container label to log format for Grafana filtering
+container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "router_parser"
+log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("router_parser")
 
 
@@ -39,21 +43,37 @@ class SignalRouter:
 
     def parse_signal(self, text, chat_id=None):
         norm = text.strip()
+        # --- PRIORIDAD LIMITLESS: si contiene 'Risk Price', forzar LimitlessParser ---
+        if 'risk price' in norm.lower():
+            from parsers_limitless import LimitlessParser
+            parser = LimitlessParser()
+            try:
+                result = parser.parse(norm)
+                if result:
+                    if hasattr(result, 'entry_range') and result.entry_range is not None:
+                        try:
+                            entry_range = list(map(float, result.entry_range))
+                            result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
+                        except Exception as e:
+                            log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
+                            result = result.__class__(**{**result.__dict__, 'entry_range': None})
+                    log.debug(f"[PARSE] {parser.format_tag} matched (LIMITLESS priority)")
+                    return result
+            except Exception as e:
+                log.warning(f"[PARSE_ERROR] LimitlessParser: {e}")
+        # --- Normal routing ---
         parsers = []
         if chat_id and str(chat_id) in self.channels_config:
             parser_names = self.channels_config[str(chat_id)]
             parsers = [self.parser_map[name] for name in parser_names if name in self.parser_map]
-        # Si no hay parsers configurados para el canal, usar todos
         if not parsers:
             parsers = list(self.parser_map.values())
         for parser in parsers:
             try:
                 result = parser.parse(norm)
                 if result:
-                    # Always ensure entry_range is a tuple of floats or None
                     if hasattr(result, 'entry_range') and result.entry_range is not None:
                         try:
-                            # Convert to list of floats
                             entry_range = list(map(float, result.entry_range))
                             result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
                         except Exception as e:

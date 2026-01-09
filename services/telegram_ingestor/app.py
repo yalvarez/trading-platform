@@ -3,7 +3,11 @@ from telethon import TelegramClient, events
 from common.config import Settings, env
 from common.redis_streams import redis_client, xadd, Streams
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+
+# Add container label to log format for Grafana filtering
+container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "telegram_ingestor"
+log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("telegram_ingestor")
 
 async def main():

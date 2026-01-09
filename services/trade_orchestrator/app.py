@@ -23,7 +23,11 @@ import importlib.util
 from common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
 from prometheus_client import start_http_server
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+
+# Add container label to log format for Grafana filtering
+container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "trade_orchestrator"
+log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("trade_orchestrator")
 
 class NotifierAdapter:

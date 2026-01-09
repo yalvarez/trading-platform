@@ -4,7 +4,11 @@ from common.redis_streams import redis_client, xadd
 
 from mt5linux import MetaTrader5
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+
+# Add container label to log format for Grafana filtering
+container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "market_data"
+log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("market_data")
 
 async def connect_mt5(host="mt5_acct1", port=8001, max_attempts=30):
