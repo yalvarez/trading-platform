@@ -126,12 +126,22 @@ async def main():
                 sig = ToroFxParser().parse(text)
                 if sig:
                     trace_id = uuid.uuid4().hex[:8]
-                    sig = sig.__dict__ if hasattr(sig, "__dict__") else sig
-                    sig["chat_id"] = chat_id
-                    sig["raw_text"] = text
-                    sig["trace"] = trace_id
-                    await xadd(r, Streams.SIGNALS, sig)
-                    log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig.get('direction','')} {sig.get('symbol','')}")
+                    # Convertir todos los valores a tipos compatibles con Redis
+                    sig_dict = {}
+                    for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
+                        if isinstance(v, bool):
+                            sig_dict[k] = str(v).lower()
+                        elif isinstance(v, (list, tuple)):
+                            sig_dict[k] = str(v)
+                        elif v is None:
+                            continue
+                        else:
+                            sig_dict[k] = v
+                    sig_dict["chat_id"] = chat_id
+                    sig_dict["raw_text"] = text
+                    sig_dict["trace"] = trace_id
+                    await xadd(r, Streams.SIGNALS, sig_dict)
+                    log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig_dict.get('direction','')} {sig_dict.get('symbol','')}")
                     await xack(r, Streams.RAW, group, msg_id)
                     continue
                 # Si no parsea, lo manda como gestión
