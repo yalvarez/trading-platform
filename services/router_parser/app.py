@@ -121,15 +121,28 @@ async def main():
         log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])
 
         try:
-            if looks_like_followup(text):
-                await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
-                log.info("[MGMT] GB follow-up")
+            # Si el texto parece gestión TOROFX, priorizar ese parser
+            if looks_like_torofx_management(text):
+                sig = ToroFxParser().parse(text)
+                if sig:
+                    trace_id = uuid.uuid4().hex[:8]
+                    sig = sig.__dict__ if hasattr(sig, "__dict__") else sig
+                    sig["chat_id"] = chat_id
+                    sig["raw_text"] = text
+                    sig["trace"] = trace_id
+                    await xadd(r, Streams.SIGNALS, sig)
+                    log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig.get('direction','')} {sig.get('symbol','')}")
+                    await xack(r, Streams.RAW, group, msg_id)
+                    continue
+                # Si no parsea, lo manda como gestión
+                await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
+                log.info("[MGMT] TOROFX")
                 await xack(r, Streams.RAW, group, msg_id)
                 continue
 
-            if looks_like_torofx_management(text):
-                await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
-                log.info("[MGMT] TOROFX")
+            if looks_like_followup(text):
+                await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
+                log.info("[MGMT] GB follow-up")
                 await xack(r, Streams.RAW, group, msg_id)
                 continue
 
