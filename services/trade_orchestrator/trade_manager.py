@@ -72,16 +72,20 @@ class TradeManager:
             return desired_percent
 
         raw_close = v * (float(desired_percent) / 100.0)
-        close_vol = step * round(raw_close / step)
+        # Ajustar al múltiplo inferior de step
+        close_vol = step * int(raw_close / step)
 
         if close_vol < vmin or close_vol <= 0:
             return 100
 
         remaining = v - close_vol
+        # Si el restante es menor al mínimo, cerrar todo
         if remaining > 0 and remaining < vmin:
             return 100
 
-        return desired_percent
+        # Calcular el porcentaje real que se puede cerrar
+        pct_real = int((close_vol / v) * 100) if v > 0 else desired_percent
+        return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
         # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
@@ -91,26 +95,43 @@ class TradeManager:
             return
         # Configurables
         tramo_pips = getattr(self, 'scaling_tramo_pips', 30.0)
-        percent_per_tramo = getattr(self, 'scaling_percent_per_tramo', 25)
+        fixed_tramo_volume = getattr(self, 'scaling_fixed_tramo_volume', 0.02)  # Nuevo: volumen fijo por tramo
         # Estado: guardar tramos ya ejecutados en t.actions_done
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
         profit_pips = ((current - entry) / point) if is_buy else ((entry - current) / point)
         if profit_pips < tramo_pips:
             return
-        max_tramos = int(100 // percent_per_tramo)
+        info = self.mt5._client_for(account).symbol_info(pos.symbol)
+        step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
+        vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+        v = float(getattr(pos, 'volume', 0.0))
+        # Calcular número de tramos posibles
+        max_tramos = int(v // fixed_tramo_volume)
+        runner_volume = v - (fixed_tramo_volume * max_tramos)
+        # Ajustar runner al múltiplo de step
+        runner_volume = step * int(runner_volume / step) if runner_volume >= vmin else 0.0
         for tramo in range(1, max_tramos + 1):
             nivel = tramo * tramo_pips
-            action_key = f"SCALING_{percent_per_tramo}_AT_{int(nivel)}"
+            action_key = f"SCALING_FIXED_{fixed_tramo_volume}_AT_{int(nivel)}"
             if profit_pips >= nivel and action_key not in t.actions_done:
                 t.actions_done.add(action_key)
-                pct = percent_per_tramo
-                # Si es el último tramo, cierra el 100% restante
+                # Último tramo: activa runner
                 if tramo == max_tramos:
+                    if runner_volume >= vmin:
+                        t.runner_enabled = True
+                        self._notify_bg(
+                            account["name"],
+                            f"🏃‍♂️ Runner activado: {runner_volume:.2f} lotes\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips"
+                        )
+                # Cierre por volumen fijo
+                close_vol = step * int(fixed_tramo_volume / step)
+                pct = int((close_vol / v) * 100) if v > 0 else 100
+                if close_vol < vmin or close_vol <= 0:
                     pct = 100
-                await self._do_partial_close(account, pos.ticket, pct, reason=f"ScalingOut {pct}% @ +{int(nivel)}pips")
+                await self._do_partial_close(account, pos.ticket, pct, reason=f"ScalingOut {pct}% ({close_vol:.2f}) @ +{int(nivel)}pips")
                 self._notify_bg(
                     account["name"],
-                    f"✂️ ScalingOut ejecutado\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips | Cierre: {pct}%"
+                    f"✂️ ScalingOut ejecutado\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips | Cierre: {pct}% ({close_vol:.2f})"
                 )
 
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
@@ -640,11 +661,17 @@ class TradeManager:
                 vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
                 if v < vmin or v == 0.0:
                     log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - Volumen insuficiente v={v} vmin={vmin}")
-                    self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})")
+                    msg = (
+                        f"❌ BE falló | Ticket: {int(ticket)}\n"
+                        f"No se puede modificar el SL porque el volumen actual ({v}) es igual o menor al mínimo permitido ({vmin}).\n"
+                        f"Esto ocurre normalmente cuando la posición ya está por cerrarse o el lote es el último permitido por el broker.\n"
+                        f"No es necesario aplicar BE en este caso."
+                    )
+                    self._notify_bg(account["name"], msg)
                     await self.notify_trade_event(
                         'be',
                         account_name=account["name"],
-                        message=f"❌ BE falló | Ticket: {int(ticket)}\nVolumen insuficiente para modificar SL (v={v}, vmin={vmin})"
+                        message=msg
                     )
                     return
 
@@ -728,7 +755,14 @@ class TradeManager:
         pos = pos_list[0] if pos_list else None
         symbol = getattr(pos, 'symbol', '') if pos else ''
         volume = float(getattr(pos, 'volume', 0.0)) if pos else 0.0
-        close_vol = volume * (float(percent) / 100.0) if volume > 0 else 0.0
+        info = client.symbol_info(symbol) if client else None
+        step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
+        vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+        # Ajustar al múltiplo inferior de step
+        raw_close = volume * (float(percent) / 100.0) if volume > 0 else 0.0
+        close_vol = step * int(raw_close / step)
+        if close_vol < vmin or close_vol <= 0:
+            close_vol = volume
         if ok:
             log.info("[TM] 🎯 partial_close ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
             try:
