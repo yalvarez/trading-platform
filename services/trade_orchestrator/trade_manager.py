@@ -101,14 +101,29 @@ class TradeManager:
         # --- Cálculo de pips correcto por símbolo ---
         symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
         client = self.mt5._client_for(account)
+        # --- Equivalencia de pips: calcula cuántos pips en el activo actual equivalen a la ganancia de XAUUSD ---
         pip_size = 0.0
+        pip_size_xau = 0.0
         if hasattr(client, 'get_pip_size'):
             pip_size = client.get_pip_size(symbol)
+            pip_size_xau = client.get_pip_size('XAUUSD')
         if not pip_size or pip_size <= 0:
             pip_size = point  # fallback
+        if not pip_size_xau or pip_size_xau <= 0:
+            pip_size_xau = pip_size  # fallback: mismo activo
+        # Valor del pip en USD para 0.01 lote
+        info = client.symbol_info(symbol)
+        info_xau = client.symbol_info('XAUUSD')
+        lot = 0.01
+        pip_value = (getattr(info, 'trade_contract_size', 1.0) * lot * pip_size) if info else pip_size
+        pip_value_xau = (getattr(info_xau, 'trade_contract_size', 1.0) * lot * pip_size_xau) if info_xau else pip_size_xau
+        # Cuántos pips en el activo actual equivalen a tramo_pips de oro
+        tramo_pips_equiv = tramo_pips
+        if pip_value > 0 and pip_value_xau > 0:
+            tramo_pips_equiv = tramo_pips * (pip_value_xau / pip_value)
         profit_pips = ((current - entry) / pip_size) if is_buy else ((entry - current) / pip_size)
-        if profit_pips < tramo_pips:
-            log.info(f"[SCALING-DEBUG] NO scaling: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} < tramo_pips={tramo_pips}")
+        if profit_pips < tramo_pips_equiv:
+            log.info(f"[SCALING-DEBUG] NO scaling: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} < tramo_pips_equiv={tramo_pips_equiv:.2f}")
             return
         info = self.mt5._client_for(account).symbol_info(pos.symbol)
         step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
