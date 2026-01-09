@@ -640,6 +640,7 @@ class TradeManager:
                     "tp": 0.0,
                     "volume": v,
                     "deviation": getattr(self, "deviation", 20),
+                    "type_filling": getattr(self.mt5, "_best_filling", lambda s: mt5.ORDER_FILLING_IOC)(symbol),
                 }
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
