@@ -95,15 +95,8 @@ class ToroFxParser(SignalParser):
             except (ValueError, IndexError):
                 pass
         
-        # Extract TPs
-        tps = []
-        for tp_match in self.TP_PATTERN.finditer(norm):
-            try:
-                tp = float(tp_match.group(1))
-                if tp not in tps:
-                    tps.append(tp)
-            except (ValueError, IndexError):
-                pass
+        # ToroFx nunca debe devolver TP, aunque los encuentre en el texto
+        tps = None
         
 
         # Extraer símbolo: si hay 'BUY MARKET XXX' o 'SELL MARKET XXX', tomar la palabra después de MARKET

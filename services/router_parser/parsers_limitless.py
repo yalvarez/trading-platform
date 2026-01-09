@@ -12,7 +12,7 @@ class LimitlessParser(SignalParser):
     SELL_PATTERN = re.compile(r'\bSELL\b', re.IGNORECASE)
     BUY_PATTERN = re.compile(r'\bBUY\b', re.IGNORECASE)
     ZONE_PATTERN = re.compile(r'Zone[:\s]*([\d.]+)\s*[-–]\s*([\d.]+)', re.IGNORECASE)
-    TP_PATTERN = re.compile(r'TP\s*\d*[:\s]*([\d.]+)', re.IGNORECASE)
+    TP_PATTERN = re.compile(r'TP\s*\d*[:]?\s*([\d.]+)', re.IGNORECASE)
     SL_PATTERN = re.compile(r'Risk Price[:\s]*([\d.]+)', re.IGNORECASE)
 
     def parse(self, text: str) -> Optional[ParseResult]:

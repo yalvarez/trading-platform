@@ -42,19 +42,23 @@ class DailySignalParser(SignalParser):
         log.debug("[DAILY_PARSE] norm=%r", norm[:400])
 
 
-        # Extraer símbolo: si hay 'BUY MARKET XXX' o 'SELL MARKET XXX', tomar la palabra después de MARKET
+        # Extraer símbolo: buscar GOLD, ORO, XAU en cualquier parte del texto
         symbol = None
+        symbol_raw = None
+        # Prioridad: MARKET, luego cualquier alias
         market_symbol = re.search(r'(?:BUY|SELL)\s+MARKET\s+([A-Za-z]{3,10})', norm)
         if market_symbol:
             symbol_raw = market_symbol.group(1).upper()
-            log.debug(f"[DAILY_PARSE] market_symbol detectado: {symbol_raw}")
         else:
             symbol_match = self.SYMBOL_EXTRACT_PATTERN.search(norm)
             symbol_raw = symbol_match.group(1).upper() if symbol_match else None
-            if symbol_raw:
-                log.debug(f"[DAILY_PARSE] symbol_match detectado: {symbol_raw}")
+        # Si no se encontró, buscar alias en todo el texto
+        if not symbol_raw:
+            alias_search = re.search(r'\b(XAUUSD|XAU|GOLD|ORO)\b', norm, re.IGNORECASE)
+            if alias_search:
+                symbol_raw = alias_search.group(1).upper()
         # Map aliases to XAUUSD
-        if symbol_raw and symbol_raw in ["XAUUSD", "XAU", "XAUUSD", "GOLD", "ORO"]:
+        if symbol_raw and symbol_raw.upper() in ["XAUUSD", "XAU", "GOLD", "ORO"]:
             symbol = "XAUUSD"
         elif symbol_raw:
             symbol = symbol_raw
