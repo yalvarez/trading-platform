@@ -654,7 +654,6 @@ class TradeManager:
                     "symbol": symbol,
                     "sl": float(be),
                     "tp": 0.0,
-                    "volume": v,
                     "deviation": getattr(self, "deviation", 20),
                     "type_filling": getattr(self.mt5, "_best_filling", lambda s: mt5.ORDER_FILLING_IOC)(symbol),
                 }
