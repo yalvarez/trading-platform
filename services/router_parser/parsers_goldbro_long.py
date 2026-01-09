@@ -36,7 +36,12 @@ class GoldBroLongParser(SignalParser):
     def parse(self, text: str) -> Optional[ParseResult]:
         norm = self.normalize(text)
         log.debug("[GB_LONG_PARSE] norm=%r", norm[:400])
-        
+
+        # Si contiene 'Risk Price', es Limitless, no parsear aquí
+        if "risk price" in norm.lower():
+            log.debug("[GB_LONG_PARSE] Detected 'Risk Price', skipping for LimitlessParser")
+            return None
+
         # Must have symbol
         symbol_match = self.SYMBOL_PATTERN.search(norm)
         has_symbol = bool(symbol_match)
@@ -50,14 +55,14 @@ class GoldBroLongParser(SignalParser):
             symbol = "XAUUSD"
         else:
             symbol = symbol_raw.upper() if symbol_raw else "NO-SYMBOL"
-        
+
         # Must have direction
         is_buy = self.BUY_PATTERN.search(norm) is not None
         is_sell = self.SELL_PATTERN.search(norm) is not None
         log.debug("[GB_LONG_PARSE] is_buy=%s is_sell=%s", is_buy, is_sell)
         if not (is_buy or is_sell):
             return None
-        
+
         # Must have entry range (allow "Entry: 4471-4468" or shorthand like "@4471-4468")
         entry_match = self.ENTRY_PATTERN.search(norm)
         if not entry_match:
@@ -82,7 +87,7 @@ class GoldBroLongParser(SignalParser):
             entry_max = float(entry_match.group(2)) if entry_match.lastindex and entry_match.lastindex >= 2 and entry_match.group(2) else entry_min
         except (ValueError, IndexError):
             return None
-        
+
         # Extract SL
         sl = None
         sl_match = self.SL_PATTERN.search(norm)
@@ -91,7 +96,7 @@ class GoldBroLongParser(SignalParser):
                 sl = float(sl_match.group(1))
             except (ValueError, IndexError):
                 pass
-        
+
         # Extract TPs
         tps = []
         for tp_match in self.TP_PATTERN.finditer(norm):
@@ -101,7 +106,7 @@ class GoldBroLongParser(SignalParser):
                     tps.append(tp)
             except (ValueError, IndexError):
                 pass
-        
+
         direction = "BUY" if is_buy else "SELL"
         return ParseResult(
             format_tag=self.format_tag,
