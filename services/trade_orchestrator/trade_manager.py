@@ -1104,9 +1104,6 @@ class TradeManager:
         # Ejecutar por cada cuenta (solo trades ya registrados TOROFX)
         any_matched_trade = False
         for account in [a for a in self.mt5.accounts if a.get("active")]:
-            if not self.mt5.connect_to_account(account):
-                continue
-
             client = self.mt5._client_for(account)
             positions = client.positions_get()
             if not positions:
