@@ -14,7 +14,9 @@ COPY services/router_parser/torofx_filters.py .
 COPY services/router_parser/parsers_daily_signal.py .
 COPY services/router_parser/parsers_goldbro_fast.py .
 COPY services/router_parser/parsers_goldbro_scalp.py .
+
 COPY services/router_parser/parsers_goldbro_long.py .
 COPY services/router_parser/parsers_torofx.py .
+COPY services/router_parser/parsers_hannah.py .
 
 CMD ["python", "app.py"]
