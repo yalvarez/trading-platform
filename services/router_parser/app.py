@@ -134,6 +134,7 @@ async def main():
                             sig_dict[k] = str(v).lower()
                         elif k == "entry_range" and v is not None:
                             try:
+                                import json
                                 # Si es string tipo '(4502.0, 4500.0)', conviértelo a lista y serializa
                                 if isinstance(v, str):
                                     v_clean = v.strip()
@@ -147,13 +148,13 @@ async def main():
                                             val = json.loads(v)
                                             sig_dict[k] = json.dumps(val)
                                         except Exception:
-                                            sig_dict[k] = json.dumps([v])
+                                            sig_dict[k] = json.dumps([])
                                 elif isinstance(v, (tuple, list)):
                                     sig_dict[k] = json.dumps(list(v))
                                 else:
-                                    sig_dict[k] = json.dumps([v])
+                                    sig_dict[k] = json.dumps([])
                             except Exception:
-                                sig_dict[k] = json.dumps([v])
+                                sig_dict[k] = json.dumps([])
                         elif isinstance(v, (list, tuple)):
                             sig_dict[k] = json.dumps(v)
                         elif v is None:
