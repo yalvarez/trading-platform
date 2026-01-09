@@ -50,6 +50,15 @@ class SignalRouter:
             try:
                 result = parser.parse(norm)
                 if result:
+                    # Always ensure entry_range is a tuple of floats or None
+                    if hasattr(result, 'entry_range') and result.entry_range is not None:
+                        try:
+                            # Convert to list of floats
+                            entry_range = list(map(float, result.entry_range))
+                            result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
+                        except Exception as e:
+                            log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
+                            result = result.__class__(**{**result.__dict__, 'entry_range': None})
                     log.debug(f"[PARSE] {parser.format_tag} matched")
                     return result
             except Exception as e:
@@ -87,6 +96,15 @@ class SignalRouter:
 
         entry_range = json.dumps(parse_result.entry_range) if parse_result.entry_range else ""
         tps = parse_result.tps or []
+
+        # Always ensure entry_range is a valid JSON array (never a string tuple)
+        if parse_result.entry_range is not None:
+            try:
+                entry_range = json.dumps(list(map(float, parse_result.entry_range)))
+            except Exception:
+                entry_range = json.dumps([])
+        else:
+            entry_range = json.dumps([])
 
         return {
             "symbol": parse_result.symbol,
@@ -126,42 +144,14 @@ async def main():
                 sig = ToroFxParser().parse(text)
                 if sig:
                     trace_id = uuid.uuid4().hex[:8]
-                    # Convertir todos los valores a tipos compatibles con Redis
+                    # Always ensure entry_range is a valid JSON array
+                    entry_range = json.dumps(list(map(float, sig.entry_range))) if sig.entry_range is not None else json.dumps([])
                     sig_dict = {}
-                    import json
                     for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
-                        if isinstance(v, bool):
+                        if k == "entry_range":
+                            sig_dict[k] = entry_range
+                        elif isinstance(v, bool):
                             sig_dict[k] = str(v).lower()
-                        elif k == "entry_range" and v is not None:
-                            try:
-                                import json
-                                # Si es string tipo '(4502.0, 4500.0)', conviértelo a lista y serializa
-                                if isinstance(v, str):
-                                    v_clean = v.strip()
-                                    if v_clean.startswith('(') and v_clean.endswith(')'):
-                                        v_clean = v_clean[1:-1]
-                                        parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
-                                        sig_dict[k] = json.dumps(parts)
-                                        # Sobrescribe el valor en el objeto original para downstream
-                                        sig[k] = json.dumps(parts)
-                                    else:
-                                        # Si es string pero no formato tupla, intenta cargar como JSON
-                                        try:
-                                            val = json.loads(v)
-                                            sig_dict[k] = json.dumps(val)
-                                            sig[k] = json.dumps(val)
-                                        except Exception:
-                                            sig_dict[k] = json.dumps([])
-                                            sig[k] = json.dumps([])
-                                elif isinstance(v, (tuple, list)):
-                                    sig_dict[k] = json.dumps(list(v))
-                                    sig[k] = json.dumps(list(v))
-                                else:
-                                    sig_dict[k] = json.dumps([])
-                                    sig[k] = json.dumps([])
-                            except Exception:
-                                sig_dict[k] = json.dumps([])
-                                sig[k] = json.dumps([])
                         elif isinstance(v, (list, tuple)):
                             sig_dict[k] = json.dumps(v)
                         elif v is None:
