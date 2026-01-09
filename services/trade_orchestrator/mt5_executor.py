@@ -91,11 +91,17 @@ class MT5Executor:
 
 
         # --- Forzar SL por defecto si no viene ---
-        default_sl_pips = 60.0  # Puedes parametrizar esto si lo deseas
         async def get_forced_sl(client, symbol, direction, price):
-            # Calcula un SL a X pips del precio de entrada
             info = client.symbol_info(symbol)
+            # Ajustar default_sl_pips según el instrumento
+            if symbol.upper().startswith("XAU"):  # Oro
+                default_sl_pips = 150.0
+            else:
+                default_sl_pips = 60.0
             point = float(getattr(info, "point", 0.01)) if info else 0.01
+            # Validar que el point sea razonable para oro
+            if symbol.upper().startswith("XAU") and point < 0.1:
+                point = 0.1
             sl_distance = default_sl_pips * point
             if direction == "BUY":
                 return price - sl_distance
