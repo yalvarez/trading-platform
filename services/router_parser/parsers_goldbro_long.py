@@ -5,7 +5,7 @@ Format: ORO/GOLD BUY/SELL Entry: 2500-2505, SL: 2490, TP1: 2515, TP2: 2530
 
 import re
 from typing import Optional, Tuple, List
-from parsers_base import SignalParser, ParseResult
+from .parsers_base import SignalParser, ParseResult
 import logging
 
 log = logging.getLogger("router_parser")

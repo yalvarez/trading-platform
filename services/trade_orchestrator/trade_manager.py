@@ -613,6 +613,10 @@ class TradeManager:
                         log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
                 offset = be_offset * point
                 be = (entry + offset) if is_buy else (entry - offset)
+                # Redondear a 2 decimales para XAUUSD y similares
+                decimals = 2
+                if symbol and symbol.upper().startswith("XAU"):  # XAUUSD, XAU
+                    be = round(be, decimals)
                 log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
                 # Chequeo de volumen mínimo
                 info = client.symbol_info(symbol) if symbol else None
