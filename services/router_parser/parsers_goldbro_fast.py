@@ -35,6 +35,10 @@ class GoldBroFastParser(SignalParser):
     def parse(self, text: str) -> Optional[ParseResult]:
         norm = self.normalize(text)
 
+        # Si contiene 'Risk Price', es Limitless, no parsear aquí
+        if "risk price" in norm.lower():
+            return None
+
         # Skip if looks like complete signal with TP/SL
         if self.COMPLETE_SIGNAL_PATTERN.search(norm):
             return None
