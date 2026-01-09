@@ -1,3 +1,4 @@
+COPY services/router_parser/parsers_limitless.py .
 FROM python:3.11-slim
 
 WORKDIR /app
