@@ -617,6 +617,22 @@ class TradeManager:
                 decimals = 2
                 if symbol and symbol.upper().startswith("XAU"):  # XAUUSD, XAU
                     be = round(be, decimals)
+                # Validación de stops
+                info = client.symbol_info(symbol) if symbol else None
+                stop_level = getattr(info, 'stop_level', 0) * point if info else 0.0
+                price_current = float(getattr(pos, 'price_current', 0.0))
+                # Para SELL, el SL debe estar por encima del precio actual + stop_level
+                # Para BUY, el SL debe estar por debajo del precio actual - stop_level
+                if not is_buy:
+                    min_sl = price_current + stop_level
+                    if be > min_sl:
+                        log.info(f"[BE-DEBUG] Ajustando BE (SELL) | be={be} -> min_sl={min_sl}")
+                        be = min_sl
+                else:
+                    max_sl = price_current - stop_level
+                    if be < max_sl:
+                        log.info(f"[BE-DEBUG] Ajustando BE (BUY) | be={be} -> max_sl={max_sl}")
+                        be = max_sl
                 log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
                 # Chequeo de volumen mínimo
                 info = client.symbol_info(symbol) if symbol else None
