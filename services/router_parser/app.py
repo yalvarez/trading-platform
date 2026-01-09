@@ -134,17 +134,26 @@ async def main():
                             sig_dict[k] = str(v).lower()
                         elif k == "entry_range" and v is not None:
                             try:
-                                # Si ya es string, intentar cargar y volver a serializar
+                                # Si es string tipo '(4502.0, 4500.0)', conviértelo a lista y serializa
                                 if isinstance(v, str):
-                                    try:
-                                        val = json.loads(v)
-                                        sig_dict[k] = json.dumps(val)
-                                    except Exception:
-                                        sig_dict[k] = json.dumps([v])
+                                    v_clean = v.strip()
+                                    if v_clean.startswith('(') and v_clean.endswith(')'):
+                                        v_clean = v_clean[1:-1]
+                                        parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
+                                        sig_dict[k] = json.dumps(parts)
+                                    else:
+                                        # Si es string pero no formato tupla, intenta cargar como JSON
+                                        try:
+                                            val = json.loads(v)
+                                            sig_dict[k] = json.dumps(val)
+                                        except Exception:
+                                            sig_dict[k] = json.dumps([v])
+                                elif isinstance(v, (tuple, list)):
+                                    sig_dict[k] = json.dumps(list(v))
                                 else:
-                                    sig_dict[k] = json.dumps(v)
+                                    sig_dict[k] = json.dumps([v])
                             except Exception:
-                                sig_dict[k] = str(v)
+                                sig_dict[k] = json.dumps([v])
                         elif isinstance(v, (list, tuple)):
                             sig_dict[k] = json.dumps(v)
                         elif v is None:
