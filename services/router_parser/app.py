@@ -121,8 +121,8 @@ async def main():
         log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])
 
         try:
-            # Si el texto parece gestión TOROFX, priorizar ese parser
-            if looks_like_torofx_management(text):
+            # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
+            if looks_like_torofx_management(text) or ("stop loss" in text.lower() and "target: open" in text.lower()):
                 sig = ToroFxParser().parse(text)
                 if sig:
                     trace_id = uuid.uuid4().hex[:8]
