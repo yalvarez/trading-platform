@@ -128,11 +128,17 @@ async def main():
                     trace_id = uuid.uuid4().hex[:8]
                     # Convertir todos los valores a tipos compatibles con Redis
                     sig_dict = {}
+                    import json
                     for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
                         if isinstance(v, bool):
                             sig_dict[k] = str(v).lower()
+                        elif k == "entry_range" and v is not None:
+                            try:
+                                sig_dict[k] = json.dumps(v)
+                            except Exception:
+                                sig_dict[k] = str(v)
                         elif isinstance(v, (list, tuple)):
-                            sig_dict[k] = str(v)
+                            sig_dict[k] = json.dumps(v)
                         elif v is None:
                             continue
                         else:
