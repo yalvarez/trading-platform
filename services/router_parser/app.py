@@ -58,7 +58,7 @@ class SignalRouter:
                         except Exception as e:
                             log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
                             result = result.__class__(**{**result.__dict__, 'entry_range': None})
-                    log.debug(f"[PARSE] {parser.format_tag} matched (LIMITLESS priority)")
+                    # log.debug(f"[PARSE] {parser.format_tag} matched (LIMITLESS priority)")  # Reduce log noise
                     return result
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] LimitlessParser: {e}")
@@ -77,7 +77,7 @@ class SignalRouter:
                         except Exception as e:
                             log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
                             result = result.__class__(**{**result.__dict__, 'entry_range': None})
-                    log.debug(f"[PARSE] {parser.format_tag} matched (TOROFX priority)")
+                    # log.debug(f"[PARSE] {parser.format_tag} matched (TOROFX priority)")  # Reduce log noise
                     return result
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
@@ -88,7 +88,7 @@ class SignalRouter:
         try:
             result = hannah_parser.parse(norm)
             if result:
-                log.debug(f"[PARSE] {hannah_parser.format_tag} matched (HANNAH priority)")
+                # log.debug(f"[PARSE] {hannah_parser.format_tag} matched (HANNAH priority)")  # Reduce log noise
                 return result
         except Exception as e:
             log.warning(f"[PARSE_ERROR] HannahParser: {e}")
@@ -110,12 +110,12 @@ class SignalRouter:
                         except Exception as e:
                             log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
                             result = result.__class__(**{**result.__dict__, 'entry_range': None})
-                    log.debug(f"[PARSE] {parser.format_tag} matched")
+                    # log.debug(f"[PARSE] {parser.format_tag} matched")  # Reduce log noise
                     return result
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] {parser.__class__.__name__}: {e}")
                 continue
-        log.debug("[PARSE] no parser matched")
+        # log.debug("[PARSE] no parser matched")  # Reduce log noise
         return None
 
     async def process_raw_signal(self, chat_id, text):
@@ -131,18 +131,18 @@ class SignalRouter:
             fast_data = await self.redis.get(fast_key)
             if fast_data:
                 # Hay una señal FAST previa, actualizarla
-                log.info(f"[FAST-UPDATE] Actualizando señal FAST previa para {parse_result.symbol} {parse_result.direction}")
+                # log.info(f"[FAST-UPDATE] Actualizando señal FAST previa para {parse_result.symbol} {parse_result.direction}")  # Reduce log noise
                 await self.redis.delete(fast_key)
                 # No deduplicar, forzar update
             elif await self.deduplicator.is_duplicate(chat_id, parse_result):
-                log.info("[DEDUP] %s", parse_result.provider_tag)
+                # log.info("[DEDUP] %s", parse_result.provider_tag)  # Reduce log noise
                 return None
         else:
             # Es señal FAST, guarda referencia para posible actualización
             key_prefix = f"fast_sig:{chat_id}:{parse_result.symbol}:{parse_result.direction}"
             await self.redis.setex(key_prefix, int(self.fast_update_window), "1")
             if await self.deduplicator.is_duplicate(chat_id, parse_result):
-                log.info("[DEDUP] %s", parse_result.provider_tag)
+                # log.info("[DEDUP] %s", parse_result.provider_tag)  # Reduce log noise
                 return None
 
         entry_range = json.dumps(parse_result.entry_range) if parse_result.entry_range else ""
@@ -187,7 +187,7 @@ async def main():
     async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
         text = fields.get("text", "")
         chat_id = fields.get("chat_id", "")
-        log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])
+        # log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])  # Reduce log noise
 
         try:
             # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
@@ -256,7 +256,7 @@ async def main():
                 await xadd(r, Streams.SIGNALS, sig)
                 log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
             else:
-                log.debug("[DROP] chat=%s parsed=None", chat_id)
+                # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
         finally:
             await xack(r, Streams.RAW, group, msg_id)
 

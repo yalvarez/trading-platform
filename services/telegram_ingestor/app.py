@@ -19,7 +19,7 @@ async def main():
             last = last_msg["ts"]
             if last is not None and now - last > 120:
                 log.warning(f"[WATCHDOG] ⚠️ No se reciben mensajes desde hace {int(now-last)}s. Posible desconexión o bloqueo.")
-            await asyncio.sleep(60)
+            await asyncio.sleep(120)  # Reduce frequency
 
     import json
     from common.config import CHANNELS_CONFIG_JSON
@@ -42,13 +42,8 @@ async def main():
     async def handler(event):
         try:
             last_msg["ts"] = asyncio.get_event_loop().time()
-            log.info(f"[HANDLER] Recibido mensaje: chat_id={event.chat_id} id={event.id}")
-            log.debug(f"[DEBUG] chat_id recibido: {event.chat_id}")
             chat_id = str(event.chat_id)
             text = (event.raw_text or "").strip()
-            log.info(f"[HANDLER][ALL] chat_id={chat_id} id={event.id} text={text.replace(chr(10), ' | ')}")
-            log.info(f"[CHAT_FILTER] chat_id={chat_id} chats={chats}")
-            log.debug(f"[DEBUG] event.to_dict: {event.to_dict() if hasattr(event, 'to_dict') else str(event)}")
             if chats and chat_id not in chats:
                 log.warning(f"[CHAT_FILTER] Ignorado chat_id={chat_id} (no está en chats). Lista de chats permitidos: {chats}")
                 return
@@ -61,14 +56,11 @@ async def main():
                 "date": event.date.isoformat() if event.date else "",
                 "text": text
             }
-            log.info(f"[REDIS] Intentando escribir en RAW: {payload}")
             try:
-                result = await xadd(r, Streams.RAW, payload)
-                log.info(f"[RAW] chat={chat_id} msg_id={event.id} len={len(text)} :: {text.replace(chr(10), ' | ')} | xadd result: {result}")
+                await xadd(r, Streams.RAW, payload)
             except Exception as re:
                 log.error(f"[REDIS][EXCEPTION] Error al escribir en Redis: {re}")
                 log.exception(re)
-            log.info(f"[HANDLER] FIN: chat_id={chat_id} id={event.id}")
         except Exception as e:
             log.error(f"[HANDLER][EXCEPTION] chat_id={getattr(event, 'chat_id', None)} id={getattr(event, 'id', None)} error={e}")
             log.exception(e)
@@ -77,7 +69,7 @@ async def main():
     async def heartbeat():
         while True:
             log.info("[HEARTBEAT] Telegram ingestor sigue vivo...")
-            await asyncio.sleep(30)
+            await asyncio.sleep(600)  # Reduce frequency to every 10 minutes
 
     asyncio.create_task(heartbeat())
     asyncio.create_task(watchdog())

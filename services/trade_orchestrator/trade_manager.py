@@ -123,7 +123,6 @@ class TradeManager:
             tramo_pips_equiv = tramo_pips * (pip_value_xau / pip_value)
         profit_pips = ((current - entry) / pip_size) if is_buy else ((entry - current) / pip_size)
         if profit_pips < tramo_pips_equiv:
-            log.info(f"[SCALING-DEBUG] NO scaling: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} < tramo_pips_equiv={tramo_pips_equiv:.2f}")
             return
         info = self.mt5._client_for(account).symbol_info(pos.symbol)
         step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
@@ -138,7 +137,7 @@ class TradeManager:
             nivel = tramo * tramo_pips
             action_key = f"SCALING_FIXED_{fixed_tramo_volume}_AT_{int(nivel)}"
             if profit_pips >= nivel and action_key not in t.actions_done:
-                log.info(f"[SCALING-DEBUG] ScalingOut: ticket={pos.ticket} symbol={t.symbol} dir={t.direction} entry={entry} current={current} profit_pips={profit_pips:.2f} nivel={nivel} tramo={tramo}/{max_tramos} fixed_tramo_volume={fixed_tramo_volume} v={v} step={step} vmin={vmin}")
+                # ScalingOut: log eliminado para reducir ruido
                 t.actions_done.add(action_key)
                 # Último tramo: activa runner
                 if tramo == max_tramos:
