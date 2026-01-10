@@ -6,10 +6,12 @@ import time
 import re
 from dataclasses import dataclass, field
 from typing import Optional
-
+import os
 import mt5_constants as mt5
 from prometheus_client import Counter, Gauge
 import logging
+import datetime
+import redis.asyncio as redis_async
 
 log = logging.getLogger("trade_orchestrator.trade_manager")
 
@@ -102,100 +104,7 @@ class TradeManager:
         symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
         client = self.mt5._client_for(account)
         # --- Equivalencia de pips: calcula cuántos pips en el activo actual equivalen a la ganancia de XAUUSD ---
-        pip_size = 0.0
-        pip_size_xau = 0.0
-        if hasattr(client, 'get_pip_size'):
-            pip_size = client.get_pip_size(symbol)
-            pip_size_xau = client.get_pip_size('XAUUSD')
-        if not pip_size or pip_size <= 0:
-            pip_size = point  # fallback
-        if not pip_size_xau or pip_size_xau <= 0:
-            pip_size_xau = pip_size  # fallback: mismo activo
-        # Valor del pip en USD para 0.01 lote
-        info = client.symbol_info(symbol)
-        info_xau = client.symbol_info('XAUUSD')
-        lot = 0.01
-        pip_value = (getattr(info, 'trade_contract_size', 1.0) * lot * pip_size) if info else pip_size
-        pip_value_xau = (getattr(info_xau, 'trade_contract_size', 1.0) * lot * pip_size_xau) if info_xau else pip_size_xau
-        # Cuántos pips en el activo actual equivalen a tramo_pips de oro
-        tramo_pips_equiv = tramo_pips
-        if pip_value > 0 and pip_value_xau > 0:
-            tramo_pips_equiv = tramo_pips * (pip_value_xau / pip_value)
-        profit_pips = ((current - entry) / pip_size) if is_buy else ((entry - current) / pip_size)
-        if profit_pips < tramo_pips_equiv:
-            return
-        info = self.mt5._client_for(account).symbol_info(pos.symbol)
-        step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
-        vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
-        v = float(getattr(pos, 'volume', 0.0))
-        # Calcular número de tramos posibles
-        max_tramos = int(v // fixed_tramo_volume)
-        runner_volume = v - (fixed_tramo_volume * max_tramos)
-        # Ajustar runner al múltiplo de step
-        runner_volume = step * int(runner_volume / step) if runner_volume >= vmin else 0.0
-        for tramo in range(1, max_tramos + 1):
-            nivel = tramo * tramo_pips
-            action_key = f"SCALING_FIXED_{fixed_tramo_volume}_AT_{int(nivel)}"
-            if profit_pips >= nivel and action_key not in t.actions_done:
-                # ScalingOut: log eliminado para reducir ruido
-                t.actions_done.add(action_key)
-                # Último tramo: activa runner
-                if tramo == max_tramos:
-                    if runner_volume >= vmin:
-                        t.runner_enabled = True
-                        self._notify_bg(
-                            account["name"],
-                            f"🏃‍♂️ Runner activado: {runner_volume:.2f} lotes\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips"
-                        )
-                # Cierre por volumen fijo
-                close_vol = step * int(fixed_tramo_volume / step)
-                pct = int((close_vol / v) * 100) if v > 0 else 100
-                if close_vol < vmin or close_vol <= 0:
-                    pct = 100
-                await self._do_partial_close(account, pos.ticket, pct, reason=f"ScalingOut {pct}% ({close_vol:.2f}) @ +{int(nivel)}pips")
-                self._notify_bg(
-                    account["name"],
-                    f"✂️ ScalingOut ejecutado\nTicket: {pos.ticket} | {t.symbol} | {t.direction}\nProfit≈{profit_pips:.1f} pips | Cierre: {pct}% ({close_vol:.2f})"
-                )
-
-    def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
-        # Forzar SL por defecto si falta
-        default_sl = getattr(self, 'default_sl', None)
-        if planned_sl is None or planned_sl == 0.0:
-            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl})")
-            if default_sl is not None:
-                planned_sl = float(default_sl)
-        """
-        Registers a new trade in the manager. Used when a trade is opened externally (e.g., by signal handler).
-        """
-        gid = int(group_id) if group_id is not None else int(ticket)
-        self.trades[int(ticket)] = ManagedTrade(
-            account_name=account_name,
-            ticket=int(ticket),
-            symbol=symbol,
-            direction=direction,
-            provider_tag=provider_tag,
-            group_id=gid,
-            tps=list(tps or []),
-            planned_sl=float(planned_sl) if planned_sl is not None else None,
-        )
-        self.group_addon_count.setdefault((account_name, gid), 0)
-        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, gid, provider_tag, tps, planned_sl)
-        try:
-            TRADES_OPENED.inc()
-            ACTIVE_TRADES.set(len(self.trades))
-        except Exception:
-            pass
-
-    async def notify_sl(self, account, pos, t):
-        await self.notify_trade_event(
-            'sl',
-            account_name=account["name"],
-            ticket=int(pos.ticket),
-            symbol=t.symbol,
-            sl_price=getattr(pos, 'sl', 0.0),
-            close_price=getattr(pos, 'price_current', 0.0),
-        )
+        # Remove duplicate and misplaced __init__
 
     async def notify_trailing(self, account, pos, new_sl):
         await self.notify_trade_event(
@@ -269,7 +178,7 @@ class TradeManager:
 
         notifier=None,
         notify_connect: bool | None = None,  # compat
-    ):
+        redis_url: str = None, redis_conn=None):
         self.mt5 = mt5_exec
         self.magic = magic
         self.loop_sleep_sec = loop_sleep_sec
@@ -314,6 +223,10 @@ class TradeManager:
         self.trades: dict[int, ManagedTrade] = {}
 
         self.group_addon_count: dict[tuple[str, int], int] = {}
+
+        # --- Redis connection for PnL tracking ---
+        self.redis_url = redis_url or os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+        self.redis = redis_conn
 
     # ----------------------------
     # Notifier
@@ -898,14 +811,35 @@ class TradeManager:
 
     # --- AUDITORÍA DE CIERRE DE TRADE ---
     async def audit_trade_close(self, account_name, ticket, t: ManagedTrade, reason: str, pos=None):
-        """Loguea un resumen de la gestión del trade al cerrarse."""
+        """Loguea un resumen de la gestión del trade al cerrarse y suma el PnL diario en Redis."""
         log.info(
             f"[AUDIT] TRADE CLOSED | account={account_name} ticket={ticket} symbol={t.symbol} dir={t.direction} "
             f"provider={t.provider_tag} group={t.group_id} entry={t.entry_price} initial_vol={t.initial_volume} "
             f"TPs={t.tps} TP_hit={sorted(t.tp_hit)} runner={t.runner_enabled} SL={t.planned_sl} reason={reason} "
             f"pos={getattr(pos, 'price_current', None) if pos else None}"
         )
-        # Aquí se puede extender para guardar en base de datos, enviar a otro sistema, etc.
+        # --- PnL calculation ---
+        pnl = None
+        try:
+            if pos and hasattr(pos, 'profit'):
+                pnl = float(getattr(pos, 'profit', 0.0))
+            elif hasattr(t, 'entry_price') and hasattr(pos, 'price_current') and hasattr(pos, 'volume'):
+                # Fallback: estimate PnL
+                direction = 1 if t.direction == 'BUY' else -1
+                pnl = direction * (float(pos.price_current) - float(t.entry_price)) * float(pos.volume)
+        except Exception as e:
+            log.warning(f"[PnL] Error calculating PnL for account={account_name} ticket={ticket}: {e}")
+        if pnl is not None:
+            # --- Redis connection (lazy init if needed) ---
+            if self.redis is None:
+                self.redis = await redis_async.from_url(self.redis_url, decode_responses=True)
+            today = datetime.datetime.utcnow().strftime('%Y%m%d')
+            key = f"pnl:{account_name}:{today}"
+            try:
+                await self.redis.incrbyfloat(key, pnl)
+                log.info(f"[PnL] Added {pnl} to {key}")
+            except Exception as e:
+                log.warning(f"[PnL] Error updating Redis for {key}: {e}")
 
     # ----------------------------
     # ✅ Addon MIDPOINT Entry–SL (NO pirámide en ganancia)
