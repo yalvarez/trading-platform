@@ -82,7 +82,7 @@ class SignalRouter:
             except Exception as e:
                 log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
             return None
-        # --- 3. HANNAH si hace match ---
+        # --- 3. HANNAH si hace match (prioridad absoluta sobre cualquier otro parser) ---
         from parsers_hannah import HannahParser
         hannah_parser = HannahParser()
         try:
