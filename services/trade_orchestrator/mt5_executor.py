@@ -117,122 +117,126 @@ class MT5Executor:
 
         async def send_order(account):
             name = account["name"]
-            client = self._client_for(account)
-            # Ensure symbol is selected before any info/price fetch
-            client.symbol_select(symbol, True)
-            symbol_info = client.symbol_info(symbol)
-            if not symbol_info:
-                log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
-            price = client.tick_price(symbol, direction)
-            if price == 0.0:
-                log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
-            order_type = 0 if direction == "BUY" else 1
-
-            # --- Forzar SL si es necesario ---
-            forced_sl = sl
-            if not forced_sl or float(forced_sl) == 0.0:
-                forced_sl = await get_forced_sl(client, symbol, direction, price)
-                log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
-
-            # --- LOTE DINÁMICO O FIJO ---
-            lot = 0.01
-            fixed_lot = float(account.get("fixed_lot", 0))
-            risk_percent = float(account.get("risk_percent", 0))
-            balance = 0.0
-            if fixed_lot > 0:
-                lot = fixed_lot
-            elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
-                # Obtener balance actual
-                try:
-                    acc_info = client.mt5.account_info()
-                    if acc_info and hasattr(acc_info, "balance"):
-                        balance = float(acc_info.balance)
-                except Exception as e:
-                    log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
-                # Calcular riesgo monetario
-                risk_money = balance * (risk_percent / 100.0)
-                # Calcular distancia SL en precio
-                sl_distance = abs(float(price) - float(forced_sl))
-                # Obtener info de símbolo
-                try:
-                    symbol_info = client.symbol_info(symbol)
-                    tick_value = float(getattr(symbol_info, "tick_value", 0.0))
-                    tick_size = float(getattr(symbol_info, "tick_size", 0.0))
-                    lot_step = float(getattr(symbol_info, "volume_step", 0.01))
-                    min_lot = float(getattr(symbol_info, "volume_min", 0.03))
-                except Exception as e:
-                    log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
-                    tick_value = 0.0
-                    tick_size = 0.0
-                    lot_step = 0.01
-                    min_lot = 0.03
-                log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
-                if tick_value > 0 and tick_size > 0 and sl_distance > 0:
-                    lot = risk_money / (sl_distance * (tick_value / tick_size))
-                    lot = max(min_lot, round(lot / lot_step) * lot_step)
-                    log.info(f"[LOTE][{name}] lotaje calculado={lot}")
-                else:
-                    log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
-                    lot = 0.03
-            # --- FIN LOTE ---
-
-            log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
-            # --- Selección dinámica y fallback de filling mode ---
-            supported_filling_modes = []
             try:
-                if symbol_info is not None:
-                    if hasattr(symbol_info, 'filling_mode_flags'):
-                        flags = symbol_info.filling_mode_flags
-                        if flags & 1:
-                            supported_filling_modes.append(1)  # IOC
-                        if flags & 2:
-                            supported_filling_modes.append(2)  # RETURN
-                        if flags & 4:
-                            supported_filling_modes.append(3)  # FOK
-                    elif hasattr(symbol_info, 'filling_mode'):
-                        supported_filling_modes.append(symbol_info.filling_mode)
-                if not supported_filling_modes:
-                    supported_filling_modes = [2, 1, 3]  # fallback to all
-            except Exception as e:
-                log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
-                supported_filling_modes = [2, 1, 3]
-            log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
+                client = self._client_for(account)
+                # Ensure symbol is selected before any info/price fetch
+                client.symbol_select(symbol, True)
+                symbol_info = client.symbol_info(symbol)
+                if not symbol_info:
+                    log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
+                price = client.tick_price(symbol, direction)
+                if price == 0.0:
+                    log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
+                order_type = 0 if direction == "BUY" else 1
 
-            # Probar cada filling mode hasta que uno funcione
-            res = None
-            for type_filling in supported_filling_modes:
-                req = {
-                    "action": 1,
-                    "symbol": symbol,
-                    "volume": float(lot),
-                    "type": order_type,
-                    "price": float(price),
-                    "sl": float(forced_sl),
-                    "tp": 0.0,
-                    "deviation": int(self.default_deviation),
-                    "magic": int(self.magic),
-                    "comment": self._safe_comment(provider_tag),
-                    "type_time": 0,
-                    "type_filling": type_filling,
-                }
-                import asyncio
-                loop = asyncio.get_running_loop()
-                res = await loop.run_in_executor(None, client.order_send, req)
-                log.warning("order_send response acct=%s (filling=%s): %s", name, type_filling, res)
-                if res and getattr(res, "retcode", None) == 10009:
-                    tickets[name] = int(getattr(res, "order", 0))
-                    log.info("open_complete_trade success acct=%s ticket=%s (filling=%s)", name, tickets[name], type_filling)
-                    break
-                elif res and getattr(res, "retcode", None) not in [10030, 10013]:
-                    # Si el error no es de filling mode, no seguir probando
+                # --- Forzar SL si es necesario ---
+                forced_sl = sl
+                if not forced_sl or float(forced_sl) == 0.0:
+                    forced_sl = await get_forced_sl(client, symbol, direction, price)
+                    log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
+
+                # --- LOTE DINÁMICO O FIJO ---
+                lot = 0.01
+                fixed_lot = float(account.get("fixed_lot", 0))
+                risk_percent = float(account.get("risk_percent", 0))
+                balance = 0.0
+                if fixed_lot > 0:
+                    lot = fixed_lot
+                elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
+                    # Obtener balance actual
+                    try:
+                        acc_info = client.mt5.account_info()
+                        if acc_info and hasattr(acc_info, "balance"):
+                            balance = float(acc_info.balance)
+                    except Exception as e:
+                        log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
+                    # Calcular riesgo monetario
+                    risk_money = balance * (risk_percent / 100.0)
+                    # Calcular distancia SL en precio
+                    sl_distance = abs(float(price) - float(forced_sl))
+                    # Obtener info de símbolo
+                    try:
+                        symbol_info = client.symbol_info(symbol)
+                        tick_value = float(getattr(symbol_info, "tick_value", 0.0))
+                        tick_size = float(getattr(symbol_info, "tick_size", 0.0))
+                        lot_step = float(getattr(symbol_info, "volume_step", 0.01))
+                        min_lot = float(getattr(symbol_info, "volume_min", 0.03))
+                    except Exception as e:
+                        log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
+                        tick_value = 0.0
+                        tick_size = 0.0
+                        lot_step = 0.01
+                        min_lot = 0.03
+                    log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
+                    if tick_value > 0 and tick_size > 0 and sl_distance > 0:
+                        lot = risk_money / (sl_distance * (tick_value / tick_size))
+                        lot = max(min_lot, round(lot / lot_step) * lot_step)
+                        log.info(f"[LOTE][{name}] lotaje calculado={lot}")
+                    else:
+                        log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
+                        lot = 0.03
+                # --- FIN LOTE ---
+
+                log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
+                # --- Selección dinámica y fallback de filling mode ---
+                supported_filling_modes = []
+                try:
+                    if symbol_info is not None:
+                        if hasattr(symbol_info, 'filling_mode_flags'):
+                            flags = symbol_info.filling_mode_flags
+                            if flags & 1:
+                                supported_filling_modes.append(1)  # IOC
+                            if flags & 2:
+                                supported_filling_modes.append(2)  # RETURN
+                            if flags & 4:
+                                supported_filling_modes.append(3)  # FOK
+                        elif hasattr(symbol_info, 'filling_mode'):
+                            supported_filling_modes.append(symbol_info.filling_mode)
+                    if not supported_filling_modes:
+                        supported_filling_modes = [2, 1, 3]  # fallback to all
+                except Exception as e:
+                    log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
+                    supported_filling_modes = [2, 1, 3]
+                log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
+
+                # Probar cada filling mode hasta que uno funcione
+                res = None
+                for type_filling in supported_filling_modes:
+                    req = {
+                        "action": 1,
+                        "symbol": symbol,
+                        "volume": float(lot),
+                        "type": order_type,
+                        "price": float(price),
+                        "sl": float(forced_sl),
+                        "tp": 0.0,
+                        "deviation": int(self.default_deviation),
+                        "magic": int(self.magic),
+                        "comment": self._safe_comment(provider_tag),
+                        "type_time": 0,
+                        "type_filling": type_filling,
+                    }
+                    import asyncio
+                    loop = asyncio.get_running_loop()
+                    res = await loop.run_in_executor(None, client.order_send, req)
+                    log.warning("order_send response acct=%s (filling=%s): %s", name, type_filling, res)
+                    if res and getattr(res, "retcode", None) == 10009:
+                        tickets[name] = int(getattr(res, "order", 0))
+                        log.info("open_complete_trade success acct=%s ticket=%s (filling=%s)", name, tickets[name], type_filling)
+                        break
+                    elif res and getattr(res, "retcode", None) not in [10030, 10013]:
+                        # Si el error no es de filling mode, no seguir probando
+                        errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                        log.warning("open_complete_trade failed acct=%s retcode=%s (filling=%s)", name, getattr(res,'retcode',None), type_filling)
+                        break
+                else:
+                    # Si ninguno funcionó
                     errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                    log.warning("open_complete_trade failed acct=%s retcode=%s (filling=%s)", name, getattr(res,'retcode',None), type_filling)
-                    break
-            else:
-                # Si ninguno funcionó
-                errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
+                    log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
+            except Exception as e:
+                errors[name] = f"Exception: {e}"
+                log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
 
         accounts = [a for a in self.accounts if a.get("active")]
-        await asyncio.gather(*(send_order(account) for account in accounts))
+        await asyncio.gather(*(send_order(account) for account in accounts), return_exceptions=True)
         return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)
