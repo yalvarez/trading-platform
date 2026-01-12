@@ -50,6 +50,34 @@ class ManagedTrade:
 
 
 class TradeManager:
+    def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
+        # Forzar SL por defecto si falta
+        default_sl = getattr(self, 'default_sl', None)
+        if planned_sl is None or planned_sl == 0.0:
+            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl})")
+            if default_sl is not None:
+                planned_sl = float(default_sl)
+        """
+        Registers a new trade in the manager. Used when a trade is opened externally (e.g., by signal handler).
+        """
+        gid = int(group_id) if group_id is not None else int(ticket)
+        self.trades[int(ticket)] = ManagedTrade(
+            account_name=account_name,
+            ticket=int(ticket),
+            symbol=symbol,
+            direction=direction,
+            provider_tag=provider_tag,
+            group_id=gid,
+            tps=list(tps or []),
+            planned_sl=float(planned_sl) if planned_sl is not None else None,
+        )
+        self.group_addon_count.setdefault((account_name, gid), 0)
+        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, gid, provider_tag, tps, planned_sl)
+        try:
+            TRADES_OPENED.inc()
+            ACTIVE_TRADES.set(len(self.trades))
+        except Exception:
+            pass
     def _effective_close_percent(self, ticket: int, desired_percent: int) -> int:
         if desired_percent >= 100:
             return 100
@@ -220,9 +248,8 @@ class TradeManager:
         self.scaling_percent_per_tramo = int(scaling_percent_per_tramo)
 
         self.notifier = notifier
-        self.trades: dict[int, ManagedTrade] = {}
-
-        self.group_addon_count: dict[tuple[str, int], int] = {}
+        self.trades = {}
+        self.group_addon_count = {}
 
         # --- Redis connection for PnL tracking ---
         self.redis_url = redis_url or os.getenv('REDIS_URL', 'redis://localhost:6379/0')
