@@ -171,6 +171,32 @@ class MT5Executor:
             # --- FIN LOTE ---
 
             log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
+            # --- Selección dinámica de filling mode ---
+            type_filling = 1  # IOC por defecto
+            supported_filling_modes = []
+            try:
+                symbol_info = client.symbol_info(symbol)
+                if symbol_info is not None:
+                    if hasattr(symbol_info, 'filling_mode_flags'):
+                        flags = symbol_info.filling_mode_flags
+                        if flags & 1:
+                            supported_filling_modes.append(1)  # IOC
+                        if flags & 2:
+                            supported_filling_modes.append(2)  # RETURN
+                        if flags & 4:
+                            supported_filling_modes.append(3)  # FOK
+                    elif hasattr(symbol_info, 'filling_mode'):
+                        supported_filling_modes.append(symbol_info.filling_mode)
+                    # Prefer RETURN (2), then IOC (1), then FOK (3)
+                    if 2 in supported_filling_modes:
+                        type_filling = 2
+                    elif 1 in supported_filling_modes:
+                        type_filling = 1
+                    elif 3 in supported_filling_modes:
+                        type_filling = 3
+            except Exception as e:
+                log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
+            log.info(f"[FILLING] {symbol} ({name}) filling seleccionado: {type_filling} (soportados: {supported_filling_modes})")
             req = {
                 "action": 1,
                 "symbol": symbol,
@@ -183,7 +209,7 @@ class MT5Executor:
                 "magic": int(self.magic),
                 "comment": self._safe_comment(provider_tag),
                 "type_time": 0,
-                "type_filling": 1,
+                "type_filling": type_filling,
             }
             import asyncio
             loop = asyncio.get_running_loop()
