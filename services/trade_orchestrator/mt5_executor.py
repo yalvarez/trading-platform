@@ -182,8 +182,9 @@ class MT5Executor:
                 supported_filling_modes = []
                 try:
                     if symbol_info is not None:
-                        if hasattr(symbol_info, 'filling_mode_flags'):
-                            flags = symbol_info.filling_mode_flags
+                        # Usar filling_mode_flags solo si existe
+                        flags = getattr(symbol_info, 'filling_mode_flags', None)
+                        if flags is not None:
                             if flags & 1:
                                 supported_filling_modes.append(1)  # IOC
                             if flags & 2:
