@@ -184,7 +184,7 @@ class MT5Executor:
                     if symbol_info is not None and hasattr(symbol_info, 'filling_mode'):
                         supported_filling_modes.append(symbol_info.filling_mode)
                     if not supported_filling_modes:
-                        supported_filling_modes = [2, 1, 3]  # fallback to all
+                        supported_filling_modes = [1, 3, 2]  # fallback: IOC, FOK, RETURN
                 except Exception as e:
                     log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
                     supported_filling_modes = [2, 1, 3]
