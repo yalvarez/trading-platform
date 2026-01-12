@@ -217,5 +217,18 @@ class MT5Executor:
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
 
         accounts = [a for a in self.accounts if a.get("active")]
-        await asyncio.gather(*(send_order(account) for account in accounts), return_exceptions=True)
+        per_account_timeout = 30  # seconds; adjust as needed
+
+        async def send_order_with_timeout(account):
+            name = account["name"]
+            try:
+                await asyncio.wait_for(send_order(account), timeout=per_account_timeout)
+            except asyncio.TimeoutError:
+                errors[name] = f"Timeout: trade execution exceeded {per_account_timeout}s"
+                log.error(f"[TIMEOUT] open_complete_trade timed out acct={name}")
+            except Exception as e:
+                errors[name] = f"Exception: {e}"
+                log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
+
+        await asyncio.gather(*(send_order_with_timeout(account) for account in accounts), return_exceptions=True)
         return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)

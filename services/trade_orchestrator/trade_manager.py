@@ -646,8 +646,11 @@ class TradeManager:
                     "sl": float(be),
                     "tp": 0.0,
                     "deviation": getattr(self, "deviation", 20),
-                    "type_filling": getattr(self.mt5, "_best_filling", lambda s: mt5.ORDER_FILLING_IOC)(symbol),
                 }
+                # Only add type_filling if required by bridge (gmag11/MetaTrader5-Docker usually ignores it for SLTP, but keep for compatibility)
+                best_filling = getattr(self.mt5, "_best_filling", None)
+                if best_filling:
+                    req["type_filling"] = best_filling(symbol)
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
                 log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
