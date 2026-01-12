@@ -673,15 +673,35 @@ class TradeManager:
                     return
                 ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
                 if ok:
-                    self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
-                    log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
-                    await self.notify_trade_event(
-                        'be',
-                        account_name=account["name"],
-                        message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
-                    )
-                    log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
-                    return
+                    # Validar que el SL realmente cambió
+                    await asyncio.sleep(1)  # Esperar un segundo para que el cambio se refleje
+                    pos_check = client.positions_get(ticket=int(ticket))
+                    sl_actual = None
+                    if pos_check and len(pos_check) > 0:
+                        sl_actual = float(getattr(pos_check[0], 'sl', 0.0))
+                    if sl_actual is not None and abs(sl_actual - float(be)) < 1e-4:
+                        self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
+                        log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
+                        await self.notify_trade_event(
+                            'be',
+                            account_name=account["name"],
+                            message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
+                        )
+                        log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
+                        return
+                    else:
+                        log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be} actual={sl_actual}")
+                        # Notificar como fallo
+                        self._notify_bg(
+                            account["name"],
+                            f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        )
+                        await self.notify_trade_event(
+                            'be',
+                            account_name=account["name"],
+                            message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        )
+                        # No return, para que pueda reintentar si quedan intentos
                 else:
                     retcode = getattr(res, 'retcode', None)
                     comment = getattr(res, 'comment', None)
