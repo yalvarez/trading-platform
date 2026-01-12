@@ -6,16 +6,24 @@ from typing import Any, Dict, Optional
 
 async def create_consumer_group(r: "redis.Redis", stream: str, group: str):
     import logging
+    import asyncio
     log = logging.getLogger("redis_streams")
-    try:
-        await r.xgroup_create(stream, group, id='0', mkstream=True)
-        log.info(f"[REDIS] Grupo '{group}' creado en stream '{stream}'")
-    except Exception as e:
-        if 'BUSYGROUP' in str(e):
-            log.info(f"[REDIS] Grupo '{group}' ya existe en stream '{stream}'")
-            return  # Grupo ya existe
-        log.error(f"[REDIS] Error creando grupo '{group}' en stream '{stream}': {e}")
-        raise
+    retries = 5
+    for attempt in range(1, retries + 1):
+        try:
+            await r.xgroup_create(stream, group, id='0', mkstream=True)
+            log.info(f"[REDIS] Grupo '{group}' creado en stream '{stream}'")
+            return
+        except Exception as e:
+            if 'BUSYGROUP' in str(e):
+                log.info(f"[REDIS] Grupo '{group}' ya existe en stream '{stream}'")
+                return  # Grupo ya existe
+            log.warning(f"[REDIS] Intento {attempt}/{retries} - Error creando grupo '{group}' en stream '{stream}': {e}")
+            if attempt < retries:
+                await asyncio.sleep(0.5 * attempt)
+            else:
+                log.error(f"[REDIS] Fallo definitivo creando grupo '{group}' en stream '{stream}': {e}")
+                raise
 
 async def xreadgroup_loop(
     r: "redis.Redis",
