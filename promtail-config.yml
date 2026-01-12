@@ -25,4 +25,6 @@ scrape_configs:
           __path__: /var/lib/docker/containers/*/*.log
     pipeline_stages:
       - docker: {}
+        - labels:
+            container_name:
         - labels: {container_name}
