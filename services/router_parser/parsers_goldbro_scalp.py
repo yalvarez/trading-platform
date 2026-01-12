@@ -31,7 +31,12 @@ class GoldBroScalpParser(SignalParser):
         # Must have symbol
         symbol_match = self.SYMBOL_PATTERN.search(norm)
         if symbol_match:
-            symbol = symbol_match.group(1).upper()
+            symbol_raw = symbol_match.group(1).upper()
+            # Normalizar GOLD, ORO, XAU, XAU/USD a XAUUSD
+            if symbol_raw in ["GOLD", "ORO", "XAU", "XAU/USD", "XAUUSD"]:
+                symbol = "XAUUSD"
+            else:
+                symbol = symbol_raw
         else:
             symbol = "NO-SYMBOL"
 

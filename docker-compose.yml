@@ -12,9 +12,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-
   # =========================
-  # MT5 ACCOUNTS (6)
+  # MT5 ACCOUNTS (8)
   # Each one exposes:
   # - Web VNC: 3000
   # - RPyC MT5 bridge: 8001
@@ -95,6 +94,30 @@ services:
       - "8006:8001"
     volumes:
       - mt5_acct6_config:/config
+
+  mt5_acct7:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct7
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3007:3000"
+      - "8007:8001"
+    volumes:
+      - mt5_acct7_config:/config
+
+  mt5_acct8:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: atp-mt5-acct8
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3008:3000"
+      - "8008:8001"
+    volumes:
+      - mt5_acct8_config:/config
 
   telegram_ingestor:
     build:
@@ -213,3 +236,5 @@ volumes:
   mt5_acct4_config:
   mt5_acct5_config:
   mt5_acct6_config:
+  mt5_acct7_config:
+  mt5_acct8_config:

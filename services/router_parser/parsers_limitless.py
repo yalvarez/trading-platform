@@ -23,7 +23,12 @@ class LimitlessParser(SignalParser):
         symbol_match = self.SYMBOL_PATTERN.search(norm)
         if not symbol_match:
             return None
-        symbol = symbol_match.group(1).upper()
+        symbol_raw = symbol_match.group(1).upper()
+        # Normalizar GOLD, ORO, XAU, XAU/USD a XAUUSD
+        if symbol_raw in ["GOLD", "ORO", "XAU", "XAU/USD", "XAUUSD"]:
+            symbol = "XAUUSD"
+        else:
+            symbol = symbol_raw
 
         is_buy = self.BUY_PATTERN.search(norm) is not None
         is_sell = self.SELL_PATTERN.search(norm) is not None

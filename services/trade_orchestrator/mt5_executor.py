@@ -118,8 +118,14 @@ class MT5Executor:
         async def send_order(account):
             name = account["name"]
             client = self._client_for(account)
+            # Ensure symbol is selected before any info/price fetch
             client.symbol_select(symbol, True)
+            symbol_info = client.symbol_info(symbol)
+            if not symbol_info:
+                log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
             price = client.tick_price(symbol, direction)
+            if price == 0.0:
+                log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
             order_type = 0 if direction == "BUY" else 1
 
             # --- Forzar SL si es necesario ---
@@ -175,7 +181,6 @@ class MT5Executor:
             type_filling = 1  # IOC por defecto
             supported_filling_modes = []
             try:
-                symbol_info = client.symbol_info(symbol)
                 if symbol_info is not None:
                     if hasattr(symbol_info, 'filling_mode_flags'):
                         flags = symbol_info.filling_mode_flags
@@ -194,6 +199,8 @@ class MT5Executor:
                         type_filling = 1
                     elif 3 in supported_filling_modes:
                         type_filling = 3
+                if not supported_filling_modes:
+                    log.warning(f"[FILLING] No supported filling modes detected for {symbol} ({name}). symbol_info: {symbol_info}")
             except Exception as e:
                 log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
             log.info(f"[FILLING] {symbol} ({name}) filling seleccionado: {type_filling} (soportados: {supported_filling_modes})")
