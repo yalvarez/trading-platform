@@ -210,6 +210,7 @@ services:
     container_name: atp-prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
     ports:
@@ -227,6 +228,8 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
 
 volumes:
   redis_data:
@@ -238,3 +241,5 @@ volumes:
   mt5_acct6_config:
   mt5_acct7_config:
   mt5_acct8_config:
+  prometheus_data:
+  grafana_data:
