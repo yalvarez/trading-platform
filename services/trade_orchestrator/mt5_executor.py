@@ -181,18 +181,8 @@ class MT5Executor:
                 # --- Selección dinámica y fallback de filling mode ---
                 supported_filling_modes = []
                 try:
-                    if symbol_info is not None:
-                        # Usar filling_mode_flags solo si existe
-                        flags = getattr(symbol_info, 'filling_mode_flags', None)
-                        if flags is not None:
-                            if flags & 1:
-                                supported_filling_modes.append(1)  # IOC
-                            if flags & 2:
-                                supported_filling_modes.append(2)  # RETURN
-                            if flags & 4:
-                                supported_filling_modes.append(3)  # FOK
-                        elif hasattr(symbol_info, 'filling_mode'):
-                            supported_filling_modes.append(symbol_info.filling_mode)
+                    if symbol_info is not None and hasattr(symbol_info, 'filling_mode'):
+                        supported_filling_modes.append(symbol_info.filling_mode)
                     if not supported_filling_modes:
                         supported_filling_modes = [2, 1, 3]  # fallback to all
                 except Exception as e:
