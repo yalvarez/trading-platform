@@ -95,15 +95,10 @@ class MT5Executor:
             info = client.symbol_info(symbol)
             # Ajustar default_sl_pips según el instrumento
             if symbol.upper().startswith("XAU"):  # Oro
-                default_sl_pips = 150.0
+                sl_distance = 300  # ejemplo: 300 pips para oro
             else:
-                default_sl_pips = 60.0
-            point = float(getattr(info, "point", 0.01)) if info else 0.01
-            # Validar que el point sea razonable para oro
-            if symbol.upper().startswith("XAU") and point < 0.1:
-                point = 0.1
-            sl_distance = default_sl_pips * point
-            if direction == "BUY":
+                sl_distance = 50   # ejemplo: 50 pips para otros
+            if direction.upper() == "BUY":
                 return price - sl_distance
             else:
                 return price + sl_distance
