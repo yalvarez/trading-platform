@@ -332,7 +332,7 @@ Raw Message
   "format_tag": "GB_LONG",
   "fast": "false",
   "hint_price": "2500.5",
-  "chat_id": "-4813477250",
+  "chat_id": "-5250557024",
   "raw_text": "ORO BUY Entry: 2500-2505..."
 }
 ```
