@@ -174,15 +174,8 @@ class MT5Executor:
 
                 log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
                 # --- Selección dinámica y fallback de filling mode ---
-                supported_filling_modes = []
-                try:
-                    if symbol_info is not None and hasattr(symbol_info, 'filling_mode'):
-                        supported_filling_modes.append(symbol_info.filling_mode)
-                    if not supported_filling_modes:
-                        supported_filling_modes = [1, 3, 2]  # fallback: IOC, FOK, RETURN
-                except Exception as e:
-                    log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
-                    supported_filling_modes = [2, 1, 3]
+                # Siempre probar todos los filling modes para máxima compatibilidad
+                supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
                 log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
 
                 # Probar cada filling mode hasta que uno funcione
