@@ -649,11 +649,15 @@ class TradeManager:
                     "type": 0 if is_buy else 1,
                     "price": float(getattr(pos, "price_current", 0.0)),
                     "volume": float(getattr(pos, "volume", 0.0)),
+                    "magic": int(getattr(pos, "magic", 0)),
+                    "order": 0,
+                    "stoplimit": 0.0,
+                    "type_filling": 0,
+                    "type_time": 0,
+                    "expiration": 0,
+                    "comment": "",
+                    "position_by": 0,
                 }
-                # Only add type_filling if required by bridge (gmag11/MetaTrader5-Docker usually ignores it for SLTP, but keep for compatibility)
-                best_filling = getattr(self.mt5, "_best_filling", None)
-                if best_filling:
-                    req["type_filling"] = best_filling(symbol)
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
                 log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
