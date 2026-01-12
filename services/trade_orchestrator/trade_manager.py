@@ -645,18 +645,7 @@ class TradeManager:
                     "symbol": symbol,
                     "sl": float(be),
                     "tp": 0.0,
-                    "deviation": getattr(self, "deviation", 20),
-                    "type": 0 if is_buy else 1,
-                    "price": float(getattr(pos, "price_current", 0.0)),
-                    "volume": float(getattr(pos, "volume", 0.0)),
-                    "magic": int(getattr(pos, "magic", 0)),
-                    "order": 0,
-                    "stoplimit": 0.0,
-                    "type_filling": 0,
-                    "type_time": 0,
-                    "expiration": 0,
-                    "comment": "",
-                    "position_by": 0,
+                    "deviation": getattr(self, "deviation", 20)
                 }
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
