@@ -603,18 +603,18 @@ class TradeManager:
                 if symbol and symbol.upper().startswith("XAU"):  # XAUUSD, XAU
                     be = round(be, decimals)
                 # Validación de stops
-                info = client.symbol_info(symbol) if symbol else None
-                stop_level = getattr(info, 'stop_level', 0) * point if info else 0.0
                 price_current = float(getattr(pos, 'price_current', 0.0))
-                # Para SELL, el SL debe estar por encima del precio actual + stop_level
-                # Para BUY, el SL debe estar por debajo del precio actual - stop_level
+                # Compatibilidad máxima: el bridge MT5 no expone stop_level, así que se asume 0.0
+                # Si el broker requiere un mínimo, debe ajustarse manualmente en la config
+                # Para SELL, el SL debe estar por encima del precio actual
+                # Para BUY, el SL debe estar por debajo del precio actual
                 if not is_buy:
-                    min_sl = price_current + stop_level
+                    min_sl = price_current  # + 0.0
                     if be > min_sl:
                         log.info(f"[BE-DEBUG] Ajustando BE (SELL) | be={be} -> min_sl={min_sl}")
                         be = min_sl
                 else:
-                    max_sl = price_current - stop_level
+                    max_sl = price_current  # - 0.0
                     if be < max_sl:
                         log.info(f"[BE-DEBUG] Ajustando BE (BUY) | be={be} -> max_sl={max_sl}")
                         be = max_sl
