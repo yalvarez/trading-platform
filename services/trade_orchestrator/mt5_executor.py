@@ -177,8 +177,7 @@ class MT5Executor:
             # --- FIN LOTE ---
 
             log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
-            # --- Selección dinámica de filling mode ---
-            type_filling = 1  # IOC por defecto
+            # --- Selección dinámica y fallback de filling mode ---
             supported_filling_modes = []
             try:
                 if symbol_info is not None:
@@ -192,42 +191,47 @@ class MT5Executor:
                             supported_filling_modes.append(3)  # FOK
                     elif hasattr(symbol_info, 'filling_mode'):
                         supported_filling_modes.append(symbol_info.filling_mode)
-                    # Prefer RETURN (2), then IOC (1), then FOK (3)
-                    if 2 in supported_filling_modes:
-                        type_filling = 2
-                    elif 1 in supported_filling_modes:
-                        type_filling = 1
-                    elif 3 in supported_filling_modes:
-                        type_filling = 3
                 if not supported_filling_modes:
-                    log.warning(f"[FILLING] No supported filling modes detected for {symbol} ({name}). symbol_info: {symbol_info}")
+                    supported_filling_modes = [2, 1, 3]  # fallback to all
             except Exception as e:
                 log.warning(f"[FILLING] No se pudo obtener filling mode para {name}: {e}")
-            log.info(f"[FILLING] {symbol} ({name}) filling seleccionado: {type_filling} (soportados: {supported_filling_modes})")
-            req = {
-                "action": 1,
-                "symbol": symbol,
-                "volume": float(lot),
-                "type": order_type,
-                "price": float(price),
-                "sl": float(forced_sl),
-                "tp": 0.0,
-                "deviation": int(self.default_deviation),
-                "magic": int(self.magic),
-                "comment": self._safe_comment(provider_tag),
-                "type_time": 0,
-                "type_filling": type_filling,
-            }
-            import asyncio
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, client.order_send, req)
-            log.warning("order_send response acct=%s: %s", name, res)
-            if res and getattr(res, "retcode", None) == 10009:
-                tickets[name] = int(getattr(res, "order", 0))
-                log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
+                supported_filling_modes = [2, 1, 3]
+            log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
+
+            # Probar cada filling mode hasta que uno funcione
+            res = None
+            for type_filling in supported_filling_modes:
+                req = {
+                    "action": 1,
+                    "symbol": symbol,
+                    "volume": float(lot),
+                    "type": order_type,
+                    "price": float(price),
+                    "sl": float(forced_sl),
+                    "tp": 0.0,
+                    "deviation": int(self.default_deviation),
+                    "magic": int(self.magic),
+                    "comment": self._safe_comment(provider_tag),
+                    "type_time": 0,
+                    "type_filling": type_filling,
+                }
+                import asyncio
+                loop = asyncio.get_running_loop()
+                res = await loop.run_in_executor(None, client.order_send, req)
+                log.warning("order_send response acct=%s (filling=%s): %s", name, type_filling, res)
+                if res and getattr(res, "retcode", None) == 10009:
+                    tickets[name] = int(getattr(res, "order", 0))
+                    log.info("open_complete_trade success acct=%s ticket=%s (filling=%s)", name, tickets[name], type_filling)
+                    break
+                elif res and getattr(res, "retcode", None) not in [10030, 10013]:
+                    # Si el error no es de filling mode, no seguir probando
+                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                    log.warning("open_complete_trade failed acct=%s retcode=%s (filling=%s)", name, getattr(res,'retcode',None), type_filling)
+                    break
             else:
+                # Si ninguno funcionó
                 errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
+                log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
 
         accounts = [a for a in self.accounts if a.get("active")]
         await asyncio.gather(*(send_order(account) for account in accounts))
