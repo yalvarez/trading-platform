@@ -50,6 +50,10 @@ class ManagedTrade:
 
 
 class TradeManager:
+    def _safe_comment(self, tag: str) -> str:
+        base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
+        base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
+        return base[:31]
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
         # Forzar SL por defecto si falta
         default_sl_pips = getattr(self, 'default_sl', None)
