@@ -716,12 +716,19 @@ class TradeManager:
     async def _do_partial_close(self, account: dict, ticket: int, percent: int, reason: str):
         log.info(f"[DEBUG] Entering _do_partial_close | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")
         client = self.mt5._client_for(account)
+        # Obtener volumen antes del cierre parcial
+        pos_list_before = client.positions_get(ticket=int(ticket))
+        vol_before = float(getattr(pos_list_before[0], 'volume', 0.0)) if pos_list_before else 0.0
         ok = client.partial_close(account=account, ticket=int(ticket), percent=int(percent))
         log.info(f"[DEBUG] Result of client.partial_close: ok={ok} | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")
-        pos_list = client.positions_get(ticket=int(ticket))
-        pos = pos_list[0] if pos_list else None
+        # Esperar un momento para que el bridge procese el cierre
+        await asyncio.sleep(1)
+        pos_list_after = client.positions_get(ticket=int(ticket))
+        vol_after = float(getattr(pos_list_after[0], 'volume', 0.0)) if pos_list_after else 0.0
+        log.info(f"[DEBUG] Volumen antes del cierre parcial: {vol_before} | después: {vol_after} | delta: {vol_before - vol_after}")
+        pos = pos_list_after[0] if pos_list_after else None
         symbol = getattr(pos, 'symbol', '') if pos else ''
-        volume = float(getattr(pos, 'volume', 0.0)) if pos else 0.0
+        volume = vol_after
         info = client.symbol_info(symbol) if client else None
         step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
         vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
@@ -790,7 +797,8 @@ class TradeManager:
         for idx, tp in enumerate(t.tps):
             tp_idx = idx + 1
             if tp_idx not in t.tp_hit and self._tp_hit(is_buy, current, float(tp), buffer_price):
-                # Determinar el porcentaje a cerrar
+                # LOG DETALLADO: Precios y trigger
+                log.info(f"[TP-DEBUG] Evaluando TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} precio_objetivo={float(tp):.5f} precio_actual={current:.5f} buffer={buffer_price:.5f}")
                 if idx < len(tp_percents):
                     pct = tp_percents[idx]
                 else:
@@ -807,7 +815,8 @@ class TradeManager:
                     current_price=current,
                 )
                 log.info(f"[DEBUG] Calling _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
-                await self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP{tp_idx}")
+                # LOG DETALLADO: Precio de ejecución real tras cierre parcial
+                await self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP{tp_idx} (objetivo={float(tp):.5f} actual={current:.5f})")
                 log.info(f"[DEBUG] Finished _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
                 t.tp_hit.add(tp_idx)
                 # BE solo tras TP1
