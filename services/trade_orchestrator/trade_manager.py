@@ -743,6 +743,10 @@ class TradeManager:
             be = entry_price + offset
         else:
             be = entry_price - offset
+        info = client.symbol_info(symbol) if client else None
+        if not info:
+            log.error(f"[BE-DEBUG] No se pudo obtener info de símbolo para {symbol} en _do_be")
+            return 100
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": int(ticket),
@@ -822,9 +826,13 @@ class TradeManager:
         pos = pos_list_after[0] if pos_list_after else None
         symbol = getattr(pos, 'symbol', '') if pos else ''
         volume = vol_after
-        info = client.symbol_info(symbol) if client else None
-        step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
-        vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+        info = client.symbol_info(symbol) if client and symbol else None
+        if info:
+            step = float(getattr(info, 'volume_step', 0.01))
+            vmin = float(getattr(info, 'volume_min', 0.01))
+        else:
+            step = 0.01
+            vmin = 0.01
         # Ajustar al múltiplo inferior de step
         raw_close = volume * (float(percent) / 100.0) if volume > 0 else 0.0
         close_vol = step * int(raw_close / step)
