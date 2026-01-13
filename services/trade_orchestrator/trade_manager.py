@@ -630,18 +630,14 @@ class TradeManager:
                 return
             # Fallback de filling mode
             for filling_mode in filling_modes:
-                # Only include strictly required fields for SL/TP modification (action=3)
+                # Solo los campos requeridos para modificar SL/TP (BE)
                 req = {
                     "action": mt5.TRADE_ACTION_SLTP,
                     "position": int(ticket),
                     "symbol": symbol,
                     "sl": float(be),
                     "tp": 0.0,
-                    "magic": 987654,
-                    "deviation": 10,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "comment": ""
+                    "magic": 987654
                 }
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
