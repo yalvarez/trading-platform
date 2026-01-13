@@ -18,10 +18,10 @@ class MT5Executor:
     async def _apply_be(self, account: dict, ticket: int, be_offset_pips: Optional[float] = None, reason: str = "") -> bool:
         """
         Aplica break-even (BE) modificando el SL de la posición indicada.
-        Prueba los filling modes igual que en apertura para máxima compatibilidad.
+        Loguea el SL actual antes y después, el SL propuesto y el stop_level del símbolo.
         """
+        import logging
         client = self._client_for(account)
-        # Obtener la posición actual por ticket
         pos_list = client.positions_get(ticket=int(ticket))
         if not pos_list:
             self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)} | No se encontró la posición")
@@ -35,18 +35,29 @@ class MT5Executor:
         point = float(getattr(info, "point", 0.0))
         entry = float(getattr(pos, "price_open", 0.0))
         is_buy = (int(getattr(pos, "type", 0)) == 0)
+        sl_actual = float(getattr(pos, "sl", 0.0))
+        stop_level = float(getattr(info, "stops_level", 0.0)) * point
         # Offset en pips
         off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
         # Para XAUUSD, 1 pip = 0.10 (no 0.01)
         digits = int(getattr(info, "digits", 2))
         def pips_to_price(pips, point, digits):
-            # Si es XAUUSD, 1 pip = 0.10
             if symbol.upper().startswith("XAU"):
                 return pips * 0.10
             return pips * point
         off_price = pips_to_price(off_pips, point, digits)
         be_sl = (entry + off_price) if is_buy else (entry - off_price)
-        # Probar los filling modes igual que en apertura
+        logging.info(f"[BE-DEBUG] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
+        # Validar que el nuevo SL cumple con el mínimo stop level
+        price_current = float(getattr(pos, "price_current", 0.0))
+        if is_buy:
+            min_sl = price_current - stop_level
+            if be_sl > min_sl:
+                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}")
+        else:
+            max_sl = price_current + stop_level
+            if be_sl < max_sl:
+                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}")
         supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
         for type_filling in supported_filling_modes:
             req = {
@@ -57,10 +68,16 @@ class MT5Executor:
                 "comment": self._safe_comment(f"BE-{reason}"),
                 "type_filling": type_filling,
             }
+            logging.info(f"[BE-DEBUG] Enviando order_send | req={req}")
             import asyncio
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(None, client.order_send, req)
             ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
+            logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+            # Consultar la posición después del intento
+            pos_list_after = client.positions_get(ticket=int(ticket))
+            sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
+            logging.info(f"[BE-DEBUG] SL después del intento: {sl_after}")
             if ok:
                 self._notify_bg(account["name"], f"🔒 BE aplicado | Ticket: {int(ticket)} | SL: {be_sl:.5f}")
                 return True
