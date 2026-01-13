@@ -118,21 +118,146 @@ class TradeManager:
         return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
+        # Configuración de trailing tras el tercer tramo
+        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 20.0)
+        if not hasattr(t, 'trailing_active_last_tramo'):
+            t.trailing_active_last_tramo = False
+        if not hasattr(t, 'trailing_peak_last_tramo'):
+            t.trailing_peak_last_tramo = None
+        # Guardar el precio del cierre del primer tramo para BE futuro
+        if not hasattr(t, 'first_tramo_close_price'):
+            t.first_tramo_close_price = None
         # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
         if t.tps:
             return
         if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
             return
-        # Configurables
         tramo_pips = getattr(self, 'scaling_tramo_pips', 30.0)
-        fixed_tramo_volume = getattr(self, 'scaling_fixed_tramo_volume', 0.02)  # Nuevo: volumen fijo por tramo
-        # Estado: guardar tramos ya ejecutados en t.actions_done
+        percent_per_tramo = getattr(self, 'scaling_percent_per_tramo', 25)
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
-        # --- Cálculo de pips correcto por símbolo ---
         symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
         client = self.mt5._client_for(account)
-        # --- Equivalencia de pips: calcula cuántos pips en el activo actual equivalen a la ganancia de XAUUSD ---
-        # Remove duplicate and misplaced __init__
+        # Estado: guardar tramos ya ejecutados en t.actions_done
+        if not hasattr(t, 'actions_done') or t.actions_done is None:
+            t.actions_done = set()
+        # Calcular cuántos tramos de 30 pips se han recorrido desde la entrada
+        pips_ganados = (current - entry) / point if is_buy else (entry - current) / point
+        tramos = int(pips_ganados // tramo_pips)
+        # Ejecutar cierre parcial por cada tramo no ejecutado
+        for tramo in range(1, tramos + 1):
+            if tramo in t.actions_done:
+                continue
+            # Cerrar el 25% del volumen actual
+            v = float(getattr(pos, 'volume', 0.0))
+            vmin = float(getattr(client.symbol_info(symbol), 'volume_min', 0.0))
+            step = float(getattr(client.symbol_info(symbol), 'volume_step', 0.01))
+            close_vol = max(step, round(v * percent_per_tramo / 100.0 / step) * step)
+            if close_vol < vmin or close_vol >= v:
+                continue
+            req = {
+                "action": 1,  # TRADE_ACTION_DEAL
+                "position": int(pos.ticket),
+                "symbol": symbol,
+                "volume": close_vol,
+                "type": 1 if not is_buy else 0,  # 0=BUY, 1=SELL
+                "price": float(current),
+                "deviation": self.deviation,
+                "magic": self.magic,
+                "type_filling": getattr(client.symbol_info(symbol), 'filling_mode', 1),
+                "type_time": 0,
+                "comment": "ScalingOut"
+            }
+            log.info(f"[TOROFX-SCALING] Enviando cierre parcial tramo {tramo} | req={req}")
+            res = client.order_send(req)
+            log.info(f"[TOROFX-SCALING] Resultado cierre parcial tramo {tramo} | res={res}")
+            if res and res.retcode in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
+                t.actions_done.add(tramo)
+                # Guardar el precio del cierre del primer tramo
+                if tramo == 1:
+                    t.first_tramo_close_price = float(current)
+                self._notify_bg(account["name"], f"🎯 ScalingOut TOROFX: Parcial tramo {tramo} ({percent_per_tramo}%) ejecutado | Ticket: {int(pos.ticket)}")
+                await self.notify_trade_event(
+                    'partial',
+                    account_name=account["name"],
+                    ticket=int(pos.ticket),
+                    symbol=symbol,
+                    percent=percent_per_tramo,
+                    tramo=tramo
+                )
+                # Al cerrar el primer tramo, poner BE (SL=entry)
+                if tramo == 1:
+                    be_req = {
+                        "action": 3,  # TRADE_ACTION_SLTP
+                        "position": int(pos.ticket),
+                        "symbol": symbol,
+                        "sl": float(entry),
+                        "tp": 0.0,
+                        "magic": self.magic
+                    }
+                    log.info(f"[TOROFX-SCALING] Aplicando BE tras primer tramo | req={be_req}")
+                    be_res = client.order_send(be_req)
+                    log.info(f"[TOROFX-SCALING] Resultado BE tras primer tramo | res={be_res}")
+                    self._notify_bg(account["name"], f"🔒 BE aplicado tras primer tramo | Ticket: {int(pos.ticket)} | SL: {entry}")
+                # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
+                if tramo == 3 and t.first_tramo_close_price:
+                    be_req = {
+                        "action": 3,  # TRADE_ACTION_SLTP
+                        "position": int(pos.ticket),
+                        "symbol": symbol,
+                        "sl": float(t.first_tramo_close_price),
+                        "tp": 0.0,
+                        "magic": self.magic
+                    }
+                    log.info(f"[TOROFX-SCALING] Aplicando BE tras tercer tramo | req={be_req}")
+                    be_res = client.order_send(be_req)
+                    log.info(f"[TOROFX-SCALING] Resultado BE tras tercer tramo | res={be_res}")
+                    self._notify_bg(account["name"], f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {t.first_tramo_close_price}")
+        # Activar trailing solo después del cierre del tercer tramo
+        if 3 in t.actions_done and not t.trailing_active_last_tramo:
+            t.trailing_active_last_tramo = True
+            t.trailing_peak_last_tramo = float(current)
+            self._notify_bg(account["name"], f"🚦 Trailing activado tras tercer tramo | Ticket: {int(pos.ticket)} | Peak: {current}")
+
+        # Si el trailing tras el tercer tramo está activo, monitorear retroceso
+        if t.trailing_active_last_tramo:
+            peak = t.trailing_peak_last_tramo or float(current)
+            # Actualizar el máximo alcanzado
+            if (is_buy and current > peak) or (not is_buy and current < peak):
+                t.trailing_peak_last_tramo = float(current)
+                peak = float(current)
+            retroceso = (peak - current) / point if is_buy else (current - peak) / point
+            if retroceso >= trailing_pips_last_tramo:
+                # Cerrar el trade por completo
+                v = float(getattr(pos, 'volume', 0.0))
+                vmin = float(getattr(client.symbol_info(symbol), 'volume_min', 0.0))
+                step = float(getattr(client.symbol_info(symbol), 'volume_step', 0.01))
+                close_vol = v
+                if close_vol >= vmin:
+                    req = {
+                        "action": 1,  # TRADE_ACTION_DEAL
+                        "position": int(pos.ticket),
+                        "symbol": symbol,
+                        "volume": close_vol,
+                        "type": 1 if not is_buy else 0,  # 0=BUY, 1=SELL
+                        "price": float(current),
+                        "deviation": self.deviation,
+                        "magic": self.magic,
+                        "type_filling": getattr(client.symbol_info(symbol), 'filling_mode', 1),
+                        "type_time": 0,
+                        "comment": "TrailingClose"
+                    }
+                    log.info(f"[TOROFX-SCALING] Trailing: cerrando trade por retroceso de {trailing_pips_last_tramo} pips | req={req}")
+                    res = client.order_send(req)
+                    log.info(f"[TOROFX-SCALING] Resultado cierre trailing último tramo | res={res}")
+                    self._notify_bg(account["name"], f"🚦 Trailing: Trade cerrado por retroceso de {trailing_pips_last_tramo} pips | Ticket: {int(pos.ticket)}")
+                    await self.notify_trade_event(
+                        'close',
+                        account_name=account["name"],
+                        ticket=int(pos.ticket),
+                        symbol=symbol,
+                        reason=f"Trailing retroceso {trailing_pips_last_tramo} pips"
+                    )
+                    t.trailing_active_last_tramo = False
 
     async def notify_trailing(self, account, pos, new_sl):
         await self.notify_trade_event(
