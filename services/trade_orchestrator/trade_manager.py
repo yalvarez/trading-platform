@@ -608,6 +608,11 @@ class TradeManager:
             decimals = 2
             if symbol and symbol.upper().startswith("XAU"):
                 be = round(be, decimals)
+            price_current = float(getattr(pos, 'price_current', 0.0))
+            # Validar que el BE no esté por encima/debajo del precio actual según dirección
+            if (is_buy and price_current < be) or (not is_buy and price_current > be):
+                log.warning(f"[BE-DEBUG] No se puede aplicar BE | entry={entry} be={be} price_current={price_current} (la orden sería rechazada por el broker)")
+                return
             log.info(f"[BE-DEBUG] Calculado BE | entry={entry} be={be}")
             info = client.symbol_info(symbol) if symbol else None
             v = float(getattr(pos, 'volume', 0.0))
