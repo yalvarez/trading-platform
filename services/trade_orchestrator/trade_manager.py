@@ -731,9 +731,18 @@ class TradeManager:
                     log.info(f"[BE-DEBUG] Detected position update after partial close | volume: {last_volume} -> {curr_volume}, time_update: {last_time_update} -> {curr_time_update}")
                     break
             await asyncio.sleep(delay_seconds)
-        # Ahora intentar modificar el SL (BE) hasta 3 veces si es necesario
-        filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
-        # Enviar solo una vez el request limpio para modificar SL/TP (BE)
+        # --- Definir symbol y calcular precio BE ---
+        symbol = getattr(pos, 'symbol', None)
+        if not symbol:
+            log.error(f"[BE-DEBUG] No se pudo determinar el símbolo para el ticket={ticket} en _do_be")
+            return
+        # Calcular precio BE: SL = precio de entrada (entry_price)
+        entry_price = float(getattr(pos, 'price_open', 0.0))
+        offset = getattr(self, 'be_offset_pips', 0.0) * point if hasattr(self, 'be_offset_pips') else 0.0
+        if is_buy:
+            be = entry_price + offset
+        else:
+            be = entry_price - offset
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": int(ticket),
