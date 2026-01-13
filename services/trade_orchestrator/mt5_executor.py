@@ -93,41 +93,9 @@ class MT5Executor:
         # --- Forzar SL por defecto si no viene ---
         async def get_forced_sl(client, symbol, direction, price):
             info = client.symbol_info(symbol)
-            # Ajustar default_sl_pips según el instrumento
-            if symbol.upper().startswith("XAU"):  # Oro
-                sl_distance = 300  # ejemplo: 300 pips para oro
-            else:
-                sl_distance = 50   # ejemplo: 50 pips para otros
-            if direction.upper() == "BUY":
-                return price - sl_distance
-            else:
-                return price + sl_distance
-
-        if not self._should_operate_now():
-            reason = "Outside trading windows (London/NY)."
-            for a in [x for x in self.accounts if x.get("active")]:
-                errors[a["name"]] = reason
-            return MT5OpenResult(tickets_by_account=tickets, errors_by_account=errors)
-
-
-        async def send_order(account):
-            # ...existing code...
-            # Después de abrir la orden, actualizar SL/TP si corresponde
-            if res and getattr(res, "retcode", None) == 10009 and (sl or tps):
-                ticket = int(getattr(res, "order", 0))
-                # Modificar SL/TP si la orden fue abierta con valores por defecto o sin TP
-                mod_req = {
-                    "action": 3,  # TRADE_ACTION_SLTP
-                    "position": ticket,
-                    "symbol": symbol,
-                    "sl": float(sl) if sl else float(forced_sl),
-                    "tp": float(tps[0]) if tps else 0.0,
-                    "magic": int(self.magic),
-                }
-                mod_res = client.order_send(mod_req)
-                log.info(f"[ORDER_MODIFY] Modificación SL/TP acct={name} ticket={ticket} req={mod_req} res={mod_res}")
-            name = account["name"]
-            try:
+            async def send_order(account):
+                name = account["name"]
+                res = None  # Inicializar res para todos los caminos
                 client = self._client_for(account)
                 # Ensure symbol is selected before any info/price fetch
                 client.symbol_select(symbol, True)
@@ -193,8 +161,8 @@ class MT5Executor:
                 supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
                 log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
 
-                # Probar cada filling mode hasta que uno funcione
-                res = None
+            # Probar cada filling mode hasta que uno funcione
+            try:
                 for type_filling in supported_filling_modes:
                     req = {
                         "action": 1,
