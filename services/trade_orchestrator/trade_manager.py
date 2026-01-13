@@ -648,7 +648,12 @@ class TradeManager:
                     "position": int(ticket),
                     "symbol": symbol,
                     "sl": float(be),
-                    "tp": 0.0
+                    "tp": 0.0,
+                    "magic": 987654,
+                    "deviation": 10,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "comment": ""
                 }
                 log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
                 res = client.order_send(req)
