@@ -208,12 +208,12 @@ class TradeManager:
                     # Usar siempre el precio de apertura real para BE
                     entry_price_real = float(getattr(pos, 'price_open', entry))
                     be_req = {
-                        "action": 3,  # TRADE_ACTION_SLTP
+                        "action": 6,  # TRADE_ACTION_SLTP (MT5)
                         "position": int(pos.ticket),
-                        "symbol": symbol,
                         "sl": entry_price_real,
                         "tp": 0.0,
-                        "magic": self.magic
+                        "comment": self._safe_comment("BE-primer-tramo"),
+                        "type_filling": 1  # IOC por defecto, ajusta si tu bridge requiere otro
                     }
                     log.info(f"[TOROFX-SCALING] Aplicando BE tras primer tramo | req={be_req}")
                     be_res = client.order_send(be_req)
@@ -222,12 +222,12 @@ class TradeManager:
                 # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
                 if tramo == 3 and t.first_tramo_close_price:
                     be_req = {
-                        "action": 3,  # TRADE_ACTION_SLTP
+                        "action": 6,  # TRADE_ACTION_SLTP (MT5)
                         "position": int(pos.ticket),
-                        "symbol": symbol,
                         "sl": float(t.first_tramo_close_price),
                         "tp": 0.0,
-                        "magic": self.magic
+                        "comment": self._safe_comment("BE-tercer-tramo"),
+                        "type_filling": 1
                     }
                     log.info(f"[TOROFX-SCALING] Aplicando BE tras tercer tramo | req={be_req}")
                     be_res = client.order_send(be_req)
@@ -757,20 +757,12 @@ class TradeManager:
                 continue
             pos0 = pos_info[0]
             req = {
-                "action": mt5.TRADE_ACTION_SLTP,
+                "action": 6,  # TRADE_ACTION_SLTP (MT5)
                 "position": int(ticket),
-                "symbol": symbol,
                 "sl": float(be),
                 "tp": float(getattr(pos0, 'tp', 0.0)),
-                "magic": 987654,
-                "type_filling": type_filling,
-                # Campos adicionales para compatibilidad con bridges estrictos
-                "volume": float(getattr(pos0, 'volume', 0.0)),
-                "type": int(getattr(pos0, 'type', 0)),
-                "price": float(getattr(pos0, 'price_current', 0.0)),
-                "deviation": 50,
-                "comment": getattr(pos0, 'comment', ''),
-                "type_time": 0,
+                "comment": self._safe_comment("BE-general"),
+                "type_filling": type_filling
             }
             log.info(f"[BE-DEBUG] Enviando order_send | req={req}")
             res = client.order_send(req)
