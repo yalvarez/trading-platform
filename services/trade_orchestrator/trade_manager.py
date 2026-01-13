@@ -646,6 +646,7 @@ class TradeManager:
                 req = {
                     "action": mt5.TRADE_ACTION_SLTP,
                     "position": int(ticket),
+                    "symbol": symbol,
                     "sl": float(be),
                     "tp": 0.0
                 }
