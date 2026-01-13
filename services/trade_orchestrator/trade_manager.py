@@ -586,6 +586,7 @@ class TradeManager:
                     break
             await asyncio.sleep(delay_seconds)
         # Ahora intentar modificar el SL (BE) hasta 3 veces si es necesario
+        filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
         for attempt in range(1, 4):
             pos_list = client.positions_get(ticket=int(ticket))
             log.info(f"[BE-DEBUG] positions_get for BE | ticket={ticket} pos_list={pos_list}")
@@ -606,28 +607,21 @@ class TradeManager:
                     log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
             offset = be_offset * point
             be = (entry + offset) if is_buy else (entry - offset)
-            # Redondear a 2 decimales para XAUUSD y similares
             decimals = 2
             if symbol and symbol.upper().startswith("XAU"):  # XAUUSD, XAU
                 be = round(be, decimals)
-            # Validación de stops
             price_current = float(getattr(pos, 'price_current', 0.0))
-            # Compatibilidad máxima: el bridge MT5 no expone stop_level, así que se asume 0.0
-            # Si el broker requiere un mínimo, debe ajustarse manualmente en la config
-            # Para SELL, el SL debe estar por encima del precio actual
-            # Para BUY, el SL debe estar por debajo del precio actual
             if not is_buy:
-                min_sl = price_current  # + 0.0
+                min_sl = price_current
                 if be > min_sl:
                     log.info(f"[BE-DEBUG] Ajustando BE (SELL) | be={be} -> min_sl={min_sl}")
                     be = min_sl
             else:
-                max_sl = price_current  # - 0.0
+                max_sl = price_current
                 if be < max_sl:
                     log.info(f"[BE-DEBUG] Ajustando BE (BUY) | be={be} -> max_sl={max_sl}")
                     be = max_sl
             log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
-            # Chequeo de volumen mínimo
             info = client.symbol_info(symbol) if symbol else None
             v = float(getattr(pos, 'volume', 0.0))
             vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
@@ -646,66 +640,57 @@ class TradeManager:
                     message=msg
                 )
                 return
-
-            req = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": int(ticket),
-                "symbol": symbol,
-                "sl": float(be),
-                "tp": 0.0,
-                "deviation": getattr(self, "deviation", 20)
-            }
-            log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
-            res = client.order_send(req)
-            log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-            # Manejo de filling mode no soportado
-            if res and getattr(res, 'retcode', None) == 10030 and 'Unsupported filling mode' in getattr(res, 'comment', ''):
-                log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - Unsupported filling mode")
-                self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode")
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"❌ BE falló | Ticket: {int(ticket)}\nUnsupported filling mode"
-                )
-                return
-            ok = bool(res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL))
-            if ok:
-                # Validar que el SL realmente cambió
-                await asyncio.sleep(1)  # Esperar un segundo para que el cambio se refleje
-                pos_check = client.positions_get(ticket=int(ticket))
-                sl_actual = None
-                if pos_check and len(pos_check) > 0:
-                    sl_actual = float(getattr(pos_check[0], 'sl', 0.0))
-                if sl_actual is not None and abs(sl_actual - float(be)) < 1e-4:
-                    self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
-                    log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
-                    await self.notify_trade_event(
-                        'be',
-                        account_name=account["name"],
-                        message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
-                    )
-                    log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
-                    return
-                else:
-                    log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be} actual={sl_actual}")
-                    # Notificar como fallo
-                    self._notify_bg(
-                        account["name"],
-                        f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
-                    )
-                    await self.notify_trade_event(
-                        'be',
-                        account_name=account["name"],
-                        message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
-                    )
-                    # No return, para que pueda reintentar si quedan intentos
-            else:
-                retcode = getattr(res, 'retcode', None)
-                comment = getattr(res, 'comment', None)
-                log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment} (attempt {attempt})")
-                if attempt < max_retries:
-                    await asyncio.sleep(delay_seconds)
+            # Fallback de filling mode
+            for filling_mode in filling_modes:
+                req = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": int(ticket),
+                    "symbol": symbol,
+                    "sl": float(be),
+                    "tp": 0.0,
+                    "deviation": getattr(self, "deviation", 20),
+                    "type_filling": filling_mode
+                }
+                log.info(f"[BE-DEBUG] Enviando order_send | req={req} (attempt {attempt})")
+                res = client.order_send(req)
+                log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+                if res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
+                    # Validar que el SL realmente cambió
+                    await asyncio.sleep(1)
+                    pos_check = client.positions_get(ticket=int(ticket))
+                    sl_actual = None
+                    if pos_check and len(pos_check) > 0:
+                        sl_actual = float(getattr(pos_check[0], 'sl', 0.0))
+                    if sl_actual is not None and abs(sl_actual - float(be)) < 1e-4:
+                        self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
+                        log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
+                        await self.notify_trade_event(
+                            'be',
+                            account_name=account["name"],
+                            message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
+                        )
+                        log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
+                        return
+                    else:
+                        log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be} actual={sl_actual}")
+                        self._notify_bg(
+                            account["name"],
+                            f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        )
+                        await self.notify_trade_event(
+                            'be',
+                            account_name=account["name"],
+                            message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        )
+                        # No return, para que pueda reintentar si quedan intentos
+                elif res and getattr(res, 'retcode', None) == 10030 and 'Unsupported filling mode' in getattr(res, 'comment', ''):
+                    log.warning(f"[BE-DEBUG] Filling mode {filling_mode} no soportado, probando siguiente...")
                     continue
+                else:
+                    retcode = getattr(res, 'retcode', None)
+                    comment = getattr(res, 'comment', None)
+                    log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment} (attempt {attempt}, filling_mode={filling_mode})")
+                    break
                 self._notify_bg(
                     account["name"],
                     f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
