@@ -93,9 +93,19 @@ class MT5Executor:
         # --- Forzar SL por defecto si no viene ---
         async def get_forced_sl(client, symbol, direction, price):
             info = client.symbol_info(symbol)
-            async def send_order(account):
-                name = account["name"]
-                res = None  # Inicializar res para todos los caminos
+            if symbol.upper().startswith("XAU"):  # Oro
+                sl_distance = 300
+            else:
+                sl_distance = 50
+            if direction.upper() == "BUY":
+                return price - sl_distance
+            else:
+                return price + sl_distance
+
+        async def send_order(account):
+            name = account["name"]
+            res = None  # Inicializar res para todos los caminos
+            try:
                 client = self._client_for(account)
                 # Ensure symbol is selected before any info/price fetch
                 client.symbol_select(symbol, True)
@@ -161,8 +171,7 @@ class MT5Executor:
                 supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
                 log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
 
-            # Probar cada filling mode hasta que uno funcione
-            try:
+                # Probar cada filling mode hasta que uno funcione
                 for type_filling in supported_filling_modes:
                     req = {
                         "action": 1,
