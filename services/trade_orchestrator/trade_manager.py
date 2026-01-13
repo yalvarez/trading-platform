@@ -598,30 +598,17 @@ class TradeManager:
             entry = float(pos.price_open)
             symbol = getattr(pos, 'symbol', None)
             acc_name = account.get('name')
-            be_offset = self.be_offset_pips
-            if hasattr(self, 'config'):
-                try:
-                    be_offset = self.config.get('be_offset_pips', {}).get(acc_name, {}).get(symbol, be_offset)
-                    log.info(f"[BE-DEBUG] be_offset override | acc={acc_name} symbol={symbol} be_offset={be_offset}")
-                except Exception as e:
-                    log.warning(f"[BE-DEBUG] Exception buscando be_offset override: {e}")
-            offset = be_offset * point
-            be = (entry + offset) if is_buy else (entry - offset)
+            # Determinar el BE según TP alcanzados
+            t = self.trades.get(int(ticket))
+            be = entry  # Por defecto, BE es el entry
+            if t and hasattr(t, 'tp_hit') and hasattr(t, 'tps'):
+                # Si TP2 alcanzado, BE = TP1
+                if 2 in t.tp_hit and len(t.tps) >= 1:
+                    be = float(t.tps[0])
             decimals = 2
-            if symbol and symbol.upper().startswith("XAU"):  # XAUUSD, XAU
+            if symbol and symbol.upper().startswith("XAU"):
                 be = round(be, decimals)
-            price_current = float(getattr(pos, 'price_current', 0.0))
-            if not is_buy:
-                min_sl = price_current
-                if be > min_sl:
-                    log.info(f"[BE-DEBUG] Ajustando BE (SELL) | be={be} -> min_sl={min_sl}")
-                    be = min_sl
-            else:
-                max_sl = price_current
-                if be < max_sl:
-                    log.info(f"[BE-DEBUG] Ajustando BE (BUY) | be={be} -> max_sl={max_sl}")
-                    be = max_sl
-            log.info(f"[BE-DEBUG] Calculado BE | entry={entry} offset={offset} be={be}")
+            log.info(f"[BE-DEBUG] Calculado BE | entry={entry} be={be}")
             info = client.symbol_info(symbol) if symbol else None
             v = float(getattr(pos, 'volume', 0.0))
             vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
