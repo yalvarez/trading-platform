@@ -627,18 +627,19 @@ class TradeManager:
             vmin = float(getattr(info, 'volume_min', 0.0)) if info else 0.0
             if v < vmin or v == 0.0:
                 log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - Volumen insuficiente v={v} vmin={vmin}")
-                msg = (
-                    f"❌ BE falló | Ticket: {int(ticket)}\n"
-                    f"No se puede modificar el SL porque el volumen actual ({v}) es igual o menor al mínimo permitido ({vmin}).\n"
-                    f"Esto ocurre normalmente cuando la posición ya está por cerrarse o el lote es el último permitido por el broker.\n"
-                    f"No es necesario aplicar BE en este caso."
-                )
-                self._notify_bg(account["name"], msg)
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=msg
-                )
+                req = {
+                    'action': 3,
+                    'position': ticket,
+                    'symbol': symbol,
+                    'sl': be,
+                    'tp': 0.0,
+                    'magic': self.magic,
+                    'deviation': 10,
+                    'type_filling': filling_mode,
+                    'type_time': 0,
+                    'comment': '',
+                    'volume': pos.volume if hasattr(pos, 'volume') else 0.0,  # Use current position volume for BE
+                }
                 return
             # Fallback de filling mode
             for filling_mode in filling_modes:
