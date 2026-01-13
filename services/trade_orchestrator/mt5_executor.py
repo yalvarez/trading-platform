@@ -74,7 +74,6 @@ class MT5Executor:
             res = await loop.run_in_executor(None, client.order_send, req)
             ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
             logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-            # Consultar la posición después del intento
             pos_list_after = client.positions_get(ticket=int(ticket))
             sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
             logging.info(f"[BE-DEBUG] SL después del intento: {sl_after}")
