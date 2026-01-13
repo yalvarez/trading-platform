@@ -634,11 +634,6 @@ class TradeManager:
                     'sl': be,
                     'tp': 0.0,
                     'magic': self.magic,
-                    'deviation': 10,
-                    'type_filling': filling_mode,
-                    'type_time': 0,
-                    'comment': '',
-                    'volume': pos.volume if hasattr(pos, 'volume') else 0.0,  # Use current position volume for BE
                 }
                 return
             # Fallback de filling mode
