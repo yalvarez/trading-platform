@@ -225,8 +225,12 @@ class MT5Executor:
                         break
                 else:
                     # Si ninguno funcionó
-                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                    log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
+                    if res is not None:
+                        errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                        log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
+                    else:
+                        errors[name] = "order_send failed: no response from MT5"
+                        log.warning("open_complete_trade failed acct=%s: no response from MT5 (all fillings)", name)
             except Exception as e:
                 errors[name] = f"Exception: {e}"
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
