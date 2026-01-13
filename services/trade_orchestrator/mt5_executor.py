@@ -15,6 +15,62 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    async def _apply_be(self, account: dict, ticket: int, be_offset_pips: Optional[float] = None, reason: str = "") -> bool:
+        """
+        Aplica break-even (BE) modificando el SL de la posición indicada.
+        Prueba los filling modes igual que en apertura para máxima compatibilidad.
+        """
+        client = self._client_for(account)
+        # Obtener la posición actual por ticket
+        pos_list = client.positions_get(ticket=int(ticket))
+        if not pos_list:
+            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)} | No se encontró la posición")
+            return False
+        pos = pos_list[0]
+        symbol = pos.symbol
+        info = client.symbol_info(symbol)
+        if not info:
+            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)} | No se encontró info de símbolo")
+            return False
+        point = float(getattr(info, "point", 0.0))
+        entry = float(getattr(pos, "price_open", 0.0))
+        is_buy = (int(getattr(pos, "type", 0)) == 0)
+        # Offset en pips
+        off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
+        # Para XAUUSD, 1 pip = 0.10 (no 0.01)
+        digits = int(getattr(info, "digits", 2))
+        def pips_to_price(pips, point, digits):
+            # Si es XAUUSD, 1 pip = 0.10
+            if symbol.upper().startswith("XAU"):
+                return pips * 0.10
+            return pips * point
+        off_price = pips_to_price(off_pips, point, digits)
+        be_sl = (entry + off_price) if is_buy else (entry - off_price)
+        # Probar los filling modes igual que en apertura
+        supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
+        for type_filling in supported_filling_modes:
+            req = {
+                "action": 6,  # TRADE_ACTION_SLTP
+                "position": int(ticket),
+                "sl": float(be_sl),
+                "tp": 0.0,
+                "comment": self._safe_comment(f"BE-{reason}"),
+                "type_filling": type_filling,
+            }
+            import asyncio
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, client.order_send, req)
+            ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
+            if ok:
+                self._notify_bg(account["name"], f"🔒 BE aplicado | Ticket: {int(ticket)} | SL: {be_sl:.5f}")
+                return True
+            else:
+                self._notify_bg(
+                    account["name"],
+                    f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
+                )
+        return False
+
     def __init__(
         self,
         accounts: list[dict],

@@ -750,14 +750,27 @@ class TradeManager:
         # --- Probar todos los filling modes para modificar SL (BE) ---
         supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
         for type_filling in supported_filling_modes:
+            # Obtener info de la posición actual para los campos requeridos
+            pos_info = client.positions_get(ticket=int(ticket))
+            if not pos_info or len(pos_info) == 0:
+                log.error(f"[BE-DEBUG] No se pudo obtener info de la posición para modificar SL | ticket={ticket}")
+                continue
+            pos0 = pos_info[0]
             req = {
                 "action": mt5.TRADE_ACTION_SLTP,
                 "position": int(ticket),
                 "symbol": symbol,
                 "sl": float(be),
-                "tp": 0.0,
+                "tp": float(getattr(pos0, 'tp', 0.0)),
                 "magic": 987654,
                 "type_filling": type_filling,
+                # Campos adicionales para compatibilidad con bridges estrictos
+                "volume": float(getattr(pos0, 'volume', 0.0)),
+                "type": int(getattr(pos0, 'type', 0)),
+                "price": float(getattr(pos0, 'price_current', 0.0)),
+                "deviation": 50,
+                "comment": getattr(pos0, 'comment', ''),
+                "type_time": 0,
             }
             log.info(f"[BE-DEBUG] Enviando order_send | req={req}")
             res = client.order_send(req)
