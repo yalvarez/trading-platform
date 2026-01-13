@@ -52,11 +52,30 @@ class ManagedTrade:
 class TradeManager:
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
         # Forzar SL por defecto si falta
-        default_sl = getattr(self, 'default_sl', None)
+        default_sl_pips = getattr(self, 'default_sl', None)
         if planned_sl is None or planned_sl == 0.0:
-            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl})")
-            if default_sl is not None:
-                planned_sl = float(default_sl)
+            # Obtener precio de entrada y punto
+            entry_price = None
+            point = None
+            # Intentar obtener precio de entrada y punto desde MT5 si posible
+            account = next((a for a in self.mt5.accounts if a.get("active")), None)
+            client = self.mt5._client_for(account) if account else None
+            pos_list = client.positions_get(ticket=int(ticket)) if client else []
+            if pos_list:
+                pos = pos_list[0]
+                entry_price = float(getattr(pos, 'price_open', 0.0))
+                point = float(getattr(client.symbol_info(symbol), 'point', 0.01))
+            # Si no se puede obtener, usar None
+            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl_pips})")
+            if default_sl_pips is not None and entry_price is not None and point is not None:
+                # Calcular SL por defecto en pips
+                sl_pips = float(default_sl_pips)
+                if direction.upper() == "BUY":
+                    planned_sl = entry_price - (sl_pips * point)
+                else:
+                    planned_sl = entry_price + (sl_pips * point)
+            elif default_sl_pips is not None:
+                planned_sl = float(default_sl_pips)
         """
         Registers a new trade in the manager. Used when a trade is opened externally (e.g., by signal handler).
         """
@@ -186,18 +205,20 @@ class TradeManager:
                 )
                 # Al cerrar el primer tramo, poner BE (SL=entry)
                 if tramo == 1:
+                    # Usar siempre el precio de apertura real para BE
+                    entry_price_real = float(getattr(pos, 'price_open', entry))
                     be_req = {
                         "action": 3,  # TRADE_ACTION_SLTP
                         "position": int(pos.ticket),
                         "symbol": symbol,
-                        "sl": float(entry),
+                        "sl": entry_price_real,
                         "tp": 0.0,
                         "magic": self.magic
                     }
                     log.info(f"[TOROFX-SCALING] Aplicando BE tras primer tramo | req={be_req}")
                     be_res = client.order_send(be_req)
                     log.info(f"[TOROFX-SCALING] Resultado BE tras primer tramo | res={be_res}")
-                    self._notify_bg(account["name"], f"🔒 BE aplicado tras primer tramo | Ticket: {int(pos.ticket)} | SL: {entry}")
+                    self._notify_bg(account["name"], f"🔒 BE aplicado tras primer tramo | Ticket: {int(pos.ticket)} | SL: {entry_price_real}")
                 # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
                 if tramo == 3 and t.first_tramo_close_price:
                     be_req = {

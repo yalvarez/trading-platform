@@ -111,6 +111,21 @@ class MT5Executor:
 
 
         async def send_order(account):
+            # ...existing code...
+            # Después de abrir la orden, actualizar SL/TP si corresponde
+            if res and getattr(res, "retcode", None) == 10009 and (sl or tps):
+                ticket = int(getattr(res, "order", 0))
+                # Modificar SL/TP si la orden fue abierta con valores por defecto o sin TP
+                mod_req = {
+                    "action": 3,  # TRADE_ACTION_SLTP
+                    "position": ticket,
+                    "symbol": symbol,
+                    "sl": float(sl) if sl else float(forced_sl),
+                    "tp": float(tps[0]) if tps else 0.0,
+                    "magic": int(self.magic),
+                }
+                mod_res = client.order_send(mod_req)
+                log.info(f"[ORDER_MODIFY] Modificación SL/TP acct={name} ticket={ticket} req={mod_req} res={mod_res}")
             name = account["name"]
             try:
                 client = self._client_for(account)
