@@ -210,10 +210,8 @@ class MT5Executor:
 
         async def send_order(account):
             name = account["name"]
-            res = None  # Inicializar res para todos los caminos
             try:
                 client = self._client_for(account)
-                # Ensure symbol is selected before any info/price fetch
                 client.symbol_select(symbol, True)
                 symbol_info = client.symbol_info(symbol)
                 if not symbol_info:
@@ -237,18 +235,14 @@ class MT5Executor:
                 if fixed_lot > 0:
                     lot = fixed_lot
                 elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
-                    # Obtener balance actual
                     try:
                         acc_info = client.mt5.account_info()
                         if acc_info and hasattr(acc_info, "balance"):
                             balance = float(acc_info.balance)
                     except Exception as e:
                         log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
-                    # Calcular riesgo monetario
                     risk_money = balance * (risk_percent / 100.0)
-                    # Calcular distancia SL en precio
                     sl_distance = abs(float(price) - float(forced_sl))
-                    # Obtener info de símbolo
                     try:
                         symbol_info = client.symbol_info(symbol)
                         tick_value = float(getattr(symbol_info, "tick_value", 0.0))
@@ -272,48 +266,28 @@ class MT5Executor:
                 # --- FIN LOTE ---
 
                 log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
-                # --- Selección dinámica y fallback de filling mode ---
-                # Siempre probar todos los filling modes para máxima compatibilidad
-                supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
-                log.info(f"[FILLING] {symbol} ({name}) filling fallback orden: {supported_filling_modes}")
 
-                # Probar cada filling mode hasta que uno funcione
-                for type_filling in supported_filling_modes:
-                    req = {
-                        "action": 1,
-                        "symbol": symbol,
-                        "volume": float(lot),
-                        "type": order_type,
-                        "price": float(price),
-                        "sl": float(forced_sl),
-                        "tp": 0.0,
-                        "deviation": int(self.default_deviation),
-                        "magic": int(self.magic),
-                        "comment": self._safe_comment(provider_tag),
-                        "type_time": 0,
-                        "type_filling": type_filling,
-                    }
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    res = await loop.run_in_executor(None, client.order_send, req)
-                    log.warning("order_send response acct=%s (filling=%s): %s", name, type_filling, res)
-                    if res and getattr(res, "retcode", None) == 10009:
-                        tickets[name] = int(getattr(res, "order", 0))
-                        log.info("open_complete_trade success acct=%s ticket=%s (filling=%s)", name, tickets[name], type_filling)
-                        break
-                    elif res and getattr(res, "retcode", None) not in [10030, 10013]:
-                        # Si el error no es de filling mode, no seguir probando
-                        errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                        log.warning("open_complete_trade failed acct=%s retcode=%s (filling=%s)", name, getattr(res,'retcode',None), type_filling)
-                        break
+                # --- Unificar lógica de envío con fallback robusto ---
+                req = {
+                    "action": 1,
+                    "symbol": symbol,
+                    "volume": float(lot),
+                    "type": order_type,
+                    "price": float(price),
+                    "sl": float(forced_sl),
+                    "tp": 0.0,
+                    "deviation": int(self.default_deviation),
+                    "magic": int(self.magic),
+                    "comment": self._safe_comment(provider_tag),
+                    "type_time": 0,
+                }
+                res = await self._best_filling_order_send(client, symbol, req)
+                if res and getattr(res, "retcode", None) == 10009:
+                    tickets[name] = int(getattr(res, "order", 0))
+                    log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
                 else:
-                    # Si ninguno funcionó
-                    if res is not None:
-                        errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                        log.warning("open_complete_trade failed acct=%s retcode=%s (all fillings)", name, getattr(res,'retcode',None))
-                    else:
-                        errors[name] = "order_send failed: no response from MT5"
-                        log.warning("open_complete_trade failed acct=%s: no response from MT5 (all fillings)", name)
+                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                    log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
             except Exception as e:
                 errors[name] = f"Exception: {e}"
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
