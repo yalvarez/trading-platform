@@ -123,13 +123,17 @@ class MT5Executor:
         for f in candidates:
             req_try = dict(req)
             req_try["type_filling"] = int(f)
-            log.info(f"[FILLING] Probar type_filling={f} para {symbol}")
+            log.info(f"[FILLING] Probar type_filling={f} para {symbol} | req={req_try}")
             res = await loop.run_in_executor(None, client.order_send, req_try)
             last_res = res
             if res and getattr(res, "retcode", None) in (10009, 10008):
                 return res
+            # Logging detallado si la orden falla
             if res and getattr(res, "retcode", None) != 10030:
+                log.warning(f"[ORDER-FAIL] retcode={getattr(res,'retcode',None)} comment={getattr(res,'comment',None)} req={req_try} res={res}")
                 return res
+            if res and getattr(res, "retcode", None) == 10030:
+                log.warning(f"[ORDER-INVALID-REQUEST] retcode=10030 comment={getattr(res,'comment',None)} req={req_try} res={res}")
         return last_res
 
         async def _best_filling_order_send(self, client, symbol, req: dict):
