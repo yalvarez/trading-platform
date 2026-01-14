@@ -182,83 +182,95 @@ async def main():
     router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds, channels_config=channels_config)
     group = "router_group"
     consumer = f"consumer_{os.getpid()}"
-    await create_consumer_group(r, Streams.RAW, group)
 
-    async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
-        text = fields.get("text", "")
-        chat_id = fields.get("chat_id", "")
-        # log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])  # Reduce log noise
-
-        # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
-        if looks_like_torofx_management(text) or ("stop loss" in text.lower() and "target: open" in text.lower()):
-            sig = ToroFxParser().parse(text)
-            if sig:
-                trace_id = uuid.uuid4().hex[:8]
-                sig_dict = {}
-                # --- SERIALIZACIÓN ROBUSTA DE entry_range ---
-                entry_range_val = sig.entry_range
-                import json
-                if entry_range_val is None:
-                    entry_range_json = json.dumps([])
-                elif isinstance(entry_range_val, str):
-                    v_clean = entry_range_val.strip()
-                    if v_clean.startswith('(') and v_clean.endswith(')'):
-                        v_clean = v_clean[1:-1]
-                        parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
-                        entry_range_json = json.dumps(parts)
-                    else:
-                        try:
-                            val = json.loads(v_clean)
-                            entry_range_json = json.dumps(val)
-                        except Exception:
-                            entry_range_json = json.dumps([])
-                elif isinstance(entry_range_val, (tuple, list)):
-                    entry_range_json = json.dumps(list(entry_range_val))
-                else:
-                    entry_range_json = json.dumps([])
-                for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
-                    if k == "entry_range":
-                        sig_dict[k] = entry_range_json
-                    elif isinstance(v, bool):
-                        sig_dict[k] = str(v).lower()
-                    elif isinstance(v, (list, tuple)):
-                        sig_dict[k] = json.dumps(v)
-                    elif v is None:
-                        continue
-                    else:
-                        sig_dict[k] = v
-                sig_dict["chat_id"] = chat_id
-                sig_dict["raw_text"] = text
-                sig_dict["trace"] = trace_id
-                await xadd(r, Streams.SIGNALS, sig_dict)
-                log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig_dict.get('direction','')} {sig_dict.get('symbol','')}")
-                await xack(r, Streams.RAW, group, msg_id)
-                continue
-            # Si no parsea, lo manda como gestión
-            await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
-            log.info("[MGMT] TOROFX")
-            await xack(r, Streams.RAW, group, msg_id)
-            continue
-
-        if looks_like_followup(text):
-            await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
-            log.info("[MGMT] GB follow-up")
-            await xack(r, Streams.RAW, group, msg_id)
-            continue
-
+    # Bucle robusto: reintenta creación de grupo si ocurre NOGROUP
+    import asyncio
+    while True:
         try:
-            sig = await router.process_raw_signal(chat_id, text)
-            if sig:
-                trace_id = uuid.uuid4().hex[:8]
-                sig["chat_id"] = chat_id
-                sig["raw_text"] = text
-                sig["trace"] = trace_id
-                await xadd(r, Streams.SIGNALS, sig)
-                log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
+            async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
+                text = fields.get("text", "")
+                chat_id = fields.get("chat_id", "")
+                # log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])  # Reduce log noise
+
+                # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
+                if looks_like_torofx_management(text) or ("stop loss" in text.lower() and "target: open" in text.lower()):
+                    sig = ToroFxParser().parse(text)
+                    if sig:
+                        trace_id = uuid.uuid4().hex[:8]
+                        sig_dict = {}
+                        # --- SERIALIZACIÓN ROBUSTA DE entry_range ---
+                        entry_range_val = sig.entry_range
+                        import json
+                        if entry_range_val is None:
+                            entry_range_json = json.dumps([])
+                        elif isinstance(entry_range_val, str):
+                            v_clean = entry_range_val.strip()
+                            if v_clean.startswith('(') and v_clean.endswith(')'):
+                                v_clean = v_clean[1:-1]
+                                parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
+                                entry_range_json = json.dumps(parts)
+                            else:
+                                try:
+                                    val = json.loads(v_clean)
+                                    entry_range_json = json.dumps(val)
+                                except Exception:
+                                    entry_range_json = json.dumps([])
+                        elif isinstance(entry_range_val, (tuple, list)):
+                            entry_range_json = json.dumps(list(entry_range_val))
+                        else:
+                            entry_range_json = json.dumps([])
+                        for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
+                            if k == "entry_range":
+                                sig_dict[k] = entry_range_json
+                            elif isinstance(v, bool):
+                                sig_dict[k] = str(v).lower()
+                            elif isinstance(v, (list, tuple)):
+                                sig_dict[k] = json.dumps(v)
+                            elif v is None:
+                                continue
+                            else:
+                                sig_dict[k] = v
+                        sig_dict["chat_id"] = chat_id
+                        sig_dict["raw_text"] = text
+                        sig_dict["trace"] = trace_id
+                        await xadd(r, Streams.SIGNALS, sig_dict)
+                        log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig_dict.get('direction','')} {sig_dict.get('symbol','')}")
+                        await xack(r, Streams.RAW, group, msg_id)
+                        continue
+                    # Si no parsea, lo manda como gestión
+                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
+                    log.info("[MGMT] TOROFX")
+                    await xack(r, Streams.RAW, group, msg_id)
+                    continue
+
+                if looks_like_followup(text):
+                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
+                    log.info("[MGMT] GB follow-up")
+                    await xack(r, Streams.RAW, group, msg_id)
+                    continue
+
+                try:
+                    sig = await router.process_raw_signal(chat_id, text)
+                    if sig:
+                        trace_id = uuid.uuid4().hex[:8]
+                        sig["chat_id"] = chat_id
+                        sig["raw_text"] = text
+                        sig["trace"] = trace_id
+                        await xadd(r, Streams.SIGNALS, sig)
+                        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
+                    else:
+                        pass  # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
+                finally:
+                    await xack(r, Streams.RAW, group, msg_id)
+        except Exception as e:
+            if "NOGROUP" in str(e):
+                log.warning("[REDIS] NOGROUP detectado, reintentando creación de grupo...")
+                await create_consumer_group(r, Streams.RAW, group)
+                await asyncio.sleep(1)
+                continue
             else:
-                pass  # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
-        finally:
-            await xack(r, Streams.RAW, group, msg_id)
+                log.error(f"[FATAL] Error inesperado en bucle de consumo: {e}")
+                raise
 
 if __name__ == "__main__":
     import asyncio
