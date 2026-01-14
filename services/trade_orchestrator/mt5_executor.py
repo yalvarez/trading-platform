@@ -82,7 +82,7 @@ class MT5Executor:
                 )
             return False
 
-    async def _best_filling_order_send(self, client, symbol, req: dict):
+    async def _best_filling_order_send(self, client, symbol, req: dict, account_name: str = None):
         """
         Intenta enviar la orden usando el filling recomendado por el símbolo y, si falla, prueba los otros modos.
         """
@@ -105,12 +105,6 @@ class MT5Executor:
         # Si la cuenta es 'StarTrader Demo' y el símbolo es XAUUSD, forzar solo FOK
         # Para revertir, eliminar este bloque
         force_fok = False
-        account_name = None
-        # Intentar obtener el nombre de la cuenta del cliente
-        if hasattr(client, 'account') and isinstance(client.account, dict):
-            account_name = client.account.get('name', None)
-        elif hasattr(client, 'account_name'):
-            account_name = getattr(client, 'account_name', None)
         if account_name == 'StarTrader Demo' and symbol.upper() == 'XAUUSD':
             force_fok = True
         # --- FIN PATCH ---
@@ -337,7 +331,7 @@ class MT5Executor:
                     "comment": self._safe_comment(provider_tag),
                     "type_time": 0,
                 }
-                res = await self._best_filling_order_send(client, symbol, req)
+                res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
                 if res and getattr(res, "retcode", None) == 10009:
                     tickets[name] = int(getattr(res, "order", 0))
                     log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
