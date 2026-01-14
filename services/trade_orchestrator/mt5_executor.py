@@ -86,7 +86,7 @@ class MT5Executor:
             """
             Intenta enviar la orden usando el filling recomendado por el símbolo y, si falla, prueba los otros modos.
             """
-            # Obtener el modo recomendado por el símbolo
+            # Obtener el modo recomendado por el símbolo y loggear todos los campos relevantes
             info = client.symbol_info(symbol)
             tick = client.symbol_info_tick(symbol)
             ORDER_FILLING_IOC = 1
@@ -94,7 +94,13 @@ class MT5Executor:
             ORDER_FILLING_RETURN = 2
             candidates = []
             tfm = getattr(info, "trade_fill_mode", None) if info else None
-            log.info(f"[SYMBOL-STATE] symbol={symbol} price={getattr(tick, 'ask', None)} enabled={info is not None} trade_fill_mode={tfm}")
+            enabled = getattr(info, "visible", None) if info else None
+            trademode = getattr(info, "trade_mode", None) if info else None
+            fillmode = getattr(info, "trade_fill_mode", None) if info else None
+            bid = getattr(tick, "bid", None) if tick else None
+            ask = getattr(tick, "ask", None) if tick else None
+            ticktime = getattr(tick, "time", None) if tick else None
+            log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} trade_fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
             if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
                 candidates.append(int(tfm))
             for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
