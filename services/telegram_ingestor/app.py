@@ -44,6 +44,7 @@ async def main():
             last_msg["ts"] = asyncio.get_event_loop().time()
             chat_id = str(event.chat_id)
             text = (event.raw_text or "").strip()
+            log.debug(f"[HANDLER][RAW] Recibido: chat_id={chat_id} id={event.id} tipo={type(event.message).__name__} texto='{text[:80]}...'")
             if chats and chat_id not in chats:
                 log.warning(f"[CHAT_FILTER] Ignorado chat_id={chat_id} (no está en chats). Lista de chats permitidos: {chats}")
                 return
@@ -68,7 +69,12 @@ async def main():
 
     asyncio.create_task(watchdog())
 
-    await client.start(phone=phone)
+    try:
+        await client.start(phone=phone)
+        log.info("[CONNECT] Conexión a Telegram exitosa.")
+    except Exception as e:
+        log.error(f"[CONNECT][ERROR] Fallo al conectar a Telegram: {e}")
+        raise
     log.info("Telegram ingestor running...")
     await client.run_until_disconnected()
 
