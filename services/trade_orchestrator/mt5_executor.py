@@ -101,11 +101,28 @@ class MT5Executor:
         ask = getattr(tick, "ask", None) if tick else None
         ticktime = getattr(tick, "time", None) if tick else None
         log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} trade_fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
-        if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
-            candidates.append(int(tfm))
-        for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
-            if f not in candidates:
-                candidates.append(f)
+        # --- PATCH: Forzar FOK para StarTrader Demo y XAUUSD ---
+        # Si la cuenta es 'StarTrader Demo' y el símbolo es XAUUSD, forzar solo FOK
+        # Para revertir, eliminar este bloque
+        force_fok = False
+        account_name = None
+        # Intentar obtener el nombre de la cuenta del cliente
+        if hasattr(client, 'account') and isinstance(client.account, dict):
+            account_name = client.account.get('name', None)
+        elif hasattr(client, 'account_name'):
+            account_name = getattr(client, 'account_name', None)
+        if account_name == 'StarTrader Demo' and symbol.upper() == 'XAUUSD':
+            force_fok = True
+        # --- FIN PATCH ---
+        if force_fok:
+            candidates = [ORDER_FILLING_FOK]
+            log.info(f"[FILLING-PATCH] Forzando FOK para cuenta StarTrader Demo y XAUUSD")
+        else:
+            if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
+                candidates.append(int(tfm))
+            for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
+                if f not in candidates:
+                    candidates.append(f)
         last_res = None
         import asyncio
         loop = asyncio.get_running_loop()
