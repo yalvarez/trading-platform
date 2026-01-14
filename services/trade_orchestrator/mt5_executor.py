@@ -281,6 +281,13 @@ class MT5Executor:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
 
+                # --- Si el SL está demasiado cerca del precio actual, poner SL=0.0 ---
+                symbol_info = client.symbol_info(symbol)
+                min_stop = float(getattr(symbol_info, "stops_level", 0.0)) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
+                if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
+                    log.warning(f"[SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Enviando SL=0.0")
+                    forced_sl = 0.0
+
                 # --- LOTE DINÁMICO O FIJO ---
                 lot = 0.01
                 fixed_lot = float(account.get("fixed_lot", 0))
