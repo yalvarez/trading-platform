@@ -105,22 +105,44 @@ async def main():
     async def handle_signal(fields: dict):
         trace_id = uuid.uuid4().hex[:8]
         orig_trace = fields.get("trace", "NO_TRACE")
-        # log.info("[SIGNAL] recv trace=%s orig_trace=%s fields=%s", trace_id, orig_trace, json.dumps(fields, ensure_ascii=False))  # Reduce log noise
         if not in_windows(parse_windows(s.trading_windows)):
             log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
-            await xadd(r, Streams.EVENTS, {"type":"skip", "reason":"outside_windows", "trace": trace_id})
+            await xadd(r, Streams.EVENTS, {"type": "skip", "reason": "outside_windows", "trace": trace_id})
             return
 
         symbol = fields.get("symbol")
         direction = fields.get("direction")
-        provider_tag = fields.get("provider_tag","GEN")
-        entry_range = fields.get("entry_range","")
-        sl = fields.get("sl","")
-        tps = json.loads(fields.get("tps","[]") or "[]")
+        provider_tag = fields.get("provider_tag", "GEN")
+        entry_range = fields.get("entry_range", "")
+        sl = fields.get("sl", "")
+        tps = json.loads(fields.get("tps", "[]") or "[]")
+        is_fast = fields.get("fast", "false").lower() == "true"
 
         entry_tuple = json.loads(entry_range) if entry_range else None
-        # ✅ wait 60s for price to enter range (if provided)
-        # For scaffold simplicity, we skip the async price wait here; you can hook it in next iteration.
+
+        # --- FAST update logic ---
+        if not is_fast:
+            # For each account, check for an existing trade with provider_tag 'GB_FAST' for this symbol/direction
+            updated_any = False
+            for acct_name, trade in list(tm.trades.items()):
+                t = trade
+                if (
+                    t.symbol == symbol
+                    and t.direction == direction
+                    and t.provider_tag == "GB_FAST"
+                ):
+                    # Update the trade with new SL, TPs, and provider_tag
+                    tm.update_trade_signal(
+                        ticket=t.ticket,
+                        tps=tps,
+                        planned_sl=float(sl) if sl else None,
+                        provider_tag=provider_tag,
+                    )
+                    log.info(f"[FAST-UPDATE] Updated FAST trade ticket={t.ticket} acct={t.account_name} with new SL/TP/provider_tag from full signal.")
+                    updated_any = True
+            # If any trade was updated, skip opening a new trade
+            if updated_any:
+                return
 
         log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s", trace_id, provider_tag, symbol, direction)
         res = await execu.open_complete_trade(
@@ -145,7 +167,6 @@ async def main():
                 tps=tps,
                 planned_sl=float(sl) if sl else None,
             )
-            # log.info("[SIGNAL] registered trade trace=%s acct=%s ticket=%s", trace_id, acct_name, ticket)  # Reduce log noise
 
         # Notify trade opened (friendly message) if notifier available
         if notifier_adapter is not None:
@@ -173,7 +194,7 @@ async def main():
                 log.exception("failed to send trade_opened notifications: %s", e)
 
         if res.errors_by_account:
-            await xadd(r, Streams.EVENTS, {"type":"open_errors", "errors": json.dumps(res.errors_by_account)})
+            await xadd(r, Streams.EVENTS, {"type": "open_errors", "errors": json.dumps(res.errors_by_account)})
 
     async def handle_mgmt(fields: dict):
         text = fields.get("text","")

@@ -76,14 +76,15 @@ class GoldBroFastParser(SignalParser):
             except (ValueError, IndexError):
                 pass
 
-        # SL temporal configurable
+        # SL temporal configurable, usando tamaño de pip real para XAUUSD
         sl_pips = float(os.getenv("FAST_TEMP_SL_PIPS", "70"))
+        pip_size = 0.1  # XAUUSD: 1 pip = 0.1
         sl = None
         if hint is not None:
             if is_buy:
-                sl = hint - sl_pips
+                sl = hint - (sl_pips * pip_size)
             elif is_sell:
-                sl = hint + sl_pips
+                sl = hint + (sl_pips * pip_size)
 
         direction = "BUY" if is_buy else "SELL"
         return ParseResult(

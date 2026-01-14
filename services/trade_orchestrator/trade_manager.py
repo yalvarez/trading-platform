@@ -740,17 +740,22 @@ class TradeManager:
         if not symbol:
             log.error(f"[BE-DEBUG] No se pudo determinar el símbolo para el ticket={ticket} en _do_be")
             return
-        # Calcular precio BE: SL = precio de entrada (entry_price)
+        # Calcular precio BE: SL = precio de entrada (entry_price) + spread (BUY) o - spread (SELL) + offset
         entry_price = float(getattr(pos, 'price_open', 0.0))
         offset = getattr(self, 'be_offset_pips', 0.0) * point if hasattr(self, 'be_offset_pips') else 0.0
-        if is_buy:
-            be = entry_price + offset
-        else:
-            be = entry_price - offset
         info = client.symbol_info(symbol) if client else None
         if not info:
             log.error(f"[BE-DEBUG] No se pudo obtener info de símbolo para {symbol} en _do_be")
             return 100
+        spread = float(getattr(info, 'spread', 0.0)) * float(getattr(info, 'point', point))
+        # Si el spread es 0, usar un valor mínimo configurable o default
+        if spread == 0.0:
+            spread = getattr(self, 'be_min_spread', 0.0) * point if hasattr(self, 'be_min_spread') else 0.0
+        if is_buy:
+            be = entry_price + spread + offset
+        else:
+            be = entry_price - spread - offset
+        log.info(f"[BE-DEBUG] BE calculation | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be}")
         # --- Probar todos los filling modes para modificar SL (BE) ---
         supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
         for type_filling in supported_filling_modes:
