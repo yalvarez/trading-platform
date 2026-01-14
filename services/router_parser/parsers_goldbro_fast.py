@@ -61,8 +61,12 @@ class GoldBroFastParser(SignalParser):
         if not (is_buy or is_sell):
             return None
 
-        # Must have urgency indicator
-        if not self.URGENCY_PATTERN.search(norm):
+        # --- Permitir urgencia opcional si el mensaje tiene formato típico de entrada rápida ---
+        has_urgency = self.URGENCY_PATTERN.search(norm) is not None
+        has_at_format = re.search(r'\b(at|@)\b', norm, re.IGNORECASE) is not None
+        has_price = self.PRICE_PATTERN.search(norm) is not None
+        # Si no hay urgencia, pero sí formato 'at/@' y precio, aceptar como FAST
+        if not has_urgency and not (has_at_format and has_price):
             return None
 
         # Extract optional price hint
@@ -75,6 +79,7 @@ class GoldBroFastParser(SignalParser):
                     hint = v
             except (ValueError, IndexError):
                 pass
+        # Si no hay hint válido, igual incluir el campo en ParseResult (None)
 
         # SL temporal configurable, usando tamaño de pip real para XAUUSD
         sl_pips = float(os.getenv("FAST_TEMP_SL_PIPS", "70"))
@@ -93,6 +98,6 @@ class GoldBroFastParser(SignalParser):
             symbol="XAUUSD",
             direction=direction,
             is_fast=True,
-            hint_price=hint,
+            hint_price=hint,  # Siempre presente, aunque sea None
             sl=sl,
         )
