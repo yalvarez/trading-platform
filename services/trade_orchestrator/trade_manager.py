@@ -742,7 +742,8 @@ class TradeManager:
             return
         # Calcular precio BE: SL = precio de entrada (entry_price) + spread (BUY) o - spread (SELL) + offset
         entry_price = float(getattr(pos, 'price_open', 0.0))
-        offset = getattr(self, 'be_offset_pips', 0.0) * point if hasattr(self, 'be_offset_pips') else 0.0
+        # Offset BE en cero
+        offset = 0.0
         info = client.symbol_info(symbol) if client else None
         if not info:
             log.error(f"[BE-DEBUG] No se pudo obtener info de símbolo para {symbol} en _do_be")
@@ -755,6 +756,30 @@ class TradeManager:
             be = entry_price + spread + offset
         else:
             be = entry_price - spread - offset
+        # Validar volumen > 0
+        v = float(getattr(pos, 'volume', 0.0))
+        if v <= 0:
+            log.error(f"[BE-DEBUG] No se puede aplicar BE, volumen=0 | ticket={ticket}")
+            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nLa posición ya está cerrada (volumen=0).")
+            await self.notify_trade_event(
+                'be',
+                account_name=account["name"],
+                message=f"❌ BE falló | Ticket: {int(ticket)}\nLa posición ya está cerrada (volumen=0)."
+            )
+            return
+        # Validar distancia mínima de stop
+        min_stop = float(getattr(info, 'stop_level', 0.0)) * float(getattr(info, 'point', point))
+        price_current = float(getattr(pos, 'price_current', entry_price))
+        dist = abs(be - price_current)
+        if dist < min_stop:
+            log.error(f"[BE-DEBUG] No se puede aplicar BE, distancia mínima no cumplida | ticket={ticket} dist={dist} min_stop={min_stop}")
+            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nLa distancia mínima de stop no se cumple (dist={dist:.5f}, min_stop={min_stop:.5f}).")
+            await self.notify_trade_event(
+                'be',
+                account_name=account["name"],
+                message=f"❌ BE falló | Ticket: {int(ticket)}\nLa distancia mínima de stop no se cumple (dist={dist:.5f}, min_stop={min_stop:.5f})."
+            )
+            return
         log.info(f"[BE-DEBUG] BE calculation | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be}")
         # --- Probar todos los filling modes para modificar SL (BE) ---
         supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN

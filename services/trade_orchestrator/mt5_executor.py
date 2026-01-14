@@ -58,20 +58,15 @@ class MT5Executor:
             max_sl = price_current + stop_level
             if be_sl < max_sl:
                 logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}")
-        supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
-        for type_filling in supported_filling_modes:
+
             req = {
                 "action": 6,  # TRADE_ACTION_SLTP
                 "position": int(ticket),
                 "sl": float(be_sl),
                 "tp": 0.0,
                 "comment": self._safe_comment(f"BE-{reason}"),
-                "type_filling": type_filling,
             }
-            logging.info(f"[BE-DEBUG] Enviando order_send | req={req}")
-            import asyncio
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, client.order_send, req)
+            res = await self._best_filling_order_send(client, symbol, req)
             ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
             logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
             pos_list_after = client.positions_get(ticket=int(ticket))
@@ -85,7 +80,39 @@ class MT5Executor:
                     account["name"],
                     f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
                 )
-        return False
+            return False
+
+        async def _best_filling_order_send(self, client, symbol, req: dict):
+            """
+            Intenta enviar la orden usando el filling recomendado por el símbolo y, si falla, prueba los otros modos.
+            """
+            # Obtener el modo recomendado por el símbolo
+            info = client.symbol_info(symbol)
+            # Defaults (MT5): 1=IOC, 2=RETURN, 3=FOK
+            ORDER_FILLING_IOC = 1
+            ORDER_FILLING_FOK = 3
+            ORDER_FILLING_RETURN = 2
+            candidates = []
+            tfm = getattr(info, "trade_fill_mode", None) if info else None
+            if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
+                candidates.append(int(tfm))
+            for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
+                if f not in candidates:
+                    candidates.append(f)
+            last_res = None
+            import asyncio
+            loop = asyncio.get_running_loop()
+            for f in candidates:
+                req_try = dict(req)
+                req_try["type_filling"] = int(f)
+                log.info(f"[FILLING] Probar type_filling={f} para {symbol}")
+                res = await loop.run_in_executor(None, client.order_send, req_try)
+                last_res = res
+                if res and getattr(res, "retcode", None) in (10009, 10008):
+                    return res
+                if res and getattr(res, "retcode", None) != 10030:
+                    return res
+            return last_res
 
     def __init__(
         self,
