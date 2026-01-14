@@ -88,12 +88,13 @@ class MT5Executor:
             """
             # Obtener el modo recomendado por el símbolo
             info = client.symbol_info(symbol)
-            # Defaults (MT5): 1=IOC, 2=RETURN, 3=FOK
+            tick = client.symbol_info_tick(symbol)
             ORDER_FILLING_IOC = 1
             ORDER_FILLING_FOK = 3
             ORDER_FILLING_RETURN = 2
             candidates = []
             tfm = getattr(info, "trade_fill_mode", None) if info else None
+            log.info(f"[SYMBOL-STATE] symbol={symbol} price={getattr(tick, 'ask', None)} enabled={info is not None} trade_fill_mode={tfm}")
             if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
                 candidates.append(int(tfm))
             for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
