@@ -17,9 +17,9 @@ async def main():
         while True:
             now = asyncio.get_event_loop().time()
             last = last_msg["ts"]
-            if last is not None and now - last > 120:
+            if last is not None and now - last > 600:
                 log.warning(f"[WATCHDOG] ⚠️ No se reciben mensajes desde hace {int(now-last)}s. Posible desconexión o bloqueo.")
-            await asyncio.sleep(120)  # Reduce frequency
+            await asyncio.sleep(600)  # Solo cada 10 minutos
 
     import json
     from common.config import CHANNELS_CONFIG_JSON
@@ -56,6 +56,7 @@ async def main():
                 "date": event.date.isoformat() if event.date else "",
                 "text": text
             }
+            log.info(f"[RECEIVED] Mensaje recibido: chat_id={chat_id} id={event.id} texto='{text[:80]}...'")
             try:
                 await xadd(r, Streams.RAW, payload)
             except Exception as re:
@@ -65,13 +66,6 @@ async def main():
             log.error(f"[HANDLER][EXCEPTION] chat_id={getattr(event, 'chat_id', None)} id={getattr(event, 'id', None)} error={e}")
             log.exception(e)
 
-    # Log periódico para saber que el loop sigue vivo
-    async def heartbeat():
-        while True:
-            log.info("[HEARTBEAT] Telegram ingestor sigue vivo...")
-            await asyncio.sleep(600)  # Reduce frequency to every 10 minutes
-
-    asyncio.create_task(heartbeat())
     asyncio.create_task(watchdog())
 
     await client.start(phone=phone)

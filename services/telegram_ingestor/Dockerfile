@@ -4,7 +4,10 @@ COPY services/telegram_ingestor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY services/common ./common
 COPY services/telegram_ingestor/notify_api.py .
+COPY services/telegram_ingestor/app.py .
 COPY services/telegram_ingestor/telegram_ingestor.session .
+COPY services/telegram_ingestor/supervisord.conf ./supervisord.conf
 
-# Solo expone la API HTTP funcional para notificaciones Telegram
-CMD ["uvicorn", "notify_api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Ejecuta API HTTP y proceso de ingesta en paralelo
+RUN pip install --no-cache-dir supervisor
+CMD ["supervisord", "-c", "./supervisord.conf"]
