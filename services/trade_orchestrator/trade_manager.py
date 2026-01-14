@@ -205,24 +205,7 @@ class TradeManager:
                     ticket=int(pos.ticket),
                     symbol=symbol,
                     percent=percent_per_tramo,
-                    tramo=tramo
-                )
-                # Al cerrar el primer tramo, poner BE (SL=entry)
-                if tramo == 1:
-                    # Usar siempre el precio de apertura real para BE
-                    entry_price_real = float(getattr(pos, 'price_open', entry))
-                    be_req = {
-                        "action": 6,  # TRADE_ACTION_SLTP (MT5)
-                        "position": int(pos.ticket),
-                        "sl": entry_price_real,
-                        "tp": 0.0,
-                        "comment": self._safe_comment("BE-primer-tramo"),
-                        "type_filling": 1  # IOC por defecto, ajusta si tu bridge requiere otro
-                    }
-                    log.info(f"[TOROFX-SCALING] Aplicando BE tras primer tramo | req={be_req}")
-                    be_res = client.order_send(be_req)
-                    log.info(f"[TOROFX-SCALING] Resultado BE tras primer tramo | res={be_res}")
-                    self._notify_bg(account["name"], f"🔒 BE aplicado tras primer tramo | Ticket: {int(pos.ticket)} | SL: {entry_price_real}")
+                    tramo=tramo)
                 # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
                 if tramo == 3 and t.first_tramo_close_price:
                     be_req = {
