@@ -13,7 +13,8 @@ api_id = int(os.getenv("TG_API_ID", "21104104"))
 api_hash = os.getenv("TG_API_HASH", "7afb33549783f0315ae6538370c78ab9")
 phone = os.getenv("TG_PHONE", "")
 
-client = TelegramClient("telegram_ingestor", api_id, api_hash)
+# Usa un archivo de sesión separado para la API para evitar conflictos de SQLite
+client = TelegramClient("telegram_ingestor_api", api_id, api_hash)
 
 class NotifyRequest(BaseModel):
     chat_id: str
