@@ -1,13 +1,16 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
-import asyncio, time, re
+import asyncio
+import time
+import re
 
 from common.timewindow import parse_windows, in_windows
 import logging
 
 log = logging.getLogger("trade_orchestrator.mt5_executor")
 from mt5_client import MT5Client
+from trade_manager import TradeManager
 
 @dataclass
 class MT5OpenResult:
@@ -39,25 +42,24 @@ class MT5Executor:
         stop_level = float(getattr(info, "stops_level", 0.0)) * point
         # Offset en pips
         off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
-        # Para XAUUSD, 1 pip = 0.10 (no 0.01)
-        digits = int(getattr(info, "digits", 2))
-        def pips_to_price(pips, point, digits):
-            if symbol.upper().startswith("XAU"):
-                return pips * 0.10
-            return pips * point
-        off_price = pips_to_price(off_pips, point, digits)
+        # Usar función centralizada de conversión
+        from trade_manager import TradeManager
+        off_price = TradeManager._pips_to_price(symbol, off_pips, point)
         be_sl = (entry + off_price) if is_buy else (entry - off_price)
+        be_sl = round(be_sl, 2 if symbol.upper().startswith("XAU") else 5)
         logging.info(f"[BE-DEBUG] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
         # Validar que el nuevo SL cumple con el mínimo stop level
         price_current = float(getattr(pos, "price_current", 0.0))
         if is_buy:
             min_sl = price_current - stop_level
             if be_sl > min_sl:
-                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}")
+                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}. Ajustando SL a {min_sl}")
+                be_sl = round(min_sl, 2 if symbol.upper().startswith("XAU") else 5)
         else:
             max_sl = price_current + stop_level
             if be_sl < max_sl:
-                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}")
+                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
+                be_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
 
             req = {
                 "action": 6,  # TRADE_ACTION_SLTP
@@ -253,14 +255,17 @@ class MT5Executor:
         # --- Forzar SL por defecto si no viene ---
         async def get_forced_sl(client, symbol, direction, price):
             info = client.symbol_info(symbol)
+            point = float(getattr(info, "point", 0.01))
             if symbol.upper().startswith("XAU"):  # Oro
-                sl_distance = 300
+                sl_pips = 300
             else:
-                sl_distance = 50
+                sl_pips = 50
+            from trade_manager import TradeManager
+            sl_offset = TradeManager._pips_to_price(symbol, sl_pips, point)
             if direction.upper() == "BUY":
-                return price - sl_distance
+                return round(price - sl_offset, 2 if symbol.upper().startswith("XAU") else 5)
             else:
-                return price + sl_distance
+                return round(price + sl_offset, 2 if symbol.upper().startswith("XAU") else 5)
 
         async def send_order(account):
             name = account["name"]
@@ -281,12 +286,16 @@ class MT5Executor:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
 
-                # --- Si el SL está demasiado cerca del precio actual, poner SL=0.0 ---
+                # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
                 min_stop = float(getattr(symbol_info, "stops_level", 0.0)) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
-                    log.warning(f"[SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Enviando SL=0.0")
-                    forced_sl = 0.0
+                    if direction.upper() == "BUY":
+                        adjusted_sl = price - min_stop
+                    else:
+                        adjusted_sl = price + min_stop
+                    log.warning(f"[SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
+                    forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
 
                 # --- LOTE DINÁMICO O FIJO ---
                 lot = 0.01

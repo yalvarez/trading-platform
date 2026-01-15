@@ -50,15 +50,38 @@ class ManagedTrade:
 
 
 class TradeManager:
+
+    @staticmethod
+    def _pips_to_price(symbol: str, pips: float, point: float) -> float:
+        """
+        Convierte pips a precio para cualquier símbolo.
+        Para XAUUSD (o símbolos que empiezan con XAU), 1 pip = 0.1 dólares.
+        Para otros, usa el point del símbolo.
+        """
+        if symbol.upper().startswith("XAU"):
+            return round(pips * 0.1, 2)
+        return round(pips * point, 5)
     def _safe_comment(self, tag: str) -> str:
         base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
         base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
         return base[:31]
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
         # Forzar SL por defecto si falta
+        import os
         default_sl_pips = getattr(self, 'default_sl', None)
+        # Permitir override por símbolo (ejemplo: XAUUSD)
+        symbol_upper = symbol.upper() if symbol else ""
+        env_override = None
+        if symbol_upper == "XAUUSD":
+            env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
+        # Si hay override en env, úsalo
+        if env_override is not None:
+            try:
+                default_sl_pips = float(env_override)
+            except Exception:
+                pass
         if planned_sl is None or planned_sl == 0.0:
-            # Obtener precio de entrada y punto
+            # Obtener precio de entrada y point
             entry_price = None
             point = None
             # Intentar obtener precio de entrada y punto desde MT5 si posible
@@ -69,15 +92,15 @@ class TradeManager:
                 pos = pos_list[0]
                 entry_price = float(getattr(pos, 'price_open', 0.0))
                 point = float(getattr(client.symbol_info(symbol), 'point', 0.01))
-            # Si no se puede obtener, usar None
             log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl_pips})")
             if default_sl_pips is not None and entry_price is not None and point is not None:
-                # Calcular SL por defecto en pips
                 sl_pips = float(default_sl_pips)
+                sl_offset = self._pips_to_price(symbol, sl_pips, point)
+                # Cálculo correcto: para BUY restar, para SELL sumar
                 if direction.upper() == "BUY":
-                    planned_sl = entry_price - (sl_pips * point)
+                    planned_sl = round(entry_price - sl_offset, 2 if symbol_upper.startswith("XAU") else 5)
                 else:
-                    planned_sl = entry_price + (sl_pips * point)
+                    planned_sl = round(entry_price + sl_offset, 2 if symbol_upper.startswith("XAU") else 5)
             elif default_sl_pips is not None:
                 planned_sl = float(default_sl_pips)
         """
@@ -186,14 +209,17 @@ class TradeManager:
                 "price": float(current),
                 "deviation": self.deviation,
                 "magic": self.magic,
-                "type_filling": getattr(client.symbol_info(symbol), 'filling_mode', 1),
+                # type_filling will be set by robust filling logic
                 "type_time": 0,
                 "comment": "ScalingOut"
             }
             log.info(f"[TOROFX-SCALING] Enviando cierre parcial tramo {tramo} | req={req}")
-            res = client.order_send(req)
+            # Use robust filling logic from mt5_executor
+            from services.trade_orchestrator.mt5_executor import MT5Executor
+            mt5_executor = MT5Executor(self.mt5)
+            res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
             log.info(f"[TOROFX-SCALING] Resultado cierre parcial tramo {tramo} | res={res}")
-            if res and res.retcode in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
+            if res and getattr(res, 'retcode', None) in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
                 t.actions_done.add(tramo)
                 # Guardar el precio del cierre del primer tramo
                 if tramo == 1:
@@ -208,18 +234,32 @@ class TradeManager:
                     tramo=tramo)
                 # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
                 if tramo == 3 and t.first_tramo_close_price:
+                    be_sl = float(t.first_tramo_close_price)
+                    # Validate min stop distance using centralized logic
+                    info = client.symbol_info(symbol)
+                    point = float(getattr(info, "point", 0.0))
+                    stop_level = float(getattr(info, "stops_level", 0.0)) * point
+                    price_current = float(current)
+                    if is_buy:
+                        min_sl = price_current - stop_level
+                        if be_sl > min_sl:
+                            be_sl = round(min_sl, 2 if symbol.startswith("XAU") else 5)
+                    else:
+                        max_sl = price_current + stop_level
+                        if be_sl < max_sl:
+                            be_sl = round(max_sl, 2 if symbol.startswith("XAU") else 5)
                     be_req = {
                         "action": 6,  # TRADE_ACTION_SLTP (MT5)
                         "position": int(pos.ticket),
-                        "sl": float(t.first_tramo_close_price),
+                        "sl": float(be_sl),
                         "tp": 0.0,
                         "comment": self._safe_comment("BE-tercer-tramo"),
-                        "type_filling": 1
+                        # type_filling will be set by robust filling logic
                     }
                     log.info(f"[TOROFX-SCALING] Aplicando BE tras tercer tramo | req={be_req}")
-                    be_res = client.order_send(be_req)
+                    be_res = await mt5_executor._best_filling_order_send(client, symbol, be_req, account.get('name'))
                     log.info(f"[TOROFX-SCALING] Resultado BE tras tercer tramo | res={be_res}")
-                    self._notify_bg(account["name"], f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {t.first_tramo_close_price}")
+                    self._notify_bg(account["name"], f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {be_sl}")
         # Activar trailing solo después del cierre del tercer tramo
         if 3 in t.actions_done and not t.trailing_active_last_tramo:
             t.trailing_active_last_tramo = True
@@ -250,12 +290,14 @@ class TradeManager:
                         "price": float(current),
                         "deviation": self.deviation,
                         "magic": self.magic,
-                        "type_filling": getattr(client.symbol_info(symbol), 'filling_mode', 1),
+                        # type_filling will be set by robust filling logic
                         "type_time": 0,
                         "comment": "TrailingClose"
                     }
                     log.info(f"[TOROFX-SCALING] Trailing: cerrando trade por retroceso de {trailing_pips_last_tramo} pips | req={req}")
-                    res = client.order_send(req)
+                    from services.trade_orchestrator.mt5_executor import MT5Executor
+                    mt5_executor = MT5Executor(self.mt5)
+                    res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
                     log.info(f"[TOROFX-SCALING] Resultado cierre trailing último tramo | res={res}")
                     self._notify_bg(account["name"], f"🚦 Trailing: Trade cerrado por retroceso de {trailing_pips_last_tramo} pips | Ticket: {int(pos.ticket)}")
                     await self.notify_trade_event(

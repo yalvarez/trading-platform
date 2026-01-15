@@ -120,6 +120,7 @@ async def main():
 
         entry_tuple = json.loads(entry_range) if entry_range else None
 
+
         # --- FAST update logic ---
         if not is_fast:
             # For each account, check for an existing trade with provider_tag 'GB_FAST' for this symbol/direction
@@ -143,6 +144,42 @@ async def main():
             # If any trade was updated, skip opening a new trade
             if updated_any:
                 return
+
+            # --- TP1/fast close logic for complete signals ---
+            # Only for complete signals (not fast), and only if TP1 is present
+            if tps and len(tps) > 0:
+                # Get current price from any active account (first one)
+                account = next((a for a in accounts if a.get("active")), None)
+                if account:
+                    client = execu._client_for(account)
+                    # Use tick_price to get current price in the right direction
+                    # For BUY, price must be >= TP1; for SELL, price <= TP1
+                    tp1 = float(tps[0])
+                    current_price = client.tick_price(symbol, direction)
+                    price_past_tp1 = False
+                    if direction.upper() == "BUY" and current_price >= tp1:
+                        price_past_tp1 = True
+                    elif direction.upper() == "SELL" and current_price <= tp1:
+                        price_past_tp1 = True
+                    if price_past_tp1:
+                        log.warning(f"[COMPLETE-SIGNAL] Price is past TP1 (current={current_price}, TP1={tp1}) for {symbol} {direction}. Not registering signal.")
+                        # Close any open fast trade for this symbol/direction
+                        for acct_name, trade in list(tm.trades.items()):
+                            t = trade
+                            if (
+                                t.symbol == symbol
+                                and t.direction == direction
+                                and t.provider_tag == "GB_FAST"
+                            ):
+                                # Attempt to close the fast trade (full close)
+                                try:
+                                    client = execu._client_for(account)
+                                    # Use partial_close with 100% to close fully
+                                    client.partial_close(account, t.ticket, 100)
+                                    log.info(f"[COMPLETE-SIGNAL] Closed FAST trade ticket={t.ticket} acct={t.account_name} due to price past TP1.")
+                                except Exception as e:
+                                    log.error(f"[COMPLETE-SIGNAL] Failed to close FAST trade ticket={t.ticket}: {e}")
+                        return
 
         log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s", trace_id, provider_tag, symbol, direction)
         res = await execu.open_complete_trade(
