@@ -19,6 +19,11 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    def _safe_comment(self, tag: str) -> str:
+        base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
+        base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
+        return base[:31]
+
     def _client_for(self, account):
         # Implementación básica: asume que la cuenta tiene un campo 'client' o que se puede construir aquí
         # Ajusta según tu arquitectura real
