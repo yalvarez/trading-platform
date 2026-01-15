@@ -197,81 +197,34 @@ class MT5Executor:
         self.notifier = notifier
 
         self.windows = parse_windows(trading_windows)
-        self.entry_wait_seconds = int(entry_wait_seconds)
-        self.entry_poll_ms = int(entry_poll_ms)
-        self.entry_buffer_points = float(entry_buffer_points)
-
-        self._clients: dict[str, MT5Client] = {}
-
-    def _notify_bg(self, account_name: str, message: str):
-        if not self.notifier:
-            return
-        try:
-            asyncio.create_task(self.notifier(account_name, message))
-        except RuntimeError:
-            print(f"[NOTIFY][NO_LOOP] {account_name}: {message}")
-
-    def _safe_comment(self, tag: str) -> str:
-        base = f"{self.comment_prefix}-{tag}"
-        base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
-        return base[:31]
-
-    def _client_for(self, account: dict) -> MT5Client:
-        key = account["name"]
-        if key not in self._clients:
-            self._clients[key] = MT5Client(account["host"], int(account["port"]))
-        return self._clients[key]
-
-    def _should_operate_now(self) -> bool:
-        return in_windows(self.windows)
-
-    async def wait_price_in_range(self, client: MT5Client, symbol: str, direction: str, lo: float, hi: float) -> float:
-        deadline = time.time() + self.entry_wait_seconds
-        buffer = self.entry_buffer_points
-        while time.time() <= deadline:
-            px = client.tick_price(symbol, direction)
-            if px > 0 and (lo - buffer) <= px <= (hi + buffer):
-                return px
-            await asyncio.sleep(self.entry_poll_ms / 1000.0)
-        return 0.0
-
-
-    async def open_complete_trade(
-        self,
-        *,
-        provider_tag: str,
-        symbol: str,
-        direction: str,
-        entry_range: Optional[Tuple[float, float]],
-        sl: float,
-        tps: list[float],
-    ) -> MT5OpenResult:
-        tickets: dict[str, int] = {}
-        errors: dict[str, str] = {}
-
-        log.info("open_complete_trade start provider=%s symbol=%s direction=%s entry=%s sl=%s tps=%s", provider_tag, symbol, direction, str(entry_range), str(sl), str(tps))
-
-
-        # --- Forzar SL por defecto si no viene ---
-        async def get_forced_sl(client, symbol, direction, price):
-            import os
-            info = client.symbol_info(symbol)
-            point = float(getattr(info, "point", 0.01))
-            if symbol.upper().startswith("XAU"):  # Oro
-                try:
-                    sl_pips = int(os.getenv("DEFAULT_SL_XAUUSD_PIPS", "60"))
-                except Exception:
-                    sl_pips = 60
-            else:
-                sl_pips = 50
-            from trade_manager import TradeManager
-            sl_offset = TradeManager._pips_to_price(symbol, sl_pips, point)
-            if direction.upper() == "BUY":
-                return round(price - sl_offset, 2 if symbol.upper().startswith("XAU") else 5)
-            else:
-                return round(price + sl_offset, 2 if symbol.upper().startswith("XAU") else 5)
+    async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
+        tickets = {}
+        errors = {}
 
         async def send_order(account):
+            # --- Variables requeridas (ajustar según integración real) ---
+            # Estas variables deben ser pasadas o definidas en el contexto real de uso
+            # Aquí se definen como ejemplo para evitar errores de referencia
+            symbol = getattr(self, 'symbol', None) or account.get('symbol') or 'XAUUSD'
+            direction = getattr(self, 'direction', None) or account.get('direction') or 'BUY'
+            sl = getattr(self, 'sl', None) or account.get('sl') or 0.0
+            entry_range = getattr(self, 'entry_range', None) or account.get('entry_range') or None
+            provider_tag = getattr(self, 'provider_tag', None) or account.get('provider_tag') or 'FAST'
+            tps = getattr(self, 'tps', None) or account.get('tps') or []
+            # tickets y errors deben estar definidos en el scope superior
+            nonlocal tickets, errors
+
+            # --- Función local para obtener SL forzado si no viene ---
+            async def get_forced_sl(client, symbol, direction, price):
+                # Lógica simple: usar SL por defecto de XAUUSD si aplica
+                if symbol.upper().startswith('XAU'):
+                    # Buscar en .env/config, aquí hardcodeado como ejemplo
+                    default_sl = getattr(self, 'default_sl_xauusd', 300)
+                    if direction.upper() == 'BUY':
+                        return price - default_sl * getattr(client.symbol_info(symbol), 'point', 0.1)
+                    else:
+                        return price + default_sl * getattr(client.symbol_info(symbol), 'point', 0.1)
+                return price  # fallback
             name = account["name"]
             try:
                 client = self._client_for(account)
@@ -279,9 +232,60 @@ class MT5Executor:
                 symbol_info = client.symbol_info(symbol)
                 if not symbol_info:
                     log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
-                price = client.tick_price(symbol, direction)
-                if price == 0.0:
-                    log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
+
+                # --- Lógica de entrada: mitad del SL a hint+buffer ---
+                entry_hint = None
+                if entry_range and isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
+                    entry_hint = float(entry_range[0])  # para señales FAST, el hint suele estar en entry_range[0]
+                elif entry_range and isinstance(entry_range, (float, int)):
+                    entry_hint = float(entry_range)
+                else:
+                    log.warning(f"[ENTRY] No entry_range provided for {symbol} ({name}), skipping price wait.")
+                price = 0.0
+                forced_sl = sl
+                # Obtener SL real para calcular el rango
+                if not forced_sl or float(forced_sl) == 0.0:
+                    # Si el SL no viene, usar el forzado para el cálculo del rango
+                    price_for_hint = client.tick_price(symbol, direction)
+                    forced_sl = await get_forced_sl(client, symbol, direction, price_for_hint)
+                try:
+                    sl_val = float(forced_sl)
+                except Exception:
+                    sl_val = None
+                buffer = self.entry_buffer_points
+                if entry_hint is not None and sl_val is not None:
+                    # Calcular mitad del SL
+                    mid_sl = (entry_hint + sl_val) / 2
+                    # Definir rango válido
+                    if direction.upper() == "BUY":
+                        valid_lo = min(mid_sl, entry_hint)
+                        valid_hi = entry_hint + buffer
+                    else:
+                        valid_lo = entry_hint - buffer
+                        valid_hi = max(mid_sl, entry_hint)
+                    # Obtener precio actual
+                    price = client.tick_price(symbol, direction)
+                    # Si el precio ya está en el rango, entrar inmediatamente
+                    if valid_lo <= price <= valid_hi:
+                        log.info(f"[ENTRY] Precio {price} dentro de rango [{valid_lo}, {valid_hi}] para {symbol} ({name}), entrando inmediatamente.")
+                    else:
+                        # Esperar a que el precio entre en el rango
+                        log.info(f"[ENTRY] Esperando precio en rango [{valid_lo}, {valid_hi}] para {symbol} ({name})...")
+                        deadline = time.time() + self.entry_wait_seconds
+                        while time.time() <= deadline:
+                            price = client.tick_price(symbol, direction)
+                            if valid_lo <= price <= valid_hi:
+                                log.info(f"[ENTRY] Precio {price} entró en rango [{valid_lo}, {valid_hi}] para {symbol} ({name}), ejecutando entrada.")
+                                break
+                            await asyncio.sleep(self.entry_poll_ms / 1000.0)
+                        else:
+                            log.warning(f"[ENTRY] No suitable price found in range [{valid_lo}, {valid_hi}] for {symbol} ({name}) during wait window. Skipping entry.")
+                            return
+                else:
+                    price = client.tick_price(symbol, direction)
+                    if price == 0.0:
+                        log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
+                        return
                 order_type = 0 if direction == "BUY" else 1
 
                 # --- Forzar SL si es necesario ---
@@ -292,7 +296,6 @@ class MT5Executor:
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
-                # Acceso seguro a stops_level/stop_level y logging de atributos disponibles
                 available_attrs = dir(symbol_info) if symbol_info else []
                 log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
                 min_stop_raw = getattr(symbol_info, "stops_level", None)
@@ -369,6 +372,80 @@ class MT5Executor:
                     log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
                     # Registrar el trade con el SL real usado
                     # Importar TradeManager aquí para evitar ciclos
+                    if hasattr(self, 'trade_manager') and self.trade_manager:
+                        self.trade_manager.register_trade(
+                            account_name=name,
+                            ticket=tickets[name],
+                            symbol=symbol,
+                            direction=direction,
+                            provider_tag=provider_tag,
+                            tps=list(tps),
+                            planned_sl=float(forced_sl),
+                            group_id=tickets[name]
+                        )
+                else:
+                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
+                    log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
+            except Exception as e:
+                errors[name] = f"Exception: {e}"
+                log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
+                risk_percent = float(account.get("risk_percent", 0))
+                balance = 0.0
+                if fixed_lot > 0:
+                    lot = fixed_lot
+                elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
+                    try:
+                        acc_info = client.mt5.account_info()
+                        if acc_info and hasattr(acc_info, "balance"):
+                            balance = float(acc_info.balance)
+                    except Exception as e:
+                        log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
+                    risk_money = balance * (risk_percent / 100.0)
+                    sl_distance = abs(float(price) - float(forced_sl))
+                    try:
+                        symbol_info = client.symbol_info(symbol)
+                        tick_value = float(getattr(symbol_info, "tick_value", 0.0))
+                        tick_size = float(getattr(symbol_info, "tick_size", 0.0))
+                        lot_step = float(getattr(symbol_info, "volume_step", 0.01))
+                        min_lot = float(getattr(symbol_info, "volume_min", 0.03))
+                    except Exception as e:
+                        log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
+                        tick_value = 0.0
+                        tick_size = 0.0
+                        lot_step = 0.01
+                        min_lot = 0.03
+                    log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
+                    if tick_value > 0 and tick_size > 0 and sl_distance > 0:
+                        lot = risk_money / (sl_distance * (tick_value / tick_size))
+                        lot = max(min_lot, round(lot / lot_step) * lot_step)
+                        log.info(f"[LOTE][{name}] lotaje calculado={lot}")
+                    else:
+                        log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
+                        lot = 0.03
+                # --- FIN LOTE ---
+
+                log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
+
+                # --- Unificar lógica de envío con fallback robusto ---
+                req = {
+                    "action": 1,
+                    "symbol": symbol,
+                    "volume": float(lot),
+                    "type": order_type,
+                    "price": float(price),
+                    "sl": float(forced_sl),
+                    "tp": 0.0,
+                    "deviation": int(self.default_deviation),
+                    "magic": int(self.magic),
+                    "comment": self._safe_comment(provider_tag),
+                    "type_time": 0,
+                }
+                res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+                if res and getattr(res, "retcode", None) == 10009:
+                    tickets[name] = int(getattr(res, "order", 0))
+                    log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
+                    # Registrar el trade con el SL real usado
+                    # Importar TradeManager aquí para evitar ciclos
                     from trade_manager import TradeManager
                     # self.trade_manager debe estar inicializado y ser pasado al executor
                     if hasattr(self, 'trade_manager') and self.trade_manager:
@@ -388,6 +465,7 @@ class MT5Executor:
             except Exception as e:
                 errors[name] = f"Exception: {e}"
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
+
 
         accounts = [a for a in self.accounts if a.get("active")]
         per_account_timeout = 30  # seconds; adjust as needed
