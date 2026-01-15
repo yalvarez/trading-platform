@@ -206,12 +206,14 @@ class MT5Executor:
         self.comment_prefix = comment_prefix
         self.notifier = notifier
         self.windows = parse_windows(trading_windows)
+        self.entry_buffer_points = entry_buffer_points
 
     async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
         tickets = {}
         errors = {}
 
         async def send_order(account):
+            order_type = 0 if (account.get('direction', 'BUY')).upper() == 'BUY' else 1
             # Inicializar variables para evitar referencias antes de asignación
             fixed_lot = float(account.get("fixed_lot", 0))
             lot = 0.01
