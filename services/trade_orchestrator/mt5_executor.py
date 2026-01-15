@@ -350,19 +350,27 @@ class MT5Executor:
                 if res and getattr(res, "retcode", None) == 10009:
                     tickets[name] = int(getattr(res, "order", 0))
                     log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
-                    # Registrar el trade con el SL real usado
+                    # Registrar o actualizar el trade con el SL real usado
                     # Importar TradeManager aquí para evitar ciclos
                     if hasattr(self, 'trade_manager') and self.trade_manager:
-                        self.trade_manager.register_trade(
-                            account_name=name,
-                            ticket=tickets[name],
-                            symbol=symbol,
-                            direction=direction,
-                            provider_tag=provider_tag,
-                            tps=list(tps),
-                            planned_sl=float(forced_sl),
-                            group_id=tickets[name]
-                        )
+                        tm = self.trade_manager
+                        ticket = tickets[name]
+                        if hasattr(tm, 'trades') and int(ticket) in tm.trades:
+                            # Ya existe: actualizar señal (SL, TPs, provider_tag)
+                            tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=float(forced_sl), provider_tag=provider_tag)
+                            log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={forced_sl}")
+                        else:
+                            # No existe: registrar normalmente
+                            tm.register_trade(
+                                account_name=name,
+                                ticket=ticket,
+                                symbol=symbol,
+                                direction=direction,
+                                provider_tag=provider_tag,
+                                tps=list(tps),
+                                planned_sl=float(forced_sl),
+                                group_id=ticket
+                            )
                 else:
                     errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
                     log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
