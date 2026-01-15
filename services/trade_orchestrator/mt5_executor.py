@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -18,6 +19,15 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    def _client_for(self, account):
+        # Implementación básica: asume que la cuenta tiene un campo 'client' o que se puede construir aquí
+        # Ajusta según tu arquitectura real
+        if 'client' in account:
+            return account['client']
+        # Si tienes un pool de clientes, puedes buscarlo aquí
+        # Por defecto, crea uno nuevo (ajusta host/port según tu sistema)
+        return MT5Client(account.get('host', 'localhost'), account.get('port', 18812))
+
     async def _apply_be(self, account: dict, ticket: int, be_offset_pips: Optional[float] = None, reason: str = "") -> bool:
         """
         Aplica break-even (BE) modificando el SL de la posición indicada.
@@ -195,13 +205,18 @@ class MT5Executor:
         self.magic = magic
         self.comment_prefix = comment_prefix
         self.notifier = notifier
-
         self.windows = parse_windows(trading_windows)
+
     async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
         tickets = {}
         errors = {}
 
         async def send_order(account):
+            # Inicializar variables para evitar referencias antes de asignación
+            fixed_lot = float(account.get("fixed_lot", 0))
+            lot = 0.01
+            risk_percent = float(account.get("risk_percent", 0))
+            balance = 0.0
             # --- Variables requeridas (ajustar según integración real) ---
             # Estas variables deben ser pasadas o definidas en el contexto real de uso
             # Aquí se definen como ejemplo para evitar errores de referencia
