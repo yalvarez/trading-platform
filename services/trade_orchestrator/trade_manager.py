@@ -66,46 +66,31 @@ class TradeManager:
         base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
         return base[:31]
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
-        # Forzar SL por defecto si falta
+        """
+        Registra un trade en el manager. Si no hay SL válido, NO registra el trade y loguea error.
+        """
         import os
         default_sl_pips = getattr(self, 'default_sl', None)
-        # Permitir override por símbolo (ejemplo: XAUUSD)
         symbol_upper = symbol.upper() if symbol else ""
         env_override = None
         if symbol_upper == "XAUUSD":
             env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
-        # Si hay override en env, úsalo
         if env_override is not None:
             try:
                 default_sl_pips = float(env_override)
             except Exception:
                 pass
+
+        # Validar que el SL recibido es válido (no None, no 0, y es un precio plausible)
         if planned_sl is None or planned_sl == 0.0:
-            # Obtener precio de entrada y point
-            entry_price = None
-            point = None
-            # Intentar obtener precio de entrada y punto desde MT5 si posible
-            account = next((a for a in self.mt5.accounts if a.get("active")), None)
-            client = self.mt5._client_for(account) if account else None
-            pos_list = client.positions_get(ticket=int(ticket)) if client else []
-            if pos_list:
-                pos = pos_list[0]
-                entry_price = float(getattr(pos, 'price_open', 0.0))
-                point = float(getattr(client.symbol_info(symbol), 'point', 0.01))
-            log.warning(f"[TM] ⚠️ Trade registrado SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (asignando SL por defecto: {default_sl_pips})")
-            if default_sl_pips is not None and entry_price is not None and point is not None:
-                sl_pips = float(default_sl_pips)
-                sl_offset = self._pips_to_price(symbol, sl_pips, point)
-                # Cálculo correcto: para BUY restar, para SELL sumar
-                if direction.upper() == "BUY":
-                    planned_sl = round(entry_price - sl_offset, 2 if symbol_upper.startswith("XAU") else 5)
-                else:
-                    planned_sl = round(entry_price + sl_offset, 2 if symbol_upper.startswith("XAU") else 5)
-            elif default_sl_pips is not None:
-                planned_sl = float(default_sl_pips)
-        """
-        Registers a new trade in the manager. Used when a trade is opened externally (e.g., by signal handler).
-        """
+            log.error(f"[TM] ❌ NO se puede registrar trade SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (planned_sl={planned_sl})")
+            return
+        # Validar que el SL no es un valor de pips (ej: < 100 para XAUUSD)
+        if symbol_upper.startswith("XAU") and planned_sl < 1000:
+            log.error(f"[TM] ❌ SL inválido (parece pips, no precio) ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
+            return
+        # Para otros símbolos, podrías agregar validaciones adicionales si lo requieres
+
         gid = int(group_id) if group_id is not None else int(ticket)
         self.trades[int(ticket)] = ManagedTrade(
             account_name=account_name,
@@ -115,7 +100,7 @@ class TradeManager:
             provider_tag=provider_tag,
             group_id=gid,
             tps=list(tps or []),
-            planned_sl=float(planned_sl) if planned_sl is not None else None,
+            planned_sl=float(planned_sl),
         )
         self.group_addon_count.setdefault((account_name, gid), 0)
         log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, gid, provider_tag, tps, planned_sl)

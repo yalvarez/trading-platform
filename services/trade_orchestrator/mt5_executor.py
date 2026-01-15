@@ -254,10 +254,14 @@ class MT5Executor:
 
         # --- Forzar SL por defecto si no viene ---
         async def get_forced_sl(client, symbol, direction, price):
+            import os
             info = client.symbol_info(symbol)
             point = float(getattr(info, "point", 0.01))
             if symbol.upper().startswith("XAU"):  # Oro
-                sl_pips = 300
+                try:
+                    sl_pips = int(os.getenv("DEFAULT_SL_XAUUSD_PIPS", "60"))
+                except Exception:
+                    sl_pips = 60
             else:
                 sl_pips = 50
             from trade_manager import TradeManager
@@ -288,7 +292,15 @@ class MT5Executor:
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
-                min_stop = float(getattr(symbol_info, "stops_level", 0.0)) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
+                # Acceso seguro a stops_level/stop_level y logging de atributos disponibles
+                available_attrs = dir(symbol_info) if symbol_info else []
+                log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
+                min_stop_raw = getattr(symbol_info, "stops_level", None)
+                if min_stop_raw is None:
+                    min_stop_raw = getattr(symbol_info, "stop_level", 0.0)
+                min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
+                fill_mode = getattr(symbol_info, "trade_fill_mode", None)
+                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None)}, stop_level={getattr(symbol_info, 'stop_level', None)}, trade_fill_mode={fill_mode}")
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
                     if direction.upper() == "BUY":
                         adjusted_sl = price - min_stop
@@ -355,6 +367,21 @@ class MT5Executor:
                 if res and getattr(res, "retcode", None) == 10009:
                     tickets[name] = int(getattr(res, "order", 0))
                     log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
+                    # Registrar el trade con el SL real usado
+                    # Importar TradeManager aquí para evitar ciclos
+                    from trade_manager import TradeManager
+                    # self.trade_manager debe estar inicializado y ser pasado al executor
+                    if hasattr(self, 'trade_manager') and self.trade_manager:
+                        self.trade_manager.register_trade(
+                            account_name=name,
+                            ticket=tickets[name],
+                            symbol=symbol,
+                            direction=direction,
+                            provider_tag=provider_tag,
+                            tps=list(tps),
+                            planned_sl=float(forced_sl),
+                            group_id=tickets[name]
+                        )
                 else:
                     errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
                     log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
