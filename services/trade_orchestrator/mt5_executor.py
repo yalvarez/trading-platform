@@ -153,44 +153,6 @@ class MT5Executor:
                 log.warning(f"[ORDER-INVALID-REQUEST] retcode=10030 comment={getattr(res,'comment',None)} req={req_try} res={res}")
         return last_res
 
-        async def _best_filling_order_send(self, client, symbol, req: dict):
-            """
-            Intenta enviar la orden usando el filling recomendado por el símbolo y, si falla, prueba los otros modos.
-            """
-            # Obtener el modo recomendado por el símbolo y loggear todos los campos relevantes
-            info = client.symbol_info(symbol)
-            tick = client.symbol_info_tick(symbol)
-            ORDER_FILLING_IOC = 1
-            ORDER_FILLING_FOK = 3
-            ORDER_FILLING_RETURN = 2
-            candidates = []
-            tfm = getattr(info, "trade_fill_mode", None) if info else None
-            enabled = getattr(info, "visible", None) if info else None
-            trademode = getattr(info, "trade_mode", None) if info else None
-            fillmode = getattr(info, "trade_fill_mode", None) if info else None
-            bid = getattr(tick, "bid", None) if tick else None
-            ask = getattr(tick, "ask", None) if tick else None
-            ticktime = getattr(tick, "time", None) if tick else None
-            log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} trade_fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
-            if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
-                candidates.append(int(tfm))
-            for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
-                if f not in candidates:
-                    candidates.append(f)
-            last_res = None
-            import asyncio
-            loop = asyncio.get_running_loop()
-            for f in candidates:
-                req_try = dict(req)
-                req_try["type_filling"] = int(f)
-                log.info(f"[FILLING] Probar type_filling={f} para {symbol}")
-                res = await loop.run_in_executor(None, client.order_send, req_try)
-                last_res = res
-                if res and getattr(res, "retcode", None) in (10009, 10008):
-                    return res
-                if res and getattr(res, "retcode", None) != 10030:
-                    return res
-            return last_res
 
     def __init__(
         self,
@@ -267,13 +229,9 @@ class MT5Executor:
                 forced_sl = sl
                 # Obtener SL real para calcular el rango
                 if not forced_sl or float(forced_sl) == 0.0:
-                    # Si el SL no viene, usar el forzado para el cálculo del rango
-                    price_for_hint = client.tick_price(symbol, direction)
-                    forced_sl = await get_forced_sl(client, symbol, direction, price_for_hint)
-                try:
-                    sl_val = float(forced_sl)
-                except Exception:
                     sl_val = None
+                else:
+                    sl_val = float(forced_sl)
                 buffer = self.entry_buffer_points
                 if entry_hint is not None and sl_val is not None:
                     # Calcular mitad del SL
@@ -411,82 +369,7 @@ class MT5Executor:
             except Exception as e:
                 errors[name] = f"Exception: {e}"
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
-                risk_percent = float(account.get("risk_percent", 0))
-                balance = 0.0
-                if fixed_lot > 0:
-                    lot = fixed_lot
-                elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
-                    try:
-                        acc_info = client.mt5.account_info()
-                        if acc_info and hasattr(acc_info, "balance"):
-                            balance = float(acc_info.balance)
-                    except Exception as e:
-                        log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
-                    risk_money = balance * (risk_percent / 100.0)
-                    sl_distance = abs(float(price) - float(forced_sl))
-                    try:
-                        symbol_info = client.symbol_info(symbol)
-                        tick_value = float(getattr(symbol_info, "tick_value", 0.0))
-                        tick_size = float(getattr(symbol_info, "tick_size", 0.0))
-                        lot_step = float(getattr(symbol_info, "volume_step", 0.01))
-                        min_lot = float(getattr(symbol_info, "volume_min", 0.03))
-                    except Exception as e:
-                        log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
-                        tick_value = 0.0
-                        tick_size = 0.0
-                        lot_step = 0.01
-                        min_lot = 0.03
-                    log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
-                    if tick_value > 0 and tick_size > 0 and sl_distance > 0:
-                        lot = risk_money / (sl_distance * (tick_value / tick_size))
-                        lot = max(min_lot, round(lot / lot_step) * lot_step)
-                        log.info(f"[LOTE][{name}] lotaje calculado={lot}")
-                    else:
-                        log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
-                        lot = 0.03
-                # --- FIN LOTE ---
 
-                log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
-
-                # --- Unificar lógica de envío con fallback robusto ---
-                req = {
-                    "action": 1,
-                    "symbol": symbol,
-                    "volume": float(lot),
-                    "type": order_type,
-                    "price": float(price),
-                    "sl": float(forced_sl),
-                    "tp": 0.0,
-                    "deviation": int(self.default_deviation),
-                    "magic": int(self.magic),
-                    "comment": self._safe_comment(provider_tag),
-                    "type_time": 0,
-                }
-                res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
-                if res and getattr(res, "retcode", None) == 10009:
-                    tickets[name] = int(getattr(res, "order", 0))
-                    log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
-                    # Registrar el trade con el SL real usado
-                    # Importar TradeManager aquí para evitar ciclos
-                    from trade_manager import TradeManager
-                    # self.trade_manager debe estar inicializado y ser pasado al executor
-                    if hasattr(self, 'trade_manager') and self.trade_manager:
-                        self.trade_manager.register_trade(
-                            account_name=name,
-                            ticket=tickets[name],
-                            symbol=symbol,
-                            direction=direction,
-                            provider_tag=provider_tag,
-                            tps=list(tps),
-                            planned_sl=float(forced_sl),
-                            group_id=tickets[name]
-                        )
-                else:
-                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                    log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
-            except Exception as e:
-                errors[name] = f"Exception: {e}"
-                log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
 
 
         accounts = [a for a in self.accounts if a.get("active")]
