@@ -413,8 +413,9 @@ class MT5Executor:
                 }
                 res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
                 log.info(f"[ORDER_SEND][DEBUG][OPEN] Respuesta completa de order_send: {repr(res)}")
-                ticket = tickets.get(name)
-                if res and getattr(res, "retcode", None) == 10009 and ticket is not None:
+                if res and getattr(res, "retcode", None) == 10009:
+                    tickets[name] = int(getattr(res, "order", 0))
+                    ticket = tickets[name]
                     log.info("open_complete_trade success acct=%s ticket=%s", name, ticket)
                     # Solo registrar/actualizar si forced_sl es válido
                     if hasattr(self, 'trade_manager') and self.trade_manager:
@@ -469,7 +470,7 @@ class MT5Executor:
                                 group_id=ticket
                             )
                 else:
-                    log.warning(f"[MT5_EXECUTOR][DEBUG] No se registró trade porque la orden no fue exitosa o ticket no asignado. acct={name} retcode={getattr(res,'retcode',None)} ticket={ticket} planned_sl_val={planned_sl_val}")
+                    log.warning(f"[MT5_EXECUTOR][DEBUG] No se registró trade porque la orden no fue exitosa o ticket no asignado. acct={name} retcode={getattr(res,'retcode',None)} ticket=None planned_sl_val={planned_sl_val}")
                     errors[name] = f"order_send failed or not registered retcode={getattr(res,'retcode',None)}"
             except Exception as e:
                 errors[name] = f"Exception: {e}"
