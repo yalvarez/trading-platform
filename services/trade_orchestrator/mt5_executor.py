@@ -412,6 +412,7 @@ class MT5Executor:
                     "type_time": 0,
                 }
                 res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+                log.info(f"[ORDER_SEND][DEBUG][OPEN] Respuesta completa de order_send: {repr(res)}")
                 ticket = tickets.get(name)
                 if res and getattr(res, "retcode", None) == 10009 and ticket is not None:
                     log.info("open_complete_trade success acct=%s ticket=%s", name, ticket)
