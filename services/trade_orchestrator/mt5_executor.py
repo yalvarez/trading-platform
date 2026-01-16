@@ -19,6 +19,58 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+
+    async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "") -> bool:
+        """
+        Modifica el SL de la posición indicada por ticket a new_sl.
+        Loguea el SL actual antes y después, el SL propuesto y el stop_level del símbolo.
+        """
+        client = self._client_for(account)
+        pos_list = client.positions_get(ticket=int(ticket))
+        if not pos_list:
+            self._notify_bg(account["name"], f"❌ SL update falló | Ticket: {int(ticket)} | No se encontró la posición")
+            return False
+        pos = pos_list[0]
+        symbol = pos.symbol
+        info = client.symbol_info(symbol)
+        if not info:
+            self._notify_bg(account["name"], f"❌ SL update falló | Ticket: {int(ticket)} | No se encontró info de símbolo")
+            return False
+        point = float(getattr(info, "point", 0.0))
+        is_buy = (int(getattr(pos, "type", 0)) == 0)
+        sl_actual = float(getattr(pos, "sl", 0.0))
+        stop_level = float(getattr(info, "stops_level", 0.0)) * point
+        price_current = float(getattr(pos, "price_current", 0.0))
+        # Validar que el nuevo SL cumple con el mínimo stop level
+        if is_buy:
+            min_sl = price_current - stop_level
+            if new_sl > min_sl:
+                log.warning(f"[SL-UPDATE] SL ({new_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}. Ajustando SL a {min_sl}")
+                new_sl = round(min_sl, 2 if symbol.upper().startswith("XAU") else 5)
+        else:
+            max_sl = price_current + stop_level
+            if new_sl < max_sl:
+                log.warning(f"[SL-UPDATE] SL ({new_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
+                new_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
+        req = {
+            "action": 6,  # TRADE_ACTION_SLTP
+            "position": int(ticket),
+            "sl": float(new_sl),
+            "tp": float(getattr(pos, "tp", 0.0)),
+            "comment": self._safe_comment(f"SLUPD-{reason}"),
+        }
+        res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+        log.info(f"[ORDER_SEND][DEBUG][SL-UPDATE] Respuesta completa de order_send: {repr(res)}")
+        ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))
+        pos_list_after = client.positions_get(ticket=int(ticket))
+        sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
+        log.info(f"[SL-UPDATE] SL después del intento: {sl_after}")
+        if ok:
+            self._notify_bg(account["name"], f"✅ SL actualizado | Ticket: {int(ticket)} | SL: {new_sl:.5f}")
+            return True
+        else:
+            self._notify_bg(account["name"], f"❌ SL update falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}")
+            return False
     def _safe_comment(self, tag: str) -> str:
         base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
         base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
@@ -76,31 +128,31 @@ class MT5Executor:
                 logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
                 be_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
 
-            req = {
-                "action": 6,  # TRADE_ACTION_SLTP
-                "position": int(ticket),
-                "sl": float(be_sl),
-                "tp": 0.0,
-                "comment": self._safe_comment(f"BE-{reason}"),
-            }
-            res = await self._best_filling_order_send(client, symbol, req)
-            log.info(f"[ORDER_SEND][DEBUG] Respuesta completa de order_send: {repr(res)}")
-            ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
-            logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-            pos_list_after = client.positions_get(ticket=int(ticket))
-            sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
-            logging.info(f"[BE-DEBUG] SL después del intento: {sl_after}")
-            if ok:
-                self._notify_bg(account["name"], f"🔒 BE aplicado | Ticket: {int(ticket)} | SL: {be_sl:.5f}")
-                return True
-            else:
-                self._notify_bg(
-                    account["name"],
-                    f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-                )
-                return False
+        req = {
+            "action": 6,  # TRADE_ACTION_SLTP
+            "position": int(ticket),
+            "sl": float(be_sl),
+            "tp": 0.0,
+            "comment": self._safe_comment(f"BE-{reason}"),
+        }
+        res = await self._best_filling_order_send(client, symbol, req)
+        log.info(f"[ORDER_SEND][DEBUG] Respuesta completa de order_send: {repr(res)}")
+        ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
+        logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+        pos_list_after = client.positions_get(ticket=int(ticket))
+        sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
+        logging.info(f"[BE-DEBUG] SL después del intento: {sl_after}")
+        if ok:
+            self._notify_bg(account["name"], f"🔒 BE aplicado | Ticket: {int(ticket)} | SL: {be_sl:.5f}")
+            return True
+        else:
+            self._notify_bg(
+                account["name"],
+                f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
+            )
+            return False
 
-        def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
+    def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
             """
             Busca el trade FAST más reciente para symbol, cuenta y dirección, dentro de la ventana de tiempo.
             Ignora SL, TP y provider_tag.
