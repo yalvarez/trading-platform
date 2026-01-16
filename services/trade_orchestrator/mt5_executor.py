@@ -179,6 +179,19 @@ class MT5Executor:
         tickets = {}
         errors = {}
 
+        # Construir accounts con direction correcto para cada cuenta activa
+        accounts = []
+        for acct in self.accounts:
+            if acct.get("active"):
+                account = dict(acct)  # copia para no mutar el original
+                account["symbol"] = symbol
+                account["direction"] = direction
+                account["sl"] = sl
+                account["entry_range"] = entry_range
+                account["provider_tag"] = provider_tag
+                account["tps"] = tps
+                accounts.append(account)
+
         async def send_order(account):
             order_type = 0 if (account.get('direction', 'BUY')).upper() == 'BUY' else 1
             # Inicializar variables para evitar referencias antes de asignación
@@ -399,7 +412,6 @@ class MT5Executor:
 
 
 
-        accounts = [a for a in self.accounts if a.get("active")]
         per_account_timeout = 30  # seconds; adjust as needed
 
         async def send_order_with_timeout(account):
