@@ -317,15 +317,12 @@ class MT5Executor:
                 if not forced_sl or float(forced_sl) == 0.0:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
+
                 # planned_sl_val SIEMPRE local y explícito, debe reflejar el SL realmente usado
                 try:
                     planned_sl_val = float(forced_sl) if forced_sl is not None else None
                 except Exception:
                     planned_sl_val = None
-
-                # Parche: asegurar que planned_sl_val SIEMPRE refleje el SL realmente usado
-                # Si forced_sl se ajusta después, actualizar planned_sl_val también
-                # (por ejemplo, tras ajuste por min_stop)
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
@@ -355,6 +352,13 @@ class MT5Executor:
                     log.warning(f"[SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
                     forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
                     planned_sl_val = forced_sl  # Parche: reflejar ajuste también en planned_sl_val
+
+                # FINAL PATCH: planned_sl_val debe reflejar SIEMPRE el SL realmente usado
+                # Si forced_sl es válido, planned_sl_val debe ser igual a forced_sl
+                if forced_sl is not None and forced_sl != 0.0:
+                    planned_sl_val = float(forced_sl)
+                else:
+                    planned_sl_val = None
 
                 # --- LOTE DINÁMICO O FIJO ---
                 lot = 0.01
@@ -433,19 +437,22 @@ class MT5Executor:
                                 window_seconds = int(os.getenv('DEDUP_TTL_SECONDS', '120'))
                             except Exception:
                                 window_seconds = 120
+                            # Logging: mostrar todos los trades candidatos
                             for t in getattr(tm, 'trades', {}).values():
                                 comment = getattr(t, 'provider_tag', '') or ''
                                 opened_ts = getattr(t, 'opened_ts', None)
                                 is_fast = 'FAST' in comment.upper()
                                 is_recent = opened_ts and (now - opened_ts <= window_seconds)
+                                log.info(f"[FAST-SEARCH] Revisando trade: ticket={getattr(t,'ticket',None)} acct={getattr(t,'account_name',None)} symbol={getattr(t,'symbol',None)} dir={getattr(t,'direction',None)} provider_tag={comment} opened_ts={opened_ts} is_fast={is_fast} is_recent={is_recent}")
+                                # Relajar el match: solo por cuenta, símbolo y dirección, y que sea FAST y reciente
                                 if (
-                                    t.account_name == name and
-                                    t.symbol == symbol and
-                                    t.direction == direction and
+                                    getattr(t,'account_name',None) == name and
+                                    getattr(t,'symbol',None) == symbol and
+                                    getattr(t,'direction',None) == direction and
                                     is_fast and
                                     is_recent
                                 ):
-                                    log.info(f"[MT5_EXECUTOR][DEBUG] FAST trade candidate for update: ticket={t.ticket} acct={t.account_name} symbol={t.symbol} dir={t.direction} provider_tag={t.provider_tag} opened_ts={opened_ts} now={now} window={window_seconds}")
+                                    log.info(f"[MT5_EXECUTOR][DEBUG] FAST trade MATCHED for update: ticket={t.ticket} acct={t.account_name} symbol={t.symbol} dir={t.direction} provider_tag={t.provider_tag} opened_ts={opened_ts} now={now} window={window_seconds}")
                                     fast_ticket = t.ticket
                                     break
                         # Si hay trade FAST previo, actualizarlo
