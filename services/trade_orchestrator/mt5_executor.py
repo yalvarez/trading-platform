@@ -463,6 +463,14 @@ class MT5Executor:
                                     fast_ticket = t.ticket
                                     break
                         # Si hay trade FAST previo, actualizarlo
+                        # Refuerzo: planned_sl_val nunca debe ser None antes de cualquier update o registro
+                        if planned_sl_val is None:
+                            log.warning(f"[MT5_EXECUTOR][PATCH] planned_sl_val era None antes de update/registro. Se usará forced_sl o 0.0. ticket={ticket} symbol={symbol} provider={provider_tag}")
+                            if forced_sl is not None and forced_sl != 0.0:
+                                planned_sl_val = float(forced_sl)
+                            else:
+                                planned_sl_val = 0.0
+
                         if fast_ticket:
                             log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade FAST previo: ticket={fast_ticket} con datos de señal completa. planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
                             tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
