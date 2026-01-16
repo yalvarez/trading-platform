@@ -235,7 +235,11 @@ class MT5Executor:
                 # --- Lógica de entrada: mitad del SL a hint+buffer ---
                 entry_hint = None
                 if entry_range and isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
-                    entry_hint = float(entry_range[0])  # para señales FAST, el hint suele estar en entry_range[0]
+                    # Si es venta, usar el precio más bajo; si es compra, el más alto
+                    if direction.upper() == "SELL":
+                        entry_hint = float(min(entry_range))
+                    else:
+                        entry_hint = float(max(entry_range))
                 elif entry_range and isinstance(entry_range, (float, int)):
                     entry_hint = float(entry_range)
                 else:
