@@ -381,11 +381,16 @@ class MT5Executor:
                         fast_ticket = None
                         if provider_tag.upper() != 'FAST':
                             for t in getattr(tm, 'trades', {}).values():
+                                is_fast = (
+                                    ('FAST' in (t.provider_tag or '').upper()) or
+                                    (not t.provider_tag) or
+                                    ((not t.planned_sl or t.planned_sl == 0.0) and (not t.tps or len(t.tps) == 0))
+                                )
                                 if (
                                     t.account_name == name and
                                     t.symbol == symbol and
                                     t.direction == direction and
-                                    t.provider_tag.upper() == 'FAST'
+                                    is_fast
                                 ):
                                     fast_ticket = t.ticket
                                     break
