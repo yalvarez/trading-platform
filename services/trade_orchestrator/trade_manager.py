@@ -246,8 +246,9 @@ class TradeManager:
         # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
         if t.tps:
             return
-        if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
-            return
+        # Deshabilitado este filtro por el momento
+        # if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
+        #     return
         tramo_pips = getattr(self, 'scaling_tramo_pips', 30.0)
         percent_per_tramo = getattr(self, 'scaling_percent_per_tramo', 25)
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
@@ -289,7 +290,12 @@ class TradeManager:
             mt5_executor = MT5Executor(self.mt5)
             res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
             log.info(f"[TOROFX-SCALING] Resultado cierre parcial tramo {tramo} | res={res}")
-            if res and getattr(res, 'retcode', None) in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
+            retcode = getattr(res, 'retcode', None) if res else None
+            if res is None:
+                log.warning(f"[TOROFX-SCALING][WARN] No se recibió respuesta al cierre parcial tramo {tramo} | ticket={pos.ticket}")
+            elif retcode not in (0, 10009, 10008):
+                log.error(f"[TOROFX-SCALING][ERROR] Cierre parcial tramo {tramo} falló | ticket={pos.ticket} retcode={retcode} res={res}")
+            if res and retcode in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
                 t.actions_done.add(tramo)
                 # Guardar el precio del cierre del primer tramo
                 if tramo == 1:
@@ -308,7 +314,15 @@ class TradeManager:
                     # Validate min stop distance using centralized logic
                     info = client.symbol_info(symbol)
                     point = float(getattr(info, "point", 0.0))
-                    stop_level = float(getattr(info, "stops_level", 0.0)) * point
+                    # Acceso robusto a stops_level/stop_level
+                    if hasattr(info, "stops_level"):
+                        stop_level_raw = getattr(info, "stops_level", 0.0)
+                    elif hasattr(info, "stop_level"):
+                        stop_level_raw = getattr(info, "stop_level", 0.0)
+                    else:
+                        log.warning(f"[TM][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
+                        stop_level_raw = 0.0
+                    stop_level = float(stop_level_raw) * point
                     price_current = float(current)
                     if is_buy:
                         min_sl = price_current - stop_level
@@ -898,7 +912,15 @@ class TradeManager:
             )
             return
         # Validar distancia mínima de stop
-        min_stop = float(getattr(info, 'stop_level', 0.0)) * float(getattr(info, 'point', point))
+        # Acceso robusto a stops_level/stop_level
+        if hasattr(info, "stops_level"):
+            stop_level_raw = getattr(info, "stops_level", 0.0)
+        elif hasattr(info, "stop_level"):
+            stop_level_raw = getattr(info, "stop_level", 0.0)
+        else:
+            log.warning(f"[TM][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
+            stop_level_raw = 0.0
+        min_stop = float(stop_level_raw) * float(getattr(info, 'point', point))
         price_current = float(getattr(pos, 'price_current', entry_price))
         dist = abs(be - price_current)
         if dist < min_stop:
