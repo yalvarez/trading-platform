@@ -326,12 +326,22 @@ class MT5Executor:
                 symbol_info = client.symbol_info(symbol)
                 available_attrs = dir(symbol_info) if symbol_info else []
                 log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
-                min_stop_raw = getattr(symbol_info, "stops_level", None)
-                if min_stop_raw is None:
-                    min_stop_raw = getattr(symbol_info, "stop_level", 0.0)
+                # Acceso seguro a stops_level, stop_level y trade_fill_mode
+                min_stop_raw = None
+                if symbol_info:
+                    if hasattr(symbol_info, "stops_level"):
+                        min_stop_raw = getattr(symbol_info, "stops_level", None)
+                    elif hasattr(symbol_info, "stop_level"):
+                        min_stop_raw = getattr(symbol_info, "stop_level", 0.0)
+                    else:
+                        log.warning(f"[MT5_EXECUTOR][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
+                        min_stop_raw = 0.0
+                    fill_mode = getattr(symbol_info, "trade_fill_mode", None) if hasattr(symbol_info, "trade_fill_mode") else None
+                else:
+                    min_stop_raw = 0.0
+                    fill_mode = None
                 min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-                fill_mode = getattr(symbol_info, "trade_fill_mode", None)
-                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None)}, stop_level={getattr(symbol_info, 'stop_level', None)}, trade_fill_mode={fill_mode}")
+                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, trade_fill_mode={fill_mode}")
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
                     if direction.upper() == "BUY":
                         adjusted_sl = price - min_stop
