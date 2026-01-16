@@ -81,14 +81,11 @@ class TradeManager:
             except Exception:
                 pass
 
-        # Validar que el SL recibido es válido (no None, no 0, y es un precio plausible)
+        # Validar que el SL recibido es válido (no None, no 0)
         if planned_sl is None or planned_sl == 0.0:
             log.debug(f"[TM][DEBUG] Registro de trade ignorado por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
             return
-        # Validar que el SL no es un valor de pips (ej: < 100 para XAUUSD)
-        if symbol_upper.startswith("XAU") and planned_sl < 1000:
-            log.error(f"[TM] ❌ SL inválido (parece pips, no precio) ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
-            return
+        # Permitir cualquier SL > 0, incluso si es el SL por defecto, para registrar trades FAST correctamente
         # Para otros símbolos, podrías agregar validaciones adicionales si lo requieres
 
         gid = int(group_id) if group_id is not None else int(ticket)
