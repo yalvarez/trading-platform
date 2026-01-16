@@ -280,6 +280,8 @@ async def main():
         hint = fields.get("provider_hint","")
         if hint == "TOROFX":
             tm.handle_torofx_management_message(int(fields.get("chat_id","0")), text)
+        elif hint == "HANNAH":
+            tm.handle_hannah_management_message(int(fields.get("chat_id","0")), text)
         elif hint == "GOLD_BROTHERS":
             # aquí puedes enrutar a handle_bg_* si quieres
             pass

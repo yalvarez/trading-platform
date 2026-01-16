@@ -19,6 +19,60 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    async def early_partial_close(
+        self,
+        account: dict,
+        ticket: int,
+        percent: float = 0.5,
+        provider_tag: str = None,
+        reason: str = ""
+    ) -> bool:
+        """
+        Cierra un porcentaje de la posición indicada y mueve el SL a break-even (BE).
+        percent: fracción a cerrar (0.5 = mitad, 0.25 = 25%, etc)
+        Pensado para señales especiales (ej: Hannah) donde se requiere proteger capital antes de TP1.
+        """
+        client = self._client_for(account)
+        pos_list = client.positions_get(ticket=int(ticket))
+        if not pos_list:
+            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | No se encontró la posición")
+            return False
+        pos = pos_list[0]
+        symbol = pos.symbol
+        volume = float(getattr(pos, "volume", 0.0))
+        if volume <= 0.0:
+            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | Volumen inválido: {volume}")
+            return False
+        close_volume = round(volume * percent, 2 if symbol.upper().startswith("XAU") else 2)
+        if close_volume < 0.01:
+            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | Volumen a cerrar demasiado pequeño: {close_volume}")
+            return False
+        # 1. Cerrar el porcentaje de la posición
+        req_close = {
+            "action": 1,  # TRADE_ACTION_DEAL
+            "position": int(ticket),
+            "symbol": symbol,
+            "volume": close_volume,
+            "type": 1 if int(getattr(pos, "type", 0)) == 0 else 0,  # Si es buy, vender; si es sell, comprar
+            "price": float(getattr(pos, "price_current", 0.0)),
+            "deviation": int(self.default_deviation),
+            "magic": int(self.magic),
+            "comment": self._safe_comment(f"{provider_tag or ''}-PARTBE-{reason}"),
+            "type_time": 0,
+        }
+        res_close = await self._best_filling_order_send(client, symbol, req_close, account.get('name'))
+        ok_close = bool(res_close and getattr(res_close, "retcode", None) in (10009, 10008))
+        if not ok_close:
+            self._notify_bg(account["name"], f"❌ early_partial_close: cierre parcial falló | Ticket: {int(ticket)} | retcode={getattr(res_close,'retcode',None)} {getattr(res_close,'comment',None)}")
+            return False
+        # 2. Mover SL a BE
+        ok_be = await self._apply_be(account, ticket, reason=f"PARTBE-{reason}")
+        if ok_be:
+            self._notify_bg(account["name"], f"✅ early_partial_close: {percent*100:.0f}% cerrado y SL movido a BE | Ticket: {int(ticket)}")
+            return True
+        else:
+            self._notify_bg(account["name"], f"⚠️ early_partial_close: {percent*100:.0f}% cerrado pero SL no pudo moverse a BE | Ticket: {int(ticket)}")
+            return False
     def _notify_bg(self, account_name, message):
         """
         Send a background notification using the notifier if available, otherwise log the message.

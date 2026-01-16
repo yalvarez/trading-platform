@@ -1,3 +1,66 @@
+from __future__ import annotations
+
+import asyncio
+import time
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+import os
+import mt5_constants as mt5
+from mt5_client import MT5Client
+from prometheus_client import Counter, Gauge
+import logging
+import datetime
+import redis.asyncio as redis_async
+
+# ...existing code...
+
+class TradeManager:
+    # ...existing code...
+    def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
+        """
+        Procesa mensajes de gestión Hannah como:
+        - "Secure half your Profits & set breakeven"
+        - "Asegura la mitad y mueve a BE"
+        Detecta intención de cierre parcial + BE y llama early_partial_close.
+        Retorna True si consumió el mensaje.
+        """
+        text = (raw_text or "").strip()
+        if not text:
+            return False
+
+        up = text.upper()
+        # Detectar frases clave (puedes ajustar/expandir)
+        has_partial = any(w in up for w in ["HALF", "MITAD", "PARTIAL", "PARCIAL", "SECURE HALF", "ASEGURA LA MITAD"])
+        has_be = any(w in up for w in ["BREAKEVEN", "BREAK EVEN", "BE", "SET BE", "MUEVE A BE", "MOVE TO BE", "SET BREAKEVEN"])
+
+        # Solo si ambas intenciones están presentes
+        if not (has_partial and has_be):
+            return False
+
+        # Ejecutar para cada cuenta activa con trade Hannah
+        any_matched_trade = False
+        for account in [a for a in self.mt5.accounts if a.get("active")]:
+            client = self.mt5._client_for(account)
+            positions = client.positions_get()
+            if not positions:
+                continue
+            pos_by_ticket = {p.ticket: p for p in positions}
+            for ticket, t in list(self.trades.items()):
+                if t.account_name != account["name"]:
+                    continue
+                if "HANNAH" not in (t.provider_tag or "").upper():
+                    continue
+                pos = pos_by_ticket.get(ticket)
+                if not pos or pos.magic != self.mt5.magic:
+                    continue
+                # Ejecutar early_partial_close (50%)
+                any_matched_trade = True
+                # Llamada asíncrona
+                import asyncio
+                asyncio.create_task(self.mt5.early_partial_close(account, ticket, percent=0.5, provider_tag="HANNAH", reason="msg_mgmt"))
+                self._notify_bg(account["name"], f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
+        return any_matched_trade
 # trade_manager.py
 from __future__ import annotations
 
