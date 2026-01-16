@@ -350,12 +350,31 @@ class MT5Executor:
                 if res and getattr(res, "retcode", None) == 10009:
                     tickets[name] = int(getattr(res, "order", 0))
                     log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
-                    # Registrar o actualizar el trade con el SL real usado
-                    # Importar TradeManager aquí para evitar ciclos
+                    # Solo registrar/actualizar si forced_sl es válido
                     if hasattr(self, 'trade_manager') and self.trade_manager:
                         tm = self.trade_manager
                         ticket = tickets[name]
-                        if hasattr(tm, 'trades') and int(ticket) in tm.trades:
+                        # Validar SL válido
+                        if forced_sl is None or float(forced_sl) == 0.0:
+                            log.error(f"[MT5_EXECUTOR] ❌ No se puede registrar/actualizar trade SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (forced_sl={forced_sl})")
+                            return
+                        # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
+                        fast_ticket = None
+                        if provider_tag.upper() != 'FAST':
+                            for t in getattr(tm, 'trades', {}).values():
+                                if (
+                                    t.account_name == name and
+                                    t.symbol == symbol and
+                                    t.direction == direction and
+                                    t.provider_tag.upper() == 'FAST'
+                                ):
+                                    fast_ticket = t.ticket
+                                    break
+                        # Si hay trade FAST previo, actualizarlo
+                        if fast_ticket:
+                            tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=float(forced_sl), provider_tag=provider_tag)
+                            log.info(f"[TM] 🔄 updated FAST->COMPLETE ticket={fast_ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={forced_sl}")
+                        elif hasattr(tm, 'trades') and int(ticket) in tm.trades:
                             # Ya existe: actualizar señal (SL, TPs, provider_tag)
                             tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=float(forced_sl), provider_tag=provider_tag)
                             log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={forced_sl}")
