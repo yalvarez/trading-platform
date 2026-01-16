@@ -218,6 +218,7 @@ class MT5Executor:
                 accounts.append(account)
 
         async def send_order(account):
+            planned_sl_val = None  # Siempre local y explícito
             order_type = 0 if (account.get('direction', 'BUY')).upper() == 'BUY' else 1
             # Inicializar variables para evitar referencias antes de asignación
             fixed_lot = float(account.get("fixed_lot", 0))
@@ -315,7 +316,7 @@ class MT5Executor:
                 if not forced_sl or float(forced_sl) == 0.0:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
-                # Asignar planned_sl_val SIEMPRE al valor real usado en la orden
+                # planned_sl_val SIEMPRE local y explícito
                 try:
                     planned_sl_val = float(forced_sl) if forced_sl is not None else None
                 except Exception:
@@ -403,10 +404,6 @@ class MT5Executor:
                     ticket = tickets[name]
                     # Usar siempre el SL forzado/calculado para planned_sl
                     # planned_sl_val debe reflejar SIEMPRE el SL realmente usado en la orden (forced_sl)
-                    try:
-                        planned_sl_val = float(forced_sl) if forced_sl is not None else None
-                    except Exception:
-                        planned_sl_val = None
                     if planned_sl_val is None or planned_sl_val == 0.0:
                         log.error(f"[MT5_EXECUTOR][DEBUG] Ignorado registro/actualización de trade por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
                         return
