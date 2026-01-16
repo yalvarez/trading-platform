@@ -396,9 +396,12 @@ class MT5Executor:
                 if hasattr(self, 'trade_manager') and self.trade_manager:
                     tm = self.trade_manager
                     ticket = tickets[name]
-                    # Validar SL válido
-                    planned_sl_val = forced_sl if forced_sl is not None and float(forced_sl) != 0.0 else None
-                    if planned_sl_val is None:
+                    # Usar siempre el SL forzado/calculado para planned_sl
+                    try:
+                        planned_sl_val = float(forced_sl)
+                    except Exception:
+                        planned_sl_val = None
+                    if planned_sl_val is None or planned_sl_val == 0.0:
                         log.error(f"[MT5_EXECUTOR] ❌ No se puede registrar/actualizar trade SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (forced_sl={forced_sl})")
                         return
                     # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
@@ -420,11 +423,11 @@ class MT5Executor:
                                 break
                     # Si hay trade FAST previo, actualizarlo
                     if fast_ticket:
-                        tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=float(planned_sl_val), provider_tag=provider_tag)
+                        tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
                         log.info(f"[TM] 🔄 updated FAST->COMPLETE ticket={fast_ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
                     elif hasattr(tm, 'trades') and int(ticket) in tm.trades:
                         # Ya existe: actualizar señal (SL, TPs, provider_tag)
-                        tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=float(planned_sl_val), provider_tag=provider_tag)
+                        tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
                         log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
                     else:
                         # No existe: registrar normalmente
@@ -435,7 +438,7 @@ class MT5Executor:
                             direction=direction,
                             provider_tag=provider_tag,
                             tps=list(tps),
-                            planned_sl=float(planned_sl_val),
+                            planned_sl=planned_sl_val,
                             group_id=ticket
                         )
                 else:
