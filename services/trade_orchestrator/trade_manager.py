@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 import mt5_constants as mt5
+from mt5_client import MT5Client
 from prometheus_client import Counter, Gauge
 import logging
 import datetime
@@ -67,9 +68,10 @@ class TradeManager:
         return base[:31]
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
         """
-        Registra un trade en el manager. Si no hay SL válido, NO registra el trade y loguea error.
+        Registra un trade en el manager. Si no hay SL válido, calcula uno por fallback y lo asigna.
         """
         import os
+        from mt5_client import MT5Client
         default_sl_pips = getattr(self, 'default_sl', None)
         symbol_upper = symbol.upper() if symbol else ""
         env_override = None
@@ -81,12 +83,35 @@ class TradeManager:
             except Exception:
                 pass
 
-        # Validar que el SL recibido es válido (no None, no 0)
+        # Si planned_sl es None o 0.0, calcularlo igual que en mt5_executor.py
         if planned_sl is None or planned_sl == 0.0:
-            log.debug(f"[TM][DEBUG] Registro de trade ignorado por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
+            log.warning(f"[TM][PATCH] planned_sl era None o 0.0, se calculará por fallback para registro. ticket={ticket} symbol={symbol} provider={provider_tag}")
+            # Fallback: para XAUUSD usar default_sl_pips * point, para otros usar price o 1.0
+            try:
+                client = getattr(self, 'mt5', None)
+                if client is not None:
+                    point = 0.1 if symbol_upper.startswith('XAU') else 1.0
+                    try:
+                        info = client._client_for({'name': account_name}).symbol_info(symbol)
+                        if info and hasattr(info, 'point'):
+                            point = float(getattr(info, 'point', 0.1 if symbol_upper.startswith('XAU') else 1.0))
+                    except Exception:
+                        pass
+                    if symbol_upper.startswith('XAU') and default_sl_pips:
+                        # Para BUY, restar; para SELL, sumar
+                        # No tenemos el precio aquí, así que solo aproximamos
+                        planned_sl = 1800.0 - default_sl_pips * point if direction.upper() == 'BUY' else 1800.0 + default_sl_pips * point
+                    else:
+                        planned_sl = 1.0
+                else:
+                    planned_sl = 1.0
+            except Exception as e:
+                log.error(f"[TM][PATCH] Error calculando planned_sl fallback: {e}")
+                planned_sl = 1.0
+
+        if planned_sl is None or planned_sl == 0.0:
+            log.debug(f"[TM][DEBUG] Registro de trade ignorado por SL inválido incluso tras fallback. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
             return
-        # Permitir cualquier SL > 0, incluso si es el SL por defecto, para registrar trades FAST correctamente
-        # Para otros símbolos, podrías agregar validaciones adicionales si lo requieres
 
         gid = int(group_id) if group_id is not None else int(ticket)
         self.trades[int(ticket)] = ManagedTrade(
@@ -459,6 +484,41 @@ class TradeManager:
         t = self.trades.get(int(ticket))
         if not t:
             return
+        # Si planned_sl es None o 0.0, calcularlo igual que en register_trade
+        if planned_sl is None or planned_sl == 0.0:
+            log.warning(f"[TM][PATCH] planned_sl era None o 0.0 en update, se calculará por fallback. ticket={ticket}")
+            try:
+                symbol = getattr(t, 'symbol', None)
+                direction = getattr(t, 'direction', 'BUY')
+                account_name = getattr(t, 'account_name', None)
+                symbol_upper = symbol.upper() if symbol else ""
+                default_sl_pips = getattr(self, 'default_sl', None)
+                env_override = None
+                if symbol_upper == "XAUUSD":
+                    env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
+                if env_override is not None:
+                    try:
+                        default_sl_pips = float(env_override)
+                    except Exception:
+                        pass
+                client = getattr(self, 'mt5', None)
+                if client is not None:
+                    point = 0.1 if symbol_upper.startswith('XAU') else 1.0
+                    try:
+                        info = client._client_for({'name': account_name}).symbol_info(symbol)
+                        if info and hasattr(info, 'point'):
+                            point = float(getattr(info, 'point', 0.1 if symbol_upper.startswith('XAU') else 1.0))
+                    except Exception:
+                        pass
+                    if symbol_upper.startswith('XAU') and default_sl_pips:
+                        planned_sl = 1800.0 - default_sl_pips * point if direction.upper() == 'BUY' else 1800.0 + default_sl_pips * point
+                    else:
+                        planned_sl = 1.0
+                else:
+                    planned_sl = 1.0
+            except Exception as e:
+                log.error(f"[TM][PATCH] Error calculando planned_sl fallback en update: {e}")
+                planned_sl = 1.0
         t.tps = list(tps or [])
         t.planned_sl = float(planned_sl) if planned_sl is not None else None
         if provider_tag:
