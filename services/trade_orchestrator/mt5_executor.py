@@ -402,7 +402,7 @@ class MT5Executor:
                     except Exception:
                         planned_sl_val = None
                     if planned_sl_val is None or planned_sl_val == 0.0:
-                        log.error(f"[MT5_EXECUTOR] ❌ No se puede registrar/actualizar trade SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (forced_sl={forced_sl})")
+                        log.error(f"[MT5_EXECUTOR][DEBUG] Ignorado registro/actualización de trade por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
                         return
                     # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
                     fast_ticket = None
@@ -425,18 +425,20 @@ class MT5Executor:
                                 is_fast and
                                 is_recent
                             ):
+                                log.info(f"[MT5_EXECUTOR][DEBUG] FAST trade candidate for update: ticket={t.ticket} acct={t.account_name} symbol={t.symbol} dir={t.direction} provider_tag={t.provider_tag} opened_ts={opened_ts} now={now} window={window_seconds}")
                                 fast_ticket = t.ticket
                                 break
                     # Si hay trade FAST previo, actualizarlo
                     if fast_ticket:
+                        log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade FAST previo: ticket={fast_ticket} con datos de señal completa. planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
                         tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
                         log.info(f"[TM] 🔄 updated FAST->COMPLETE ticket={fast_ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
                     elif hasattr(tm, 'trades') and int(ticket) in tm.trades:
-                        # Ya existe: actualizar señal (SL, TPs, provider_tag)
+                        log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade existente: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
                         tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
                         log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
                     else:
-                        # No existe: registrar normalmente
+                        log.info(f"[MT5_EXECUTOR][DEBUG] Registrando nuevo trade: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
                         tm.register_trade(
                             account_name=name,
                             ticket=ticket,
