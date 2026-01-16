@@ -117,25 +117,20 @@ async def main():
         sl = fields.get("sl", "")
         tps = json.loads(fields.get("tps", "[]") or "[]")
         is_fast = fields.get("fast", "false").lower() == "true"
-        # Si es FAST y no trae SL, calcularlo aquí usando el precio de mercado
+        # Si es FAST y no trae SL, calcularlo aquí usando la función centralizada de MT5Executor
         if (not sl or float(sl) == 0.0) and is_fast:
             account = next((a for a in accounts if a.get("active")), None)
             if account:
                 client = execu._client_for(account)
                 price = client.tick_price(symbol, direction)
-                # Lógica estándar: para XAUUSD usar 300 pips (0.1), para otros usar 100 pips (point)
-                info = client.symbol_info(symbol)
-                point = float(getattr(info, "point", 0.1 if symbol.upper().startswith("XAU") else 0.00001)) if info else (0.1 if symbol.upper().startswith("XAU") else 0.00001)
-                if symbol.upper().startswith("XAU"):
-                    default_sl_pips = float(os.getenv("DEFAULT_SL_XAUUSD_PIPS", 300))
+                # Usar la función centralizada de MT5Executor para calcular el SL forzado
+                if hasattr(execu, "get_forced_sl"):
+                    forced_sl = await execu.get_forced_sl(client, symbol, direction, price)
                 else:
-                    default_sl_pips = float(os.getenv("DEFAULT_SL_PIPS", 100))
-                if direction.upper() == "BUY":
-                    sl_val = price - default_sl_pips * point
-                else:
-                    sl_val = price + default_sl_pips * point
-                sl = str(round(sl_val, 2 if symbol.upper().startswith("XAU") else 5))
-                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal: {sl} (price={price}, pips={default_sl_pips}, point={point})")
+                    # fallback legacy: usar la función local si existe (por compatibilidad)
+                    forced_sl = price  # fallback mínimo
+                sl = str(round(forced_sl, 2 if symbol.upper().startswith("XAU") else 5))
+                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal (centralizado): {sl} (price={price})")
             else:
                 log.error(f"[TRACE][SIGNAL][FAST] No se pudo calcular SL forzado: no hay cuenta activa. Abortando señal.")
                 return
