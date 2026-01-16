@@ -424,10 +424,17 @@ class MT5Executor:
                     # Solo registrar/actualizar si forced_sl es válido
                     if hasattr(self, 'trade_manager') and self.trade_manager:
                         tm = self.trade_manager
-                        # Usar siempre el SL forzado/calculado para planned_sl
-                        if planned_sl_val is None or planned_sl_val == 0.0:
-                            log.error(f"[MT5_EXECUTOR][DEBUG] Ignorado registro/actualización de trade por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
-                            return
+                        # Si planned_sl_val es None, calcularlo usando get_forced_sl
+                        if planned_sl_val is None:
+                            log.warning(f"[MT5_EXECUTOR][DEBUG] planned_sl_val era None, se calculará usando get_forced_sl para registro. ticket={ticket} symbol={symbol} provider={provider_tag}")
+                            # Usar el precio actual para calcular el SL por defecto
+                            try:
+                                price_actual = client.tick_price(symbol, direction)
+                                planned_sl_val = await get_forced_sl(client, symbol, direction, price_actual)
+                                log.info(f"[MT5_EXECUTOR][DEBUG] planned_sl_val calculado por defecto: {planned_sl_val}")
+                            except Exception as e:
+                                log.error(f"[MT5_EXECUTOR][ERROR] No se pudo calcular planned_sl por defecto: {e}")
+                                planned_sl_val = 0.0
                         # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
                         fast_ticket = None
                         if provider_tag.upper() != 'FAST':
