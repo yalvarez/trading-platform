@@ -189,12 +189,12 @@ class MT5Executor:
             # --- Variables requeridas (ajustar según integración real) ---
             # Estas variables deben ser pasadas o definidas en el contexto real de uso
             # Aquí se definen como ejemplo para evitar errores de referencia
-            symbol = getattr(self, 'symbol', None) or account.get('symbol') or 'XAUUSD'
-            direction = getattr(self, 'direction', None) or account.get('direction') or 'BUY'
-            sl = getattr(self, 'sl', None) or account.get('sl') or 0.0
-            entry_range = getattr(self, 'entry_range', None) or account.get('entry_range') or None
-            provider_tag = getattr(self, 'provider_tag', None) or account.get('provider_tag') or 'FAST'
-            tps = getattr(self, 'tps', None) or account.get('tps') or []
+            symbol = account.get('symbol') or 'XAUUSD'
+            direction = account.get('direction', 'BUY')
+            sl = account.get('sl') or 0.0
+            entry_range = account.get('entry_range') or None
+            provider_tag = account.get('provider_tag') or 'FAST'
+            tps = account.get('tps') or []
             # tickets y errors deben estar definidos en el scope superior
             nonlocal tickets, errors
 
