@@ -316,11 +316,15 @@ class MT5Executor:
                 if not forced_sl or float(forced_sl) == 0.0:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
-                # planned_sl_val SIEMPRE local y explícito
+                # planned_sl_val SIEMPRE local y explícito, debe reflejar el SL realmente usado
                 try:
                     planned_sl_val = float(forced_sl) if forced_sl is not None else None
                 except Exception:
                     planned_sl_val = None
+
+                # Parche: asegurar que planned_sl_val SIEMPRE refleje el SL realmente usado
+                # Si forced_sl se ajusta después, actualizar planned_sl_val también
+                # (por ejemplo, tras ajuste por min_stop)
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
@@ -349,6 +353,7 @@ class MT5Executor:
                         adjusted_sl = price + min_stop
                     log.warning(f"[SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
                     forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
+                    planned_sl_val = forced_sl  # Parche: reflejar ajuste también en planned_sl_val
 
                 # --- LOTE DINÁMICO O FIJO ---
                 lot = 0.01
@@ -389,6 +394,7 @@ class MT5Executor:
                 # --- FIN LOTE ---
 
                 log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
+                log.info(f"[ORDER_PREP][SL-DEBUG] forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
 
                 # --- Unificar lógica de envío con fallback robusto ---
                 req = {
