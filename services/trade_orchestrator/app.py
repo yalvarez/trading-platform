@@ -115,9 +115,31 @@ async def main():
         provider_tag = fields.get("provider_tag", "GEN")
         entry_range = fields.get("entry_range", "")
         sl = fields.get("sl", "")
-        log.info(f"[TRACE][SIGNAL] SL recibido en handle_signal: {sl} (type={type(sl)}) fields={fields}")
         tps = json.loads(fields.get("tps", "[]") or "[]")
         is_fast = fields.get("fast", "false").lower() == "true"
+        # Si es FAST y no trae SL, calcularlo aquí usando el precio de mercado
+        if (not sl or float(sl) == 0.0) and is_fast:
+            account = next((a for a in accounts if a.get("active")), None)
+            if account:
+                client = execu._client_for(account)
+                price = client.tick_price(symbol, direction)
+                # Lógica estándar: para XAUUSD usar 300 pips (0.1), para otros usar 100 pips (point)
+                info = client.symbol_info(symbol)
+                point = float(getattr(info, "point", 0.1 if symbol.upper().startswith("XAU") else 0.00001)) if info else (0.1 if symbol.upper().startswith("XAU") else 0.00001)
+                if symbol.upper().startswith("XAU"):
+                    default_sl_pips = float(os.getenv("DEFAULT_SL_XAUUSD_PIPS", 300))
+                else:
+                    default_sl_pips = float(os.getenv("DEFAULT_SL_PIPS", 100))
+                if direction.upper() == "BUY":
+                    sl_val = price - default_sl_pips * point
+                else:
+                    sl_val = price + default_sl_pips * point
+                sl = str(round(sl_val, 2 if symbol.upper().startswith("XAU") else 5))
+                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal: {sl} (price={price}, pips={default_sl_pips}, point={point})")
+            else:
+                log.error(f"[TRACE][SIGNAL][FAST] No se pudo calcular SL forzado: no hay cuenta activa. Abortando señal.")
+                return
+        log.info(f"[TRACE][SIGNAL] SL recibido en handle_signal: {sl} (type={type(sl)}) fields={fields}")
         if not sl or float(sl) == 0.0:
             log.error(f"[TRACE][SIGNAL] SL inválido detectado en handle_signal. SL={sl} is_fast={is_fast} fields={fields}. Abortando señal.")
             return
