@@ -407,17 +407,23 @@ class MT5Executor:
                     # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
                     fast_ticket = None
                     if provider_tag.upper() != 'FAST':
+                        import os
+                        now = time.time()
+                        try:
+                            window_seconds = int(os.getenv('DEDUP_TTL_SECONDS', '120'))
+                        except Exception:
+                            window_seconds = 120
                         for t in getattr(tm, 'trades', {}).values():
-                            is_fast = (
-                                ('FAST' in (t.provider_tag or '').upper()) or
-                                (not t.provider_tag) or
-                                ((not t.planned_sl or t.planned_sl == 0.0) and (not t.tps or len(t.tps) == 0))
-                            )
+                            comment = getattr(t, 'provider_tag', '') or ''
+                            opened_ts = getattr(t, 'opened_ts', None)
+                            is_fast = 'FAST' in comment.upper()
+                            is_recent = opened_ts and (now - opened_ts <= window_seconds)
                             if (
                                 t.account_name == name and
                                 t.symbol == symbol and
                                 t.direction == direction and
-                                is_fast
+                                is_fast and
+                                is_recent
                             ):
                                 fast_ticket = t.ticket
                                 break
