@@ -117,20 +117,26 @@ async def main():
         sl = fields.get("sl", "")
         tps = json.loads(fields.get("tps", "[]") or "[]")
         is_fast = fields.get("fast", "false").lower() == "true"
-        # Si es FAST y no trae SL, calcularlo aquí usando la función centralizada de MT5Executor
+        # Si es FAST y no trae SL, calcularlo aquí usando la lógica de pips correcta (oro y otros)
         if (not sl or float(sl) == 0.0) and is_fast:
             account = next((a for a in accounts if a.get("active")), None)
             if account:
                 client = execu._client_for(account)
                 price = client.tick_price(symbol, direction)
-                # Usar la función centralizada de MT5Executor para calcular el SL forzado
-                if hasattr(execu, "get_forced_sl"):
-                    forced_sl = await execu.get_forced_sl(client, symbol, direction, price)
+                # Obtener default_sl_pips desde entorno o config
+                default_sl_pips = float(os.getenv("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(os.getenv("DEFAULT_SL_PIPS", 100))
+                # Usar la función de TradeManager para convertir pips a precio
+                point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
+                if hasattr(tm, "_pips_to_price"):
+                    sl_offset = tm._pips_to_price(symbol, default_sl_pips, point)
                 else:
-                    # fallback legacy: usar la función local si existe (por compatibilidad)
-                    forced_sl = price  # fallback mínimo
+                    sl_offset = default_sl_pips * point
+                if direction.upper() == "BUY":
+                    forced_sl = price - sl_offset
+                else:
+                    forced_sl = price + sl_offset
                 sl = str(round(forced_sl, 2 if symbol.upper().startswith("XAU") else 5))
-                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal (centralizado): {sl} (price={price})")
+                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal (pips_to_price): {sl} (price={price}, offset={sl_offset})")
             else:
                 log.error(f"[TRACE][SIGNAL][FAST] No se pudo calcular SL forzado: no hay cuenta activa. Abortando señal.")
                 return
