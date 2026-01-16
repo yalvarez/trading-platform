@@ -99,6 +99,29 @@ class MT5Executor:
                 )
             return False
 
+        def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
+            """
+            Busca el trade FAST más reciente para symbol, cuenta y dirección, dentro de la ventana de tiempo.
+            Ignora SL, TP y provider_tag.
+            """
+            from datetime import datetime
+            now = datetime.utcnow()
+            candidates = []
+            for t in trades:
+                if (
+                    t.get('symbol') == symbol
+                    and t.get('account_name') == account_name
+                    and t.get('direction') == direction
+                ):
+                    opened_at = t.get('opened_at')
+                    if opened_at:
+                        age = (now - opened_at).total_seconds()
+                        if age <= max_age_seconds:
+                            candidates.append((age, t))
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda x: x[0])[0][1]
+
     async def _best_filling_order_send(self, client, symbol, req: dict, account_name: str = None):
         """
         Intenta enviar la orden usando el filling recomendado por el símbolo y, si falla, prueba los otros modos.
