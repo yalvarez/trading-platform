@@ -115,13 +115,18 @@ async def main():
         provider_tag = fields.get("provider_tag", "GEN")
         entry_range = fields.get("entry_range", "")
         sl = fields.get("sl", "")
+        log.info(f"[TRACE][SIGNAL] SL recibido en handle_signal: {sl} (type={type(sl)}) fields={fields}")
         tps = json.loads(fields.get("tps", "[]") or "[]")
         is_fast = fields.get("fast", "false").lower() == "true"
+        if not sl or float(sl) == 0.0:
+            log.error(f"[TRACE][SIGNAL] SL inválido detectado en handle_signal. SL={sl} is_fast={is_fast} fields={fields}. Abortando señal.")
+            return
 
         entry_tuple = json.loads(entry_range) if entry_range else None
 
 
         # --- FAST update logic ---
+        log.info(f"[TRACE][SIGNAL] SL propagado a lógica FAST/COMPLETE: {sl}")
         if not is_fast:
             # For each account, check for an existing trade with provider_tag 'GB_FAST' for this symbol/direction
             updated_any = False
@@ -133,6 +138,7 @@ async def main():
                     and t.provider_tag == "GB_FAST"
                 ):
                     # Update the trade with new SL, TPs, and provider_tag
+                    log.info(f"[TRACE][FAST-UPDATE] SL recibido para update_trade_signal: {sl}")
                     tm.update_trade_signal(
                         ticket=t.ticket,
                         tps=tps,
@@ -182,6 +188,7 @@ async def main():
                         return
 
         log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s", trace_id, provider_tag, symbol, direction)
+        log.info(f"[TRACE][SIGNAL] SL propagado a open_complete_trade: {sl}")
         res = await execu.open_complete_trade(
             provider_tag=provider_tag,
             symbol=symbol,
@@ -195,6 +202,7 @@ async def main():
 
         # register opened
         for acct_name, ticket in res.tickets_by_account.items():
+            log.info(f"[TRACE][SIGNAL] SL propagado a register_trade: {sl}")
             tm.register_trade(
                 account_name=acct_name,
                 ticket=ticket,
