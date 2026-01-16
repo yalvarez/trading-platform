@@ -168,6 +168,17 @@ async def main():
                         planned_sl=float(sl) if sl else None,
                         provider_tag=provider_tag,
                     )
+                    # --- NEW: Update SL in MT5 as well ---
+                    try:
+                        account = next((a for a in accounts if a.get("name") == t.account_name), None)
+                        if account:
+                            client = execu._client_for(account)
+                            # Only update SL if ticket is valid and SL is provided
+                            if t.ticket and sl:
+                                client.modify_order(account, t.ticket, sl=float(sl))
+                                log.info(f"[FAST-UPDATE] SL updated in MT5 for ticket={t.ticket} acct={t.account_name} to SL={sl}")
+                    except Exception as e:
+                        log.error(f"[FAST-UPDATE] Failed to update SL in MT5 for ticket={t.ticket}: {e}")
                     log.info(f"[FAST-UPDATE] Updated FAST trade ticket={t.ticket} acct={t.account_name} with new SL/TP/provider_tag from full signal.")
                     updated_any = True
             # If any trade was updated, skip opening a new trade
