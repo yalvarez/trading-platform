@@ -174,6 +174,7 @@ class MT5Executor:
         self.notifier = notifier
         self.windows = parse_windows(trading_windows)
         self.entry_buffer_points = entry_buffer_points
+        self.entry_wait_seconds = entry_wait_seconds
 
     async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
         tickets = {}
