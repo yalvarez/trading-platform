@@ -84,6 +84,7 @@ class MT5Executor:
                 "comment": self._safe_comment(f"BE-{reason}"),
             }
             res = await self._best_filling_order_send(client, symbol, req)
+            log.info(f"[ORDER_SEND][DEBUG] Respuesta completa de order_send: {repr(res)}")
             ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
             logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
             pos_list_after = client.positions_get(ticket=int(ticket))
@@ -97,7 +98,7 @@ class MT5Executor:
                     account["name"],
                     f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
                 )
-            return False
+                return False
 
         def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
             """
