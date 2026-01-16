@@ -19,8 +19,23 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    def _notify_bg(self, account_name, message):
+        """
+        Send a background notification using the notifier if available, otherwise log the message.
+        """
+        if hasattr(self, 'notifier') and self.notifier:
+            try:
+                import asyncio
+                if asyncio.iscoroutinefunction(self.notifier):
+                    asyncio.create_task(self.notifier(account_name, message))
+                else:
+                    self.notifier(account_name, message)
+            except Exception as e:
+                log.error(f"[NOTIFY_BG] Error sending notification: {e}")
+        else:
+            log.info(f"[NOTIFY_BG][{account_name}] {message}")
 
-    async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "") -> bool:
+    async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None) -> bool:
         """
         Modifica el SL de la posición indicada por ticket a new_sl.
         Loguea el SL actual antes y después, el SL propuesto y el stop_level del símbolo.
@@ -52,12 +67,14 @@ class MT5Executor:
             if new_sl < max_sl:
                 log.warning(f"[SL-UPDATE] SL ({new_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
                 new_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
+        # Usar provider_tag actualizado en el comentario si se proporciona
+        comment_tag = f"{provider_tag}-SLUPD-{reason}" if provider_tag else f"SLUPD-{reason}"
         req = {
             "action": 6,  # TRADE_ACTION_SLTP
             "position": int(ticket),
             "sl": float(new_sl),
             "tp": float(getattr(pos, "tp", 0.0)),
-            "comment": self._safe_comment(f"SLUPD-{reason}"),
+            "comment": self._safe_comment(comment_tag),
         }
         res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
         log.info(f"[ORDER_SEND][DEBUG][SL-UPDATE] Respuesta completa de order_send: {repr(res)}")
