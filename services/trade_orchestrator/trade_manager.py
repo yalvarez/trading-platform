@@ -83,7 +83,7 @@ class TradeManager:
 
         # Validar que el SL recibido es válido (no None, no 0, y es un precio plausible)
         if planned_sl is None or planned_sl == 0.0:
-            log.error(f"[TM] ❌ NO se puede registrar trade SIN SL! ticket={ticket} symbol={symbol} provider={provider_tag} (planned_sl={planned_sl})")
+            log.debug(f"[TM][DEBUG] Registro de trade ignorado por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
             return
         # Validar que el SL no es un valor de pips (ej: < 100 para XAUUSD)
         if symbol_upper.startswith("XAU") and planned_sl < 1000:
