@@ -411,66 +411,64 @@ class MT5Executor:
                     "type_time": 0,
                 }
                 res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
-                if res and getattr(res, "retcode", None) == 10009:
-                    tickets[name] = int(getattr(res, "order", 0))
-                    log.info("open_complete_trade success acct=%s ticket=%s", name, tickets[name])
-                # Solo registrar/actualizar si forced_sl es válido
-                if hasattr(self, 'trade_manager') and self.trade_manager:
-                    tm = self.trade_manager
-                    ticket = tickets[name]
-                    # Usar siempre el SL forzado/calculado para planned_sl
-                    # planned_sl_val debe reflejar SIEMPRE el SL realmente usado en la orden (forced_sl)
-                    if planned_sl_val is None or planned_sl_val == 0.0:
-                        log.error(f"[MT5_EXECUTOR][DEBUG] Ignorado registro/actualización de trade por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
-                        return
-                    # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
-                    fast_ticket = None
-                    if provider_tag.upper() != 'FAST':
-                        import os
-                        now = time.time()
-                        try:
-                            window_seconds = int(os.getenv('DEDUP_TTL_SECONDS', '120'))
-                        except Exception:
-                            window_seconds = 120
-                        for t in getattr(tm, 'trades', {}).values():
-                            comment = getattr(t, 'provider_tag', '') or ''
-                            opened_ts = getattr(t, 'opened_ts', None)
-                            is_fast = 'FAST' in comment.upper()
-                            is_recent = opened_ts and (now - opened_ts <= window_seconds)
-                            if (
-                                t.account_name == name and
-                                t.symbol == symbol and
-                                t.direction == direction and
-                                is_fast and
-                                is_recent
-                            ):
-                                log.info(f"[MT5_EXECUTOR][DEBUG] FAST trade candidate for update: ticket={t.ticket} acct={t.account_name} symbol={t.symbol} dir={t.direction} provider_tag={t.provider_tag} opened_ts={opened_ts} now={now} window={window_seconds}")
-                                fast_ticket = t.ticket
-                                break
-                    # Si hay trade FAST previo, actualizarlo
-                    if fast_ticket:
-                        log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade FAST previo: ticket={fast_ticket} con datos de señal completa. planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
-                        tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
-                        log.info(f"[TM] 🔄 updated FAST->COMPLETE ticket={fast_ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
-                    elif hasattr(tm, 'trades') and int(ticket) in tm.trades:
-                        log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade existente: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
-                        tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
-                        log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
-                    else:
-                        log.info(f"[MT5_EXECUTOR][DEBUG] Registrando nuevo trade: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
-                        tm.register_trade(
-                            account_name=name,
-                            ticket=ticket,
-                            symbol=symbol,
-                            direction=direction,
-                            provider_tag=provider_tag,
-                            tps=list(tps),
-                            planned_sl=planned_sl_val,
-                            group_id=ticket
-                        )
+                ticket = tickets.get(name)
+                if res and getattr(res, "retcode", None) == 10009 and ticket is not None:
+                    log.info("open_complete_trade success acct=%s ticket=%s", name, ticket)
+                    # Solo registrar/actualizar si forced_sl es válido
+                    if hasattr(self, 'trade_manager') and self.trade_manager:
+                        tm = self.trade_manager
+                        # Usar siempre el SL forzado/calculado para planned_sl
+                        if planned_sl_val is None or planned_sl_val == 0.0:
+                            log.error(f"[MT5_EXECUTOR][DEBUG] Ignorado registro/actualización de trade por SL inválido. ticket={ticket} symbol={symbol} provider={provider_tag} forced_sl={forced_sl} planned_sl_val={planned_sl_val}")
+                            return
+                        # Si es señal completa y provider_tag != 'FAST', buscar trade FAST previo para actualizarlo
+                        fast_ticket = None
+                        if provider_tag.upper() != 'FAST':
+                            import os
+                            now = time.time()
+                            try:
+                                window_seconds = int(os.getenv('DEDUP_TTL_SECONDS', '120'))
+                            except Exception:
+                                window_seconds = 120
+                            for t in getattr(tm, 'trades', {}).values():
+                                comment = getattr(t, 'provider_tag', '') or ''
+                                opened_ts = getattr(t, 'opened_ts', None)
+                                is_fast = 'FAST' in comment.upper()
+                                is_recent = opened_ts and (now - opened_ts <= window_seconds)
+                                if (
+                                    t.account_name == name and
+                                    t.symbol == symbol and
+                                    t.direction == direction and
+                                    is_fast and
+                                    is_recent
+                                ):
+                                    log.info(f"[MT5_EXECUTOR][DEBUG] FAST trade candidate for update: ticket={t.ticket} acct={t.account_name} symbol={t.symbol} dir={t.direction} provider_tag={t.provider_tag} opened_ts={opened_ts} now={now} window={window_seconds}")
+                                    fast_ticket = t.ticket
+                                    break
+                        # Si hay trade FAST previo, actualizarlo
+                        if fast_ticket:
+                            log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade FAST previo: ticket={fast_ticket} con datos de señal completa. planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
+                            tm.update_trade_signal(ticket=int(fast_ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
+                            log.info(f"[TM] 🔄 updated FAST->COMPLETE ticket={fast_ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
+                        elif hasattr(tm, 'trades') and int(ticket) in tm.trades:
+                            log.info(f"[MT5_EXECUTOR][DEBUG] Actualizando trade existente: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
+                            tm.update_trade_signal(ticket=int(ticket), tps=list(tps), planned_sl=planned_sl_val, provider_tag=provider_tag)
+                            log.info(f"[TM] 🔄 updated ticket={ticket} acct={name} provider={provider_tag} tps={tps} planned_sl={planned_sl_val}")
+                        else:
+                            log.info(f"[MT5_EXECUTOR][DEBUG] Registrando nuevo trade: ticket={ticket} planned_sl={planned_sl_val} tps={tps} provider_tag={provider_tag}")
+                            tm.register_trade(
+                                account_name=name,
+                                ticket=ticket,
+                                symbol=symbol,
+                                direction=direction,
+                                provider_tag=provider_tag,
+                                tps=list(tps),
+                                planned_sl=planned_sl_val,
+                                group_id=ticket
+                            )
                 else:
-                    errors[name] = f"order_send failed retcode={getattr(res,'retcode',None)}"
-                    log.warning("open_complete_trade failed acct=%s retcode=%s", name, getattr(res,'retcode',None))
+                    log.warning(f"[MT5_EXECUTOR][DEBUG] No se registró trade porque la orden no fue exitosa o ticket no asignado. acct={name} retcode={getattr(res,'retcode',None)} ticket={ticket} planned_sl_val={planned_sl_val}")
+                    errors[name] = f"order_send failed or not registered retcode={getattr(res,'retcode',None)}"
             except Exception as e:
                 errors[name] = f"Exception: {e}"
                 log.error(f"[EXCEPTION] open_complete_trade failed acct={name}: {e}")
