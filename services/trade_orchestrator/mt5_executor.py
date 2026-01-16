@@ -315,6 +315,11 @@ class MT5Executor:
                 if not forced_sl or float(forced_sl) == 0.0:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
+                # Asignar planned_sl_val SIEMPRE al valor real usado en la orden
+                try:
+                    planned_sl_val = float(forced_sl) if forced_sl is not None else None
+                except Exception:
+                    planned_sl_val = None
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
                 symbol_info = client.symbol_info(symbol)
