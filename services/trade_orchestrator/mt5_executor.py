@@ -397,8 +397,9 @@ class MT5Executor:
                     tm = self.trade_manager
                     ticket = tickets[name]
                     # Usar siempre el SL forzado/calculado para planned_sl
+                    # planned_sl_val debe reflejar SIEMPRE el SL realmente usado en la orden (forced_sl)
                     try:
-                        planned_sl_val = float(forced_sl)
+                        planned_sl_val = float(forced_sl) if forced_sl is not None else None
                     except Exception:
                         planned_sl_val = None
                     if planned_sl_val is None or planned_sl_val == 0.0:
