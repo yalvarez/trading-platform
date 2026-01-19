@@ -518,12 +518,8 @@ class TradeManager:
     # Notifier
     # ----------------------------
     def _notify_bg(self, account_name: str, message: str):
-        if not self.notifier:
-            return
-        try:
-            asyncio.create_task(self.notifier.notify(account_name, message))
-        except RuntimeError:
-            log.warning("[NOTIFY][NO_LOOP] %s: %s", account_name, message)
+        # Notificaciones a Telegram deshabilitadas temporalmente
+        return
 
     async def notify_trade_event(self, event: str, **kwargs):
         """
@@ -553,8 +549,8 @@ class TradeManager:
             msg = kwargs.get('message')
         else:
             msg = kwargs.get('message')
-        if msg:
-            await self.notifier.notify(account_name, msg)
+        # Notificaciones a Telegram deshabilitadas temporalmente
+        return
 
 
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
