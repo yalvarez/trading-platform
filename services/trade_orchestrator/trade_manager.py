@@ -48,7 +48,6 @@ class TradeManager:
                 self._notify_bg(account["name"], f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
         return any_matched_trade
 # trade_manager.py
-from __future__ import annotations
 
 import asyncio
 import time
