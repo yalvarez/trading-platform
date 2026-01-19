@@ -1,17 +1,3 @@
-from __future__ import annotations
-
-import asyncio
-import time
-import re
-from dataclasses import dataclass, field
-from typing import Optional
-import os
-import mt5_constants as mt5
-from mt5_client import MT5Client
-from prometheus_client import Counter, Gauge
-import logging
-import datetime
-import redis.asyncio as redis_async
 
 # ...existing code...
 
