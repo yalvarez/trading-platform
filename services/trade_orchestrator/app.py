@@ -117,6 +117,11 @@ async def main():
         sl = fields.get("sl", "")
         tps = json.loads(fields.get("tps", "[]") or "[]")
         is_fast = fields.get("fast", "false").lower() == "true"
+        # Nuevo: obtener el canal de origen de la señal
+        try:
+            source_channel = int(fields.get("source_chat_id") or fields.get("chat_id") or 0)
+        except Exception:
+            source_channel = 0
         # Si es FAST y no trae SL, calcularlo aquí usando la lógica de pips correcta (oro y otros)
         if (not sl or float(sl) == 0.0) and is_fast:
             account = next((a for a in accounts if a.get("active")), None)
@@ -223,7 +228,28 @@ async def main():
 
         log.info("[SIGNAL] calling open_complete_trade trace=%s provider=%s symbol=%s dir=%s", trace_id, provider_tag, symbol, direction)
         log.info(f"[TRACE][SIGNAL] SL propagado a open_complete_trade: {sl}")
-        res = await execu.open_complete_trade(
+        # Filtrar cuentas según allowed_channels
+        filtered_accounts = []
+        for acct in accounts:
+            allowed_channels = acct.get("allowed_channels")
+            if allowed_channels is None:
+                filtered_accounts.append(acct)  # Si no está definido, acepta todos los canales
+            else:
+                # Puede ser lista de int o str
+                if source_channel and any(int(ch) == source_channel for ch in allowed_channels):
+                    filtered_accounts.append(acct)
+        if not filtered_accounts:
+            log.info(f"[SKIP] Ninguna cuenta permite el canal {source_channel}. Signal ignorada.")
+            return
+        # Ejecutar solo para las cuentas filtradas
+        res = await MT5Executor(filtered_accounts,
+            magic=execu.magic,
+            notifier=execu.notifier,
+            trading_windows=execu.windows,
+            entry_wait_seconds=execu.entry_wait_seconds,
+            entry_poll_ms=execu.entry_poll_ms,
+            entry_buffer_points=execu.entry_buffer_points
+        ).open_complete_trade(
             provider_tag=provider_tag,
             symbol=symbol,
             direction=direction,

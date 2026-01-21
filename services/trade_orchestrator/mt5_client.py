@@ -1,4 +1,4 @@
-from mt5linux import MetaTrader5
+from ..mt5linux import MetaTrader5
 
 
 class MT5Client:

@@ -1,4 +1,3 @@
-
 # ...existing code...
 
 class TradeManager:
@@ -55,8 +54,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 import os
-import mt5_constants as mt5
-from mt5_client import MT5Client
+from enum import Enum
+class TradingMode(Enum):
+    GENERAL = "general"
+    BE_PIPS = "be_pips"
+    BE_PNL = "be_pnl"
+
+from . import mt5_constants as mt5
+from .mt5_client import MT5Client
 from prometheus_client import Counter, Gauge
 import logging
 import datetime
@@ -119,7 +124,7 @@ class TradeManager:
         Registra un trade en el manager. Si no hay SL válido, calcula uno por fallback y lo asigna.
         """
         import os
-        from mt5_client import MT5Client
+        from .mt5_client import MT5Client
         default_sl_pips = getattr(self, 'default_sl', None)
         symbol_upper = symbol.upper() if symbol else ""
         env_override = None
@@ -403,7 +408,8 @@ class TradeManager:
         )
     def __init__(
         self,
-        mt5_exec,
+        mt5_exec=None,
+        mt5=None,
         *,
         magic: int = 987654,
         loop_sleep_sec: float = 1.0,
@@ -451,7 +457,7 @@ class TradeManager:
         notifier=None,
         notify_connect: bool | None = None,  # compat
         redis_url: str = None, redis_conn=None):
-        self.mt5 = mt5_exec
+        self.mt5 = mt5_exec if mt5 is None else mt5
         self.magic = magic
         self.loop_sleep_sec = loop_sleep_sec
 
@@ -690,6 +696,9 @@ class TradeManager:
                 # 3) Trailing Stop
                 if self.enable_trailing:
                     await self._maybe_trailing(account, pos, point, is_buy, current, t)
+
+                # Llamada a la gestión según modalidad
+                await self.gestionar_trade(t, account)
         except Exception as e:
             # Supresión de errores de conexión repetidos
             if hasattr(self, '_last_conn_error') and self._last_conn_error == str(e):
@@ -1128,6 +1137,10 @@ class TradeManager:
                 # Solo procesar un TP por tick
                 return
 
+        # Robustecer: Si TP2 ya está en tp_hit y la variable de activación está activa, runner_enabled debe estar activo
+        if self.trailing_activation_after_tp2 and (2 in t.tp_hit):
+            t.runner_enabled = True
+
         # Runner retrace
         if long_mode and t.runner_enabled and t.mfe_peak_price is not None:
             retrace_price = self.runner_retrace_pips * point
@@ -1545,4 +1558,140 @@ class TradeManager:
 
         # Consumimos el mensaje si era de gestión TOROFX (aunque no haya match en ese instante)
         return True
+
+    async def gestionar_trade(self, trade, cuenta):
+        """
+        Decide y delega la gestión del trade según la modalidad configurada en la cuenta.
+        """
+        modo = cuenta.get("trading_mode", TradingMode.GENERAL.value)
+        if modo == TradingMode.GENERAL.value:
+            return await self.gestionar_trade_general(trade, cuenta)
+        elif modo == TradingMode.BE_PIPS.value:
+            return await self.gestionar_trade_be_pips(trade, cuenta)
+        elif modo == TradingMode.BE_PNL.value:
+            return await self.gestionar_trade_be_pnl(trade, cuenta)
+        else:
+            # fallback a general si el modo es desconocido
+            return await self.gestionar_trade_general(trade, cuenta)
+
+    async def gestionar_trade_general(self, trade, cuenta):
+        """
+        Lógica de gestión clásica: TP, runner, trailing, BE, etc. usando funciones comunes.
+        """
+        client = self.mt5._client_for(cuenta)
+        pos_list = client.positions_get(ticket=int(trade.ticket))
+        if not pos_list:
+            return
+        pos = pos_list[0]
+        info = client.symbol_info(trade.symbol)
+        tick = client.symbol_info_tick(trade.symbol)
+        if not info or not tick:
+            return
+        point = float(info.point)
+        is_buy = (trade.direction == "BUY")
+        current = float(pos.price_current)
+        # TP y runner
+        await self._maybe_take_profits(cuenta, pos, point, is_buy, current, trade)
+        # Trailing
+        if self.enable_trailing:
+            await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
+
+    async def gestionar_trade_be_pips(self, trade, cuenta):
+        """
+        Lógica: al alcanzar X pips, mover SL a BE, luego gestión normal (TP, runner, trailing).
+        """
+        be_pips = cuenta.get("be_pips", 35)
+        recorrido = self._get_recorrido_pips(trade, cuenta)
+        if recorrido >= be_pips and not getattr(trade, "be_applied", False):
+            self._move_sl_to_be(trade, cuenta)
+            trade.be_applied = True
+        # Reutilizar funciones comunes
+        await self.gestionar_trade_general(trade, cuenta)
+
+    async def gestionar_trade_be_pnl(self, trade, cuenta):
+        """
+        Lógica: al alcanzar X pips y tras parcial, poner SL en precio que permita perder solo lo ganado en la parcial, luego gestión normal.
+        """
+        be_pips = cuenta.get("be_pips", 35)
+        recorrido = self._get_recorrido_pips(trade, cuenta)
+        if recorrido >= be_pips and getattr(trade, "parcial_ganada", False) and not getattr(trade, "sl_pnl_applied", False):
+            pnl_ganado = getattr(trade, "pnl_parcial", 0.0)
+            sl_price = self._calcular_sl_por_pnl(trade, cuenta, pnl_ganado)
+            self._move_sl(trade, cuenta, sl_price)
+            trade.sl_pnl_applied = True
+        # Reutilizar funciones comunes
+        await self.gestionar_trade_general(trade, cuenta)
+
+    # Métodos auxiliares (esqueleto)
+    def _get_current_price(self, symbol, cuenta):
+        client = self.mt5._client_for(cuenta)
+        tick = client.symbol_info_tick(symbol)
+        return getattr(tick, "bid", None) if tick else None
+
+    def _close_partial_and_be(self, trade, cuenta, tp1):
+        # Cerrar parcial (50%) y mover SL a BE
+        client = self.mt5._client_for(cuenta)
+        ticket = trade.ticket
+        # Cierre parcial
+        asyncio.create_task(self.mt5.early_partial_close(cuenta, ticket, percent=0.5, provider_tag=trade.provider_tag, reason="TP1"))
+        # Mover SL a BE (lógica clásica)
+        # ...puedes llamar a modify_sl o lógica interna...
+        pass
+
+    def _get_recorrido_pips(self, trade, cuenta):
+        client = self.mt5._client_for(cuenta)
+        pos_list = client.positions_get(ticket=int(trade.ticket))
+        if not pos_list:
+            return 0
+        pos = pos_list[0]
+        entry = float(getattr(pos, "price_open", 0.0))
+        current = float(getattr(pos, "price_current", 0.0))
+        point = float(getattr(client.symbol_info(trade.symbol), "point", 0.00001))
+        if trade.direction.upper() == "BUY":
+            recorrido = (current - entry) / point
+        else:
+            recorrido = (entry - current) / point
+        return round(recorrido, 1)
+
+    def _move_sl_to_be(self, trade, cuenta):
+        client = self.mt5._client_for(cuenta)
+        pos_list = client.positions_get(ticket=int(trade.ticket))
+        if not pos_list:
+            return
+        pos = pos_list[0]
+        entry = float(getattr(pos, "price_open", 0.0))
+        # Mover SL a precio de entrada
+        asyncio.create_task(self.mt5.modify_sl(cuenta, trade.ticket, entry, reason="BE-auto", provider_tag=trade.provider_tag))
+
+    def _calcular_sl_por_pnl(self, trade, cuenta, pnl_ganado):
+        # Calcular el precio de SL que permita perder solo lo ganado
+        client = self.mt5._client_for(cuenta)
+        pos_list = client.positions_get(ticket=int(trade.ticket))
+        if not pos_list:
+            return 0
+        pos = pos_list[0]
+        entry = float(getattr(pos, "price_open", 0.0))
+        volume = float(getattr(pos, "volume", 0.01))
+        # Calcular distancia en pips equivalente a pnl_ganado
+        # Suponiendo 1 pip = valor_pip (depende del símbolo y lotaje)
+        valor_pip = self._valor_pip(trade.symbol, volume, cuenta)
+        pips_equivalentes = abs(pnl_ganado / valor_pip) if valor_pip else 0
+        point = float(getattr(client.symbol_info(trade.symbol), "point", 0.00001))
+        if trade.direction.upper() == "BUY":
+            sl_price = entry + (pips_equivalentes * point)
+        else:
+            sl_price = entry - (pips_equivalentes * point)
+        return round(sl_price, 5)
+
+    def _valor_pip(self, symbol, volume, cuenta):
+        # Estimar el valor de un pip para el símbolo y volumen
+        # Ejemplo para XAUUSD y FX
+        if symbol.upper().startswith("XAU"):
+            return 1.0 * volume  # 1 pip = $1 por lote en oro
+        else:
+            return 0.1 * volume  # Ejemplo para FX, ajustar según broker
+
+    def _move_sl(self, trade, cuenta, sl_price):
+        client = self.mt5._client_for(cuenta)
+        asyncio.create_task(self.mt5.modify_sl(cuenta, trade.ticket, sl_price, reason="BE-PNL", provider_tag=trade.provider_tag))
 
