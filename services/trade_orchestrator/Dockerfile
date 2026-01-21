@@ -9,11 +9,7 @@ RUN pip install --no-cache-dir mt5linux==0.1.9
 
 COPY services/common ./common
 
-COPY services/trade_orchestrator/app.py .
-COPY services/trade_orchestrator/mt5_client.py .
-COPY services/trade_orchestrator/mt5_executor.py .
-COPY services/trade_orchestrator/mt5_constants.py .
-COPY services/trade_orchestrator/trade_manager.py .
-COPY services/trade_orchestrator/introspect_mt5_rpyc.py .
+COPY services/trade_orchestrator ./trade_orchestrator
 
-CMD ["python", "app.py"]
+# Ejecutar como paquete para soportar imports relativos
+CMD ["python", "-m", "trade_orchestrator.app"]
