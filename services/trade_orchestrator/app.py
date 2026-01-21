@@ -4,8 +4,8 @@ from common.config import Settings
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
 
-from mt5_executor import MT5Executor
-from trade_manager import TradeManager
+from .mt5_executor import MT5Executor
+from .trade_manager import TradeManager
 # Ensure services folder is on sys.path so sibling packages (telegram_ingestor) can be imported
 _svc_a = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 _svc_b = os.path.abspath(os.path.join(os.path.dirname(__file__), 'services'))

@@ -11,7 +11,7 @@ import logging
 
 log = logging.getLogger("trade_orchestrator.mt5_executor")
 from .mt5_client import MT5Client
-from trade_manager import TradeManager
+from .trade_manager import TradeManager
 
 @dataclass
 class MT5OpenResult:
@@ -181,7 +181,7 @@ class MT5Executor:
         # Offset en pips
         off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
         # Usar función centralizada de conversión
-        from trade_manager import TradeManager
+        from .trade_manager import TradeManager
         off_price = TradeManager._pips_to_price(symbol, off_pips, point)
         be_sl = (entry + off_price) if is_buy else (entry - off_price)
         be_sl = round(be_sl, 2 if symbol.upper().startswith("XAU") else 5)
