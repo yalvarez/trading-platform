@@ -12,7 +12,12 @@ class Window:
 
 def parse_windows(spec: str) -> list[Window]:
     out: list[Window] = []
-    for part in (spec or "").split(","):
+    # Si es lista, úsala directamente; si es string, splitea por coma
+    if isinstance(spec, list):
+        parts = spec
+    else:
+        parts = (spec or "").split(",")
+    for part in parts:
         part = part.strip()
         if not part:
             continue
