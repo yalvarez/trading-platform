@@ -10,7 +10,7 @@ from common.timewindow import parse_windows, in_windows
 import logging
 
 log = logging.getLogger("trade_orchestrator.mt5_executor")
-from services.trade_orchestrator.mt5_client import MT5Client
+from .mt5_client import MT5Client
 from trade_manager import TradeManager
 
 @dataclass
