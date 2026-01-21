@@ -11,13 +11,18 @@ class Window:
     end: dtime
 
 def parse_windows(spec: str) -> list[Window]:
-    out: list[Window] = []
-    # Si es lista, úsala directamente; si es string, splitea por coma
+    # Si ya es lista de Window, devolver tal cual
     if isinstance(spec, list):
+        if all(isinstance(x, Window) for x in spec):
+            return spec
         parts = spec
     else:
         parts = (spec or "").split(",")
+    out: list[Window] = []
     for part in parts:
+        if isinstance(part, Window):
+            out.append(part)
+            continue
         part = part.strip()
         if not part:
             continue
