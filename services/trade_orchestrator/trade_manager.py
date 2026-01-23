@@ -1486,7 +1486,7 @@ class TradeManager:
         # Consumimos el mensaje si era de gestión TOROFX (aunque no haya match en ese instante)
         return True
 
-    async def gestionar_trade(self, trade, cuenta):
+    async def gestionar_trade(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Decide y delega la gestión del trade según la modalidad configurada en la cuenta.
         Llama a la función de gestión correspondiente:
@@ -1497,40 +1497,42 @@ class TradeManager:
         """
         modo = cuenta.get("trading_mode", TradingMode.GENERAL.value)
         if modo == TradingMode.GENERAL.value:
-            return await self.gestionar_trade_general(trade, cuenta)
+            return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         elif modo == TradingMode.BE_PIPS.value:
-            return await self.gestionar_trade_be_pips(trade, cuenta)
+            return await self.gestionar_trade_be_pips(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         elif modo == TradingMode.BE_PNL.value:
-            return await self.gestionar_trade_be_pnl(trade, cuenta)
+            return await self.gestionar_trade_be_pnl(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         else:
             # fallback a general si el modo es desconocido
-            return await self.gestionar_trade_general(trade, cuenta)
+            return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
-    async def gestionar_trade_general(self, trade, cuenta):
+    async def gestionar_trade_general(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Lógica de gestión clásica: TP, runner, trailing, BE, etc. usando funciones comunes.
         - Ejecuta toma de ganancias parciales y trailing stop si está habilitado.
         - Usa helpers centralizados para cálculos de precios y pips.
         """
-        client = self.mt5._client_for(cuenta)
-        pos_list = client.positions_get(ticket=int(trade.ticket))
-        if not pos_list:
-            return
-        pos = pos_list[0]
-        info = client.symbol_info(trade.symbol)
-        tick = client.symbol_info_tick(trade.symbol)
-        if not info or not tick:
-            return
-        point = float(info.point)
-        is_buy = (trade.direction == "BUY")
-        current = float(pos.price_current)
+        # Si se pasan los argumentos, úsalos; si no, obténlos
+        if pos is None or point is None or is_buy is None or current is None:
+            client = self.mt5._client_for(cuenta)
+            pos_list = client.positions_get(ticket=int(trade.ticket))
+            if not pos_list:
+                return
+            pos = pos_list[0]
+            info = client.symbol_info(trade.symbol)
+            tick = client.symbol_info_tick(trade.symbol)
+            if not info or not tick:
+                return
+            point = float(info.point)
+            is_buy = (trade.direction == "BUY")
+            current = float(pos.price_current)
         # TP y runner
         await self._maybe_take_profits(cuenta, pos, point, is_buy, current, trade)
         # Trailing
         if self.enable_trailing:
             await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
 
-    async def gestionar_trade_be_pips(self, trade, cuenta):
+    async def gestionar_trade_be_pips(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Lógica: al alcanzar X pips, cerrar 30% del trade, mover SL a BE, luego gestión normal (TP, runner, trailing).
         - Si el recorrido en pips >= be_pips y no se ha aplicado BE, cierra 30% y mueve SL a BE.
@@ -1548,9 +1550,9 @@ class TradeManager:
             self._move_sl_to_be(trade, cuenta)
             trade.be_applied = True
         # Reutilizar funciones comunes
-        await self.gestionar_trade_general(trade, cuenta)
+        await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
-    async def gestionar_trade_be_pnl(self, trade, cuenta):
+    async def gestionar_trade_be_pnl(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Lógica: al alcanzar X pips, cerrar 30% del trade, calcular SL en base al monto ganado en esa parcial, mover el SL, luego gestión normal.
         - Si el recorrido en pips >= be_pips y no se ha aplicado SL PnL, cierra 30%, calcula y mueve el SL.
@@ -1574,7 +1576,7 @@ class TradeManager:
             self._move_sl(trade, cuenta, sl_price)
             trade.sl_pnl_applied = True
         # Reutilizar funciones comunes
-        await self.gestionar_trade_general(trade, cuenta)
+        await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
     # Métodos auxiliares (esqueleto)
     def _get_current_price(self, symbol, cuenta):
