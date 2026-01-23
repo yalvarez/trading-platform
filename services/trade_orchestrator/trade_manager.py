@@ -1602,7 +1602,7 @@ class TradeManager:
 
     def _get_recorrido_pips(self, trade, cuenta):
         """
-        Calcula el recorrido en pips desde la entrada hasta el precio actual para el trade dado.
+        Calcula el recorrido en pips desde la entrada hasta el precio actual para el trade dado, usando el valor estándar de pip (ej. 0.10 para XAUUSD).
         """
         client = self.mt5._client_for(cuenta)
         pos_list = client.positions_get(ticket=int(trade.ticket))
@@ -1611,11 +1611,13 @@ class TradeManager:
         pos = pos_list[0]
         entry = float(getattr(pos, "price_open", 0.0))
         current = float(getattr(pos, "price_current", 0.0))
-        point = float(getattr(client.symbol_info(trade.symbol), "point", 0.00001))
+        pip_value = valor_pip(trade.symbol)
+        if pip_value == 0:
+            pip_value = 0.10  # fallback seguro para oro
         if trade.direction.upper() == "BUY":
-            recorrido = (current - entry) / point
+            recorrido = (current - entry) / pip_value
         else:
-            recorrido = (entry - current) / point
+            recorrido = (entry - current) / pip_value
         return round(recorrido, 1)
 
     def _move_sl_to_be(self, trade, cuenta):
