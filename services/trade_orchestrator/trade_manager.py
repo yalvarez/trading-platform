@@ -957,7 +957,8 @@ class TradeManager:
         await asyncio.sleep(1)
         pos_list_after = client.positions_get(ticket=int(ticket))
         vol_after = float(getattr(pos_list_after[0], 'volume', 0.0)) if pos_list_after else 0.0
-        log.info(f"[DEBUG] Volumen antes del cierre parcial: {vol_before} | después: {vol_after} | delta: {vol_before - vol_after}")
+        delta_vol = vol_before - vol_after
+        log.info(f"[DEBUG] Volumen antes del cierre parcial: {vol_before} | después: {vol_after} | delta: {delta_vol}")
         pos = pos_list_after[0] if pos_list_after else None
         symbol = getattr(pos, 'symbol', '') if pos else ''
         volume = vol_after
@@ -973,8 +974,10 @@ class TradeManager:
         close_vol = step * int(raw_close / step)
         if close_vol < vmin or close_vol <= 0:
             close_vol = volume
-        if ok:
-            log.info("[TM] 🎯 partial_close ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
+
+        # Validación crítica: ¿el volumen realmente cambió?
+        if ok and delta_vol > 0.00001:
+            log.info("[TM] 🎯 partial_close ticket=%s percent=%s reason=%s | Volumen cambiado correctamente (delta=%.5f)", int(ticket), int(percent), reason, delta_vol)
             try:
                 PARTIAL_CLOSES.inc()
             except Exception:
@@ -986,7 +989,7 @@ class TradeManager:
                 symbol=symbol,
                 close_percent=percent,
                 close_price=getattr(pos, 'price_current', 0.0) if pos else 0.0,
-                closed_volume=close_vol,
+                closed_volume=delta_vol,
             )
             # Si el cierre es total, auditar solo si el trade existe
             if percent >= 100:
@@ -994,7 +997,7 @@ class TradeManager:
                 if t_audit is not None:
                     await self.audit_trade_close(account["name"], int(ticket), t_audit, reason, pos)
         else:
-            log.warning("[TM] ❌ partial_close FAILED ticket=%s percent=%s reason=%s", int(ticket), int(percent), reason)
+            log.error("[TM][CRITICAL] ❌ partial_close NO CAMBIÓ VOLUMEN | ticket=%s percent=%s reason=%s | delta=%.5f | ok=%s", int(ticket), int(percent), reason, delta_vol, ok)
             await self.notify_trade_event(
                 'partial',
                 account_name=account["name"],
@@ -1002,7 +1005,7 @@ class TradeManager:
                 symbol=symbol,
                 close_percent=percent,
                 close_price=getattr(pos, 'price_current', 0.0) if pos else 0.0,
-                closed_volume=close_vol,
+                closed_volume=delta_vol,
             )
 
     # ----------------------------
@@ -1611,7 +1614,8 @@ class TradeManager:
         pos = pos_list[0]
         entry = float(getattr(pos, "price_open", 0.0))
         current = float(getattr(pos, "price_current", 0.0))
-        pip_value = valor_pip(trade.symbol)
+        volume = float(getattr(pos, "volume", 0.01))
+        pip_value = valor_pip(trade.symbol, volume)
         if pip_value == 0:
             pip_value = 0.10  # fallback seguro para oro
         if trade.direction.upper() == "BUY":
