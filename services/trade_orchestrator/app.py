@@ -31,12 +31,18 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("trade_orchestrator")
 
 class NotifierAdapter:
-    """Adapter exposing both async callable and notify() used across modules."""
+    """
+    Adaptador que expone métodos async para notificaciones de TP, cierres parciales y mensajes generales.
+    Permite usar un notificador Telegram remoto de forma uniforme en toda la app.
+    """
 
     def __init__(self, tg_notifier):
         self._tg = tg_notifier
 
     async def notify_tp_hit(self, account_name: str, ticket: int, symbol: str, tp_index: int, tp_price: float, current_price: float):
+        """
+        Notifica que se alcanzó un TP para una cuenta/ticket/símbolo.
+        """
         return await self._tg.notify_tp_hit(
             account_name=account_name,
             ticket=ticket,
@@ -47,16 +53,30 @@ class NotifierAdapter:
         )
 
     async def notify_partial_close(self, *args, **kwargs):
+        """
+        Notifica un cierre parcial si el notificador lo soporta.
+        """
         if hasattr(self._tg, "notify_partial_close"):
             return await self._tg.notify_partial_close(*args, **kwargs)
 
     async def __call__(self, account_name: str, message: str):
+        """
+        Notificación genérica (llamada como función).
+        """
         await self._tg.notify(account_name, message)
 
     async def notify(self, account_name: str, message: str):
+        """
+        Notificación genérica (método explícito).
+        """
         await self._tg.notify(account_name, message)
 
 async def main():
+    """
+    Función principal de arranque del servicio trade_orchestrator.
+    - Inicializa settings, métricas, Redis, cuentas y notificador.
+    - Lanza los loops de señales y gestión de trades.
+    """
     s = Settings.load()
     # start Prometheus metrics server
     try:
@@ -103,8 +123,12 @@ async def main():
     tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None))  # attach notifier if available
 
     async def handle_signal(fields: dict):
+        """
+        Procesa una señal de trading recibida, calcula SL/TP, filtra cuentas y ejecuta la apertura o actualización de trades.
+        """
         trace_id = uuid.uuid4().hex[:8]
         orig_trace = fields.get("trace", "NO_TRACE")
+        
         if not in_windows(parse_windows(s.trading_windows)):
             log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
             await xadd(r, Streams.EVENTS, {"type": "skip", "reason": "outside_windows", "trace": trace_id})
@@ -130,18 +154,11 @@ async def main():
                 price = client.tick_price(symbol, direction)
                 # Obtener default_sl_pips desde entorno o config
                 default_sl_pips = float(os.getenv("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(os.getenv("DEFAULT_SL_PIPS", 100))
-                # Usar la función de TradeManager para convertir pips a precio
                 point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
-                if hasattr(tm, "_pips_to_price"):
-                    sl_offset = tm._pips_to_price(symbol, default_sl_pips, point)
-                else:
-                    sl_offset = default_sl_pips * point
-                if direction.upper() == "BUY":
-                    forced_sl = price - sl_offset
-                else:
-                    forced_sl = price + sl_offset
-                sl = str(round(forced_sl, 2 if symbol.upper().startswith("XAU") else 5))
-                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal (pips_to_price): {sl} (price={price}, offset={sl_offset})")
+                from .trade_utils import calcular_sl_default
+                forced_sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
+                sl = str(forced_sl)
+                log.info(f"[TRACE][SIGNAL][FAST] SL forzado en handle_signal (calcular_sl_default): {sl} (price={price}, default_sl_pips={default_sl_pips}, point={point})")
             else:
                 log.error(f"[TRACE][SIGNAL][FAST] No se pudo calcular SL forzado: no hay cuenta activa. Abortando señal.")
                 return
@@ -151,7 +168,6 @@ async def main():
             return
 
         entry_tuple = json.loads(entry_range) if entry_range else None
-
 
         # --- FAST update logic ---
         log.info(f"[TRACE][SIGNAL] SL propagado a lógica FAST/COMPLETE: {sl}")
@@ -280,7 +296,10 @@ async def main():
                 if entry_tuple:
                     entry_price = (float(entry_tuple[0]) + float(entry_tuple[1])) / 2.0
                 hint_price = float(fields.get("hint_price")) if fields.get("hint_price") else None
-                use_price = entry_price if entry_price is not None else hint_price or 0.0
+                use_price = entry_price if entry_price is not None else hint_price
+                if use_price is None or use_price == 0.0:
+                    log.error(f"[APP][ERROR] No se pudo obtener el precio de entrada para notificar trade abierto en {symbol}. Abortando notificación.")
+                    return
                 for acct_name, ticket in res.tickets_by_account.items():
                     asyncio.create_task(
                         tg_notifier.notify_trade_opened(
@@ -302,6 +321,9 @@ async def main():
             await xadd(r, Streams.EVENTS, {"type": "open_errors", "errors": json.dumps(res.errors_by_account)})
 
     async def handle_mgmt(fields: dict):
+        """
+        Procesa mensajes de gestión recibidos (ej: comandos Hannah, Torofx, etc).
+        """
         text = fields.get("text","")
         hint = fields.get("provider_hint","")
         if hint == "TOROFX":
@@ -315,6 +337,9 @@ async def main():
     REDIS_OFFSET_KEY = "signals:last_id"
 
     async def get_last_id():
+        """
+        Obtiene el último ID procesado de señales desde Redis.
+        """
         try:
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
             redis = await aioredis.from_url(redis_url, decode_responses=True)
@@ -326,6 +351,9 @@ async def main():
             return "$"
 
     async def set_last_id(last_id):
+        """
+        Guarda el último ID procesado de señales en Redis.
+        """
         try:
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
             redis = await aioredis.from_url(redis_url, decode_responses=True)
@@ -335,12 +363,18 @@ async def main():
             log.warning(f"[OFFSET] Could not set last_id in Redis: {e}")
 
     async def loop_signals():
+        """
+        Loop principal que consume señales de trading y las procesa.
+        """
         last_id = await get_last_id()
         async for msg_id, fields in xread_loop(r, Streams.SIGNALS, last_id=last_id):
             await handle_signal(fields)
             await set_last_id(msg_id)
 
     async def loop_mgmt():
+        """
+        Loop principal que consume mensajes de gestión y los procesa.
+        """
         async for _, fields in xread_loop(r, Streams.MGMT, last_id="$"):
             await handle_mgmt(fields)
 

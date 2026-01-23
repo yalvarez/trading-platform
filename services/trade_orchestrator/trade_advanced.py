@@ -1,10 +1,13 @@
+
 """
-Advanced trade management features:
-- Partial take profits
-- Breakeven automation
-- Trailing stops
-- Addon entries
-- Position scaling
+trade_advanced.py - Funciones avanzadas para la gestión de trades.
+
+Incluye:
+- Partial take profits: gestión de cierres parciales en diferentes niveles de TP.
+- Breakeven automation: automatización del movimiento de SL a BE.
+- Trailing stops: trailing dinámico del SL.
+- Addon entries: entradas adicionales en niveles definidos.
+- Position scaling: escalado de posición según beneficio.
 """
 
 import time
@@ -68,8 +71,21 @@ class PartialCloseRecord:
 
 class AdvancedTradeManager:
     """
-    Manages advanced trade features for better profit optimization.
-    Works alongside MT5Executor for position management.
+    Gestiona las funciones avanzadas de trade para optimizar beneficios.
+    Trabaja junto a MT5Executor para la gestión de posiciones.
+    Métodos principales:
+    - should_close_partial: Determina si debe hacerse un cierre parcial en un TP.
+    - calculate_close_volume: Calcula el volumen a cerrar en un parcial.
+    - should_activate_trailing: Determina si debe activarse el trailing stop.
+    - should_update_trailing: Verifica si ha pasado suficiente tiempo para actualizar el trailing.
+    - calculate_trailing_sl: Calcula el nuevo SL para trailing.
+    - should_move_to_breakeven: Determina si debe moverse el SL a BE.
+    - calculate_breakeven_price: Calcula el precio de BE con offset.
+    - suggest_addon_prices: Sugiere precios para addons entre entry y SL.
+    - calculate_addon_lot: Calcula el lotaje para addons.
+    - record_partial_close: Registra un cierre parcial.
+    - update_trailing_timestamp: Actualiza el timestamp del trailing.
+    - cleanup_ticket: Limpia datos de seguimiento de un ticket cerrado.
     """
     
     def __init__(self, settings: Optional[AdvancedTradeSettings] = None):
@@ -110,15 +126,19 @@ class AdvancedTradeManager:
         self,
         current_volume: float,
         tp_index: int,
-        total_tps: int
+        total_tps: int,
+        step: float = 0.0,
+        min_vol: float = 0.0
     ) -> float:
-        """Calculate volume to close for partial close"""
+        """
+        Calcula el volumen a cerrar en un parcial usando la función centralizada.
+        """
+        from .trade_utils import calcular_volumen_parcial
         if not self.settings.tp_partial_levels or tp_index >= len(self.settings.tp_partial_levels):
             return current_volume
-        
         level = self.settings.tp_partial_levels[tp_index]
         close_percent = level.get("close_percent", 100.0)
-        return (current_volume * close_percent) / 100.0
+        return calcular_volumen_parcial(current_volume, close_percent, step, min_vol)
     
     def should_activate_trailing(
         self,
@@ -176,15 +196,21 @@ class AdvancedTradeManager:
     def calculate_breakeven_price(
         self,
         entry_price: float,
-        direction: str
+        direction: str,
+        point: float,
+        symbol: str
     ) -> float:
-        """Calculate breakeven price with offset"""
-        offset = self.settings.breakeven_offset_pips * 0.01  # Convert to decimal
-        
-        if direction == "BUY":
-            return entry_price + offset
-        else:
-            return entry_price - offset
+        """
+        Calcula el precio de break-even (BE) usando la función centralizada.
+        """
+        from .trade_utils import calcular_be_price
+        return calcular_be_price(
+            entry_price,
+            direction,
+            self.settings.breakeven_offset_pips,
+            point,
+            symbol
+        )
     
     def suggest_addon_prices(
         self,
@@ -213,14 +239,19 @@ class AdvancedTradeManager:
         step = distance / (addon_count + 1)  # Divide into equal parts
         
         if direction == "BUY":
+            if entry_price is None:
+                log.error(f"[ADVANCED][ERROR] No se pudo obtener entry_price para addons BUY. Abortando cálculo de precios.")
+                return []
             for i in range(1, addon_count + 1):
                 price = entry_price - (step * i)
                 prices.append(price)
         else:
+            if entry_price is None:
+                log.error(f"[ADVANCED][ERROR] No se pudo obtener entry_price para addons SELL. Abortando cálculo de precios.")
+                return []
             for i in range(1, addon_count + 1):
                 price = entry_price + (step * i)
                 prices.append(price)
-        
         return prices
     
     def calculate_addon_lot(
@@ -252,10 +283,14 @@ class AdvancedTradeManager:
         log.info(f"[PARTIAL] Ticket {ticket}: Closed {closed_volume} at {close_price} (TP{tp_index+1})")
     
     def update_trailing_timestamp(self, ticket: int):
-        """Update last trailing stop update time"""
+        """
+        Actualiza el timestamp del último update de trailing stop para el ticket dado.
+        """
         self.trailing_last_update[ticket] = time.time()
     
     def cleanup_ticket(self, ticket: int):
-        """Clean up tracking data for closed ticket"""
+        """
+        Limpia los datos de seguimiento (cierres parciales y trailing) para un ticket cerrado.
+        """
         self.partial_closes.pop(ticket, None)
         self.trailing_last_update.pop(ticket, None)

@@ -10,8 +10,9 @@ from common.timewindow import parse_windows, in_windows
 import logging
 
 log = logging.getLogger("trade_orchestrator.mt5_executor")
+
 from .mt5_client import MT5Client
-from .trade_manager import TradeManager
+from .trade_utils import safe_comment, pips_to_price, calcular_lotaje
 
 @dataclass
 class MT5OpenResult:
@@ -75,7 +76,7 @@ class MT5Executor:
             return False
     def _notify_bg(self, account_name, message):
         """
-        Send a background notification using the notifier if available, otherwise log the message.
+        Envía una notificación de fondo usando el notifier si está disponible, si no, loguea el mensaje.
         """
         if hasattr(self, 'notifier') and self.notifier:
             try:
@@ -143,9 +144,10 @@ class MT5Executor:
             self._notify_bg(account["name"], f"❌ SL update falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}")
             return False
     def _safe_comment(self, tag: str) -> str:
-        base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
-        base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
-        return base[:31]
+        """
+        Wrapper para safe_comment centralizado.
+        """
+        return safe_comment(tag, getattr(self, 'comment_prefix', 'TM'))
 
     def _client_for(self, account):
         # Implementación básica: asume que la cuenta tiene un campo 'client' o que se puede construir aquí
@@ -180,11 +182,8 @@ class MT5Executor:
         stop_level = float(getattr(info, "stops_level", 0.0)) * point
         # Offset en pips
         off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
-        # Usar función centralizada de conversión
-        from .trade_manager import TradeManager
-        off_price = TradeManager._pips_to_price(symbol, off_pips, point)
-        be_sl = (entry + off_price) if is_buy else (entry - off_price)
-        be_sl = round(be_sl, 2 if symbol.upper().startswith("XAU") else 5)
+        from .trade_utils import calcular_be_price
+        be_sl = calcular_be_price(entry, "BUY" if is_buy else "SELL", off_pips, point, symbol)
         logging.info(f"[BE-DEBUG] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
         # Validar que el nuevo SL cumple con el mínimo stop level
         price_current = float(getattr(pos, "price_current", 0.0))
@@ -203,25 +202,7 @@ class MT5Executor:
             "action": 6,  # TRADE_ACTION_SLTP
             "position": int(ticket),
             "sl": float(be_sl),
-            "tp": 0.0,
-            "comment": self._safe_comment(f"BE-{reason}"),
         }
-        res = await self._best_filling_order_send(client, symbol, req)
-        log.info(f"[ORDER_SEND][DEBUG] Respuesta completa de order_send: {repr(res)}")
-        ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))  # DONE, DONE_PARTIAL
-        logging.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-        pos_list_after = client.positions_get(ticket=int(ticket))
-        sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
-        logging.info(f"[BE-DEBUG] SL después del intento: {sl_after}")
-        if ok:
-            self._notify_bg(account["name"], f"🔒 BE aplicado | Ticket: {int(ticket)} | SL: {be_sl:.5f}")
-            return True
-        else:
-            self._notify_bg(
-                account["name"],
-                f"❌ BE falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}"
-            )
-            return False
 
     def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
             """
@@ -361,17 +342,16 @@ class MT5Executor:
             # tickets y errors deben estar definidos en el scope superior
             nonlocal tickets, errors
 
-            # --- Función local para obtener SL forzado si no viene ---
+            # --- Función centralizada para obtener SL forzado si no viene ---
+            from .trade_utils import calcular_sl_default
             async def get_forced_sl(client, symbol, direction, price):
-                # Lógica simple: usar SL por defecto de XAUUSD si aplica
-                if symbol.upper().startswith('XAU'):
-                    # Buscar en .env/config, aquí hardcodeado como ejemplo
-                    default_sl = getattr(self, 'default_sl_xauusd', 300)
-                    if direction.upper() == 'BUY':
-                        return price - default_sl * getattr(client.symbol_info(symbol), 'point', 0.1)
-                    else:
-                        return price + default_sl * getattr(client.symbol_info(symbol), 'point', 0.1)
-                return price  # fallback
+                # Usar la función centralizada para calcular el SL por defecto
+                point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
+                info = client.symbol_info(symbol)
+                if info and hasattr(info, 'point'):
+                    point = float(getattr(info, 'point', point))
+                default_sl = getattr(self, 'default_sl_xauusd', 300) if symbol.upper().startswith('XAU') else getattr(self, 'default_sl', 100)
+                return calcular_sl_default(symbol, direction, price, point, default_sl)
             name = account["name"]
             try:
                 client = self._client_for(account)
@@ -430,8 +410,8 @@ class MT5Executor:
                             return
                 else:
                     price = client.tick_price(symbol, direction)
-                    if price == 0.0:
-                        log.warning(f"[PRICE] Price is 0.0 for {symbol} ({name}) - symbol may not be available, not selected, or market is closed.")
+                    if price is None or price == 0.0:
+                        log.error(f"[PRICE][ERROR] No se pudo obtener el precio actual de {symbol} ({name}) para la entrada. Abortando operación.")
                         return
                 order_type = 0 if direction == "BUY" else 1
 
@@ -484,10 +464,10 @@ class MT5Executor:
                     planned_sl_val = None
 
                 # --- LOTE DINÁMICO O FIJO ---
-                lot = 0.01
                 fixed_lot = float(account.get("fixed_lot", 0))
                 risk_percent = float(account.get("risk_percent", 0))
                 balance = 0.0
+                lot = 0.01
                 if fixed_lot > 0:
                     lot = fixed_lot
                 elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
@@ -511,15 +491,8 @@ class MT5Executor:
                         tick_size = 0.0
                         lot_step = 0.01
                         min_lot = 0.03
-                    log.info(f"[LOTE][{name}] balance={balance} risk_money={risk_money} sl_distance={sl_distance} tick_value={tick_value} tick_size={tick_size} lot_step={lot_step} min_lot={min_lot}")
-                    if tick_value > 0 and tick_size > 0 and sl_distance > 0:
-                        lot = risk_money / (sl_distance * (tick_value / tick_size))
-                        lot = max(min_lot, round(lot / lot_step) * lot_step)
-                        log.info(f"[LOTE][{name}] lotaje calculado={lot}")
-                    else:
-                        log.warning(f"[LOTE] No se pudo calcular lotaje dinámico para {name}, usando 0.03")
-                        lot = 0.03
-                # --- FIN LOTE ---
+                    lot = calcular_lotaje(balance, risk_money, sl_distance, tick_value, tick_size, lot_step, min_lot, fixed_lot)
+                    log.info(f"[LOTE][{name}] lotaje calculado={lot}")
 
                 log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
                 log.info(f"[ORDER_PREP][SL-DEBUG] forced_sl={forced_sl} planned_sl_val={planned_sl_val}")

@@ -1,5 +1,8 @@
 # ...existing code...
 
+from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
+from services.trade_orchestrator.mt5_executor import MT5Executor
+
 class TradeManager:
     # ...existing code...
     def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
@@ -106,79 +109,35 @@ class ManagedTrade:
 class TradeManager:
 
     @staticmethod
-    def _pips_to_price(symbol: str, pips: float, point: float) -> float:
-        """
-        Convierte pips a precio para cualquier símbolo.
-        Para XAUUSD (o símbolos que empiezan con XAU), 1 pip = 0.1 dólares.
-        Para otros, usa el point del símbolo.
-        """
-        if symbol.upper().startswith("XAU"):
-            return round(pips * 0.1, 2)
-        return round(pips * point, 5)
+    # pips_to_price y safe_comment ahora están en trade_utils.py
+    def _pips_to_price(self, symbol: str, pips: float, point: float) -> float:
+        return pips_to_price(symbol, pips, point)
+
     def _safe_comment(self, tag: str) -> str:
-        base = f"{getattr(self, 'comment_prefix', 'TM')}-{tag}"
-        base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
-        return base[:31]
+        return safe_comment(tag, getattr(self, 'comment_prefix', 'TM'))
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
         """
         Registra un trade en el manager. Si no hay SL válido, calcula uno por fallback y lo asigna.
         """
-        import os
-        from .mt5_client import MT5Client
-        default_sl_pips = getattr(self, 'default_sl', None)
-        symbol_upper = symbol.upper() if symbol else ""
-        env_override = None
-        if symbol_upper == "XAUUSD":
-            env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
-        if env_override is not None:
-            try:
-                default_sl_pips = float(env_override)
-            except Exception:
-                pass
 
-        # Si planned_sl es None o 0.0, calcularlo igual que en mt5_executor.py
+        # Si planned_sl es None o 0.0, lanzar un warning y no registrar el trade
         if planned_sl is None or planned_sl == 0.0:
-            log.warning(f"[TM][PATCH] planned_sl era None o 0.0, se calculará por fallback para registro. ticket={ticket} symbol={symbol} provider={provider_tag}")
-            # Fallback: para XAUUSD usar default_sl_pips * point, para otros usar price o 1.0
-            try:
-                client = getattr(self, 'mt5', None)
-                if client is not None:
-                    point = 0.1 if symbol_upper.startswith('XAU') else 1.0
-                    try:
-                        info = client._client_for({'name': account_name}).symbol_info(symbol)
-                        if info and hasattr(info, 'point'):
-                            point = float(getattr(info, 'point', 0.1 if symbol_upper.startswith('XAU') else 1.0))
-                    except Exception:
-                        pass
-                    if symbol_upper.startswith('XAU') and default_sl_pips:
-                        # Para BUY, restar; para SELL, sumar
-                        # No tenemos el precio aquí, así que solo aproximamos
-                        planned_sl = 1800.0 - default_sl_pips * point if direction.upper() == 'BUY' else 1800.0 + default_sl_pips * point
-                    else:
-                        planned_sl = 1.0
-                else:
-                    planned_sl = 1.0
-            except Exception as e:
-                log.error(f"[TM][PATCH] Error calculando planned_sl fallback: {e}")
-                planned_sl = 1.0
-
-        if planned_sl is None or planned_sl == 0.0:
-            log.debug(f"[TM][DEBUG] Registro de trade ignorado por SL inválido incluso tras fallback. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
+            log.error(f"[TM][ERROR] planned_sl debe ser el SL real usado en MT5. Registro ignorado. ticket={ticket} symbol={symbol} provider={provider_tag} planned_sl={planned_sl}")
             return
 
-        gid = int(group_id) if group_id is not None else int(ticket)
+        groupId = int(group_id) if group_id is not None else int(ticket)
         self.trades[int(ticket)] = ManagedTrade(
             account_name=account_name,
             ticket=int(ticket),
             symbol=symbol,
             direction=direction,
             provider_tag=provider_tag,
-            group_id=gid,
+            group_id=groupId,
             tps=list(tps or []),
             planned_sl=float(planned_sl),
         )
-        self.group_addon_count.setdefault((account_name, gid), 0)
-        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, gid, provider_tag, tps, planned_sl)
+        self.group_addon_count.setdefault((account_name, groupId), 0)
+        log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, groupId, provider_tag, tps, planned_sl)
         try:
             TRADES_OPENED.inc()
             ACTIVE_TRADES.set(len(self.trades))
@@ -207,25 +166,18 @@ class TradeManager:
         if v <= 0 or step <= 0 or vmin <= 0:
             return desired_percent
 
-        raw_close = v * (float(desired_percent) / 100.0)
-        # Ajustar al múltiplo inferior de step
-        close_vol = step * int(raw_close / step)
-
+        close_vol = calcular_volumen_parcial(v, desired_percent, step, vmin)
         if close_vol < vmin or close_vol <= 0:
             return 100
-
         remaining = v - close_vol
-        # Si el restante es menor al mínimo, cerrar todo
         if remaining > 0 and remaining < vmin:
             return 100
-
-        # Calcular el porcentaje real que se puede cerrar
         pct_real = int((close_vol / v) * 100) if v > 0 else desired_percent
         return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
         # Configuración de trailing tras el tercer tramo
-        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 20.0)
+        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
         if not hasattr(t, 'trailing_active_last_tramo'):
             t.trailing_active_last_tramo = False
         if not hasattr(t, 'trailing_peak_last_tramo'):
@@ -276,7 +228,6 @@ class TradeManager:
             }
             log.info(f"[TOROFX-SCALING] Enviando cierre parcial tramo {tramo} | req={req}")
             # Use robust filling logic from mt5_executor
-            from services.trade_orchestrator.mt5_executor import MT5Executor
             mt5_executor = MT5Executor(self.mt5)
             res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
             log.info(f"[TOROFX-SCALING] Resultado cierre parcial tramo {tramo} | res={res}")
@@ -347,7 +298,7 @@ class TradeManager:
             if (is_buy and current > peak) or (not is_buy and current < peak):
                 t.trailing_peak_last_tramo = float(current)
                 peak = float(current)
-            retroceso = (peak - current) / point if is_buy else (current - peak) / point
+            retroceso = calcular_trailing_retroceso(peak, current, point, is_buy)
             if retroceso >= trailing_pips_last_tramo:
                 # Cerrar el trade por completo
                 v = float(getattr(pos, 'volume', 0.0))
@@ -369,7 +320,6 @@ class TradeManager:
                         "comment": "TrailingClose"
                     }
                     log.info(f"[TOROFX-SCALING] Trailing: cerrando trade por retroceso de {trailing_pips_last_tramo} pips | req={req}")
-                    from services.trade_orchestrator.mt5_executor import MT5Executor
                     mt5_executor = MT5Executor(self.mt5)
                     res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
                     log.info(f"[TOROFX-SCALING] Resultado cierre trailing último tramo | res={res}")
@@ -414,12 +364,12 @@ class TradeManager:
         magic: int = 987654,
         loop_sleep_sec: float = 1.0,
 
-        scalp_tp1_percent: int = 60,
-        scalp_tp2_percent: int = 100,
+        scalp_tp1_percent: int = 50,
+        scalp_tp2_percent: int = 80,
 
         long_tp1_percent: int = 50,
-        long_tp2_percent: int = 50,
-        runner_retrace_pips: float = 10,
+        long_tp2_percent: int = 80,
+        runner_retrace_pips: float = 20,
         buffer_pips: float = 2.0,
 
         enable_be_after_tp1: bool = True,
@@ -428,7 +378,7 @@ class TradeManager:
         enable_trailing: bool = True,
         trailing_activation_after_tp2: bool = True,
         trailing_activation_pips: float = 30.0,
-        trailing_stop_pips: float = 15.0,
+        trailing_stop_pips: float = 20.0,
 
         trailing_min_change_pips: float = 1.0,
         trailing_cooldown_sec: float = 2.0,
@@ -444,7 +394,7 @@ class TradeManager:
 
         # ✅ TOROFX management defaults
         torofx_partial_default_percent: int = 30,  # “tomar parcial…” sin %
-        torofx_partial_min_pips: float = 50.0,     # “+50/60” -> usa 50 por defecto
+        torofx_partial_min_pips: float = 30.0,     # “+50/60” -> usa 50 por defecto
         torofx_close_entry_tolerance_pips: float = 10.0,  # para “cierro mi entrada 4330”
         torofx_provider_tag_match: str = "TOROFX",  # substring en provider_tag
 
@@ -548,41 +498,40 @@ class TradeManager:
         t = self.trades.get(int(ticket))
         if not t:
             return
-        # Si planned_sl es None o 0.0, calcularlo igual que en register_trade
+        # Si planned_sl es None o 0.0, intentar obtener el precio real; si no es posible, abortar el cálculo
         if planned_sl is None or planned_sl == 0.0:
-            log.warning(f"[TM][PATCH] planned_sl era None o 0.0 en update, se calculará por fallback. ticket={ticket}")
+            symbol = getattr(t, 'symbol', None)
+            direction = getattr(t, 'direction', 'BUY')
+            account_name = getattr(t, 'account_name', None)
+            symbol_upper = symbol.upper() if symbol else ""
+            default_sl_pips = getattr(self, 'default_sl', None)
+            env_override = None
+            if symbol_upper == "XAUUSD":
+                env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
+            if env_override is not None:
+                try:
+                    default_sl_pips = float(env_override)
+                except Exception:
+                    pass
+            client = getattr(self, 'mt5', None)
+            price = None
+            point = 0.1 if symbol_upper.startswith('XAU') else 0.00001
+            if client is not None:
+                try:
+                    info = client._client_for({'name': account_name}).symbol_info(symbol)
+                    if info and hasattr(info, 'point'):
+                        point = float(getattr(info, 'point', point))
+                    price = float(getattr(info, 'bid', None))
+                except Exception:
+                    pass
+            if price is None:
+                log.error(f"[TM][ERROR] No se pudo obtener el precio actual de {symbol} para calcular el SL por defecto. Abortando update_trade_signal. ticket={ticket}")
+                return
             try:
-                symbol = getattr(t, 'symbol', None)
-                direction = getattr(t, 'direction', 'BUY')
-                account_name = getattr(t, 'account_name', None)
-                symbol_upper = symbol.upper() if symbol else ""
-                default_sl_pips = getattr(self, 'default_sl', None)
-                env_override = None
-                if symbol_upper == "XAUUSD":
-                    env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
-                if env_override is not None:
-                    try:
-                        default_sl_pips = float(env_override)
-                    except Exception:
-                        pass
-                client = getattr(self, 'mt5', None)
-                if client is not None:
-                    point = 0.1 if symbol_upper.startswith('XAU') else 1.0
-                    try:
-                        info = client._client_for({'name': account_name}).symbol_info(symbol)
-                        if info and hasattr(info, 'point'):
-                            point = float(getattr(info, 'point', 0.1 if symbol_upper.startswith('XAU') else 1.0))
-                    except Exception:
-                        pass
-                    if symbol_upper.startswith('XAU') and default_sl_pips:
-                        planned_sl = 1800.0 - default_sl_pips * point if direction.upper() == 'BUY' else 1800.0 + default_sl_pips * point
-                    else:
-                        planned_sl = 1.0
-                else:
-                    planned_sl = 1.0
+                planned_sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
             except Exception as e:
-                log.error(f"[TM][PATCH] Error calculando planned_sl fallback en update: {e}")
-                planned_sl = 1.0
+                log.error(f"[TM][PATCH] Error calculando planned_sl centralizado en update: {e}")
+                return
         t.tps = list(tps or [])
         t.planned_sl = float(planned_sl) if planned_sl is not None else None
         if provider_tag:
@@ -615,13 +564,13 @@ class TradeManager:
         while True:
             accounts = [a for a in self.mt5.accounts if a.get("active")]
             await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
-            tick_count += 1
-            if tick_count % 60 == 0:
-                if tick_count % 600 == 0:
-                    log.info(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
-                else:
-                    log.debug(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
-            await asyncio.sleep(self.loop_sleep_sec)
+            # tick_count += 1
+            # if tick_count % 60 == 0:
+            #     if tick_count % 600 == 0:
+            #         log.info(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
+            #     else:
+            #         log.debug(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
+            # await asyncio.sleep(self.loop_sleep_sec)
 
     async def _tick_once_account(self, account):
         """
@@ -683,22 +632,9 @@ class TradeManager:
                 if t.initial_volume is None:
                     t.initial_volume = float(pos.volume)
 
-                # 1) Gestión de Take Profits
-                await self._maybe_take_profits(account, pos, point, is_buy, current, t)
-
-                # 1b) Scaling out para trades sin TP (solo si no tiene TP)
-                await self._maybe_scaling_out_no_tp(account, pos, point, is_buy, current, t)
-
-                # 2) Addon midpoint (añadir posición si corresponde)
-                if self.enable_addon:
-                    await self._maybe_addon_midpoint(account, pos, point, is_buy, current, t)
-
-                # 3) Trailing Stop
-                if self.enable_trailing:
-                    await self._maybe_trailing(account, pos, point, is_buy, current, t)
-
-                # Llamada a la gestión según modalidad
-                await self.gestionar_trade(t, account)
+                # Llamada a la gestión según modalidad, ahora con contexto completo
+                await self.gestionar_trade(t, account, pos=pos, point=point, is_buy=is_buy, current=current)
+        
         except Exception as e:
             # Supresión de errores de conexión repetidos
             if hasattr(self, '_last_conn_error') and self._last_conn_error == str(e):
@@ -1077,27 +1013,23 @@ class TradeManager:
         buffer_price = self.buffer_pips * point
         if not t.tps:
             return
-        long_mode = self._is_long_mode(t)
-
-        if long_mode:
-            if t.mfe_peak_price is None:
+        # --- Runner y TP logic ---
+        # Guardar el precio máximo alcanzado
+        if t.mfe_peak_price is None:
+            t.mfe_peak_price = current
+        else:
+            if is_buy and current > t.mfe_peak_price:
                 t.mfe_peak_price = current
-            else:
-                if is_buy and current > t.mfe_peak_price:
-                    t.mfe_peak_price = current
-                if (not is_buy) and current < t.mfe_peak_price:
-                    t.mfe_peak_price = current
+            if (not is_buy) and current < t.mfe_peak_price:
+                t.mfe_peak_price = current
 
-        # TP1, TP2, TP3+ (dinámico)
         tp_percents = [
-            self.long_tp1_percent if long_mode else self.scalp_tp1_percent,
-            self.long_tp2_percent if long_mode else self.scalp_tp2_percent,
+            self.long_tp1_percent if self._is_long_mode(t) else self.scalp_tp1_percent,
+            self.long_tp2_percent if self._is_long_mode(t) else self.scalp_tp2_percent,
         ]
-        # Si hay más de 2 TPs, los siguientes usan el 100% restante
         for idx, tp in enumerate(t.tps):
             tp_idx = idx + 1
             if tp_idx not in t.tp_hit and self._tp_hit(is_buy, current, float(tp), buffer_price):
-                # LOG DETALLADO: Precios y trigger
                 log.info(f"[TP-DEBUG] Evaluando TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} precio_objetivo={float(tp):.5f} precio_actual={current:.5f} buffer={buffer_price:.5f}")
                 if idx < len(tp_percents):
                     pct = tp_percents[idx]
@@ -1115,7 +1047,6 @@ class TradeManager:
                     current_price=current,
                 )
                 log.info(f"[DEBUG] Calling _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
-                # LOG DETALLADO: Precio de ejecución real tras cierre parcial
                 await self._do_partial_close(account, pos.ticket, pct_eff, reason=f"TP{tp_idx} (objetivo={float(tp):.5f} actual={current:.5f})")
                 log.info(f"[DEBUG] Finished _do_partial_close for TP{tp_idx} | account={account['name']} ticket={int(pos.ticket)} pct={pct_eff}")
                 t.tp_hit.add(tp_idx)
@@ -1124,25 +1055,21 @@ class TradeManager:
                     log.info(f"[BE-DEBUG] Intentando aplicar BE | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} entry={t.entry_price} tp1={float(tp)}")
                     await self._do_be(account, pos.ticket, point, is_buy)
                     log.info(f"[BE-DEBUG] BE ejecutado | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol}")
-                # Runner solo tras TP2
-                if tp_idx == 2 and long_mode:
+                # Runner solo tras TP2 (ahora para cualquier trade con al menos 2 TPs)
+                if tp_idx == 2:
                     t.runner_enabled = True
-                # Trailing post TP3+
-                if tp_idx >= 3:
-                    t.runner_enabled = True  # Forzar trailing
                 try:
                     TP_HITS.labels(tp=f"tp{tp_idx}").inc()
                 except Exception:
                     pass
-                # Solo procesar un TP por tick
                 return
 
         # Robustecer: Si TP2 ya está en tp_hit y la variable de activación está activa, runner_enabled debe estar activo
         if self.trailing_activation_after_tp2 and (2 in t.tp_hit):
             t.runner_enabled = True
 
-        # Runner retrace
-        if long_mode and t.runner_enabled and t.mfe_peak_price is not None:
+        # Runner retrace (ahora para cualquier trade con runner_enabled)
+        if t.runner_enabled and t.mfe_peak_price is not None:
             retrace_price = self.runner_retrace_pips * point
             if is_buy and (t.mfe_peak_price - current) >= retrace_price:
                 log.info(f"[AUDIT] RUNNER retrace close | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} mfe_peak={t.mfe_peak_price:.5f} current={current:.5f}")
@@ -1562,6 +1489,11 @@ class TradeManager:
     async def gestionar_trade(self, trade, cuenta):
         """
         Decide y delega la gestión del trade según la modalidad configurada en la cuenta.
+        Llama a la función de gestión correspondiente:
+        - general: gestión clásica (TP, runner, trailing, BE, etc.)
+        - be_pips: mueve SL a BE al alcanzar X pips, luego gestión normal
+        - be_pnl: tras parcial y X pips, mueve SL para proteger ganancia, luego gestión normal
+        Si el modo es desconocido, usa la gestión general.
         """
         modo = cuenta.get("trading_mode", TradingMode.GENERAL.value)
         if modo == TradingMode.GENERAL.value:
@@ -1577,6 +1509,8 @@ class TradeManager:
     async def gestionar_trade_general(self, trade, cuenta):
         """
         Lógica de gestión clásica: TP, runner, trailing, BE, etc. usando funciones comunes.
+        - Ejecuta toma de ganancias parciales y trailing stop si está habilitado.
+        - Usa helpers centralizados para cálculos de precios y pips.
         """
         client = self.mt5._client_for(cuenta)
         pos_list = client.positions_get(ticket=int(trade.ticket))
@@ -1598,11 +1532,19 @@ class TradeManager:
 
     async def gestionar_trade_be_pips(self, trade, cuenta):
         """
-        Lógica: al alcanzar X pips, mover SL a BE, luego gestión normal (TP, runner, trailing).
+        Lógica: al alcanzar X pips, cerrar 30% del trade, mover SL a BE, luego gestión normal (TP, runner, trailing).
+        - Si el recorrido en pips >= be_pips y no se ha aplicado BE, cierra 30% y mueve SL a BE.
+        - Luego ejecuta la gestión general.
         """
-        be_pips = cuenta.get("be_pips", 35)
+        be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
         if recorrido >= be_pips and not getattr(trade, "be_applied", False):
+            # Cierre parcial 30%
+            client = self.mt5._client_for(cuenta)
+            pos_list = client.positions_get(ticket=int(trade.ticket))
+            if pos_list:
+                await self._do_partial_close(cuenta, trade.ticket, 30, reason=f"BE_PIPS {be_pips}pips")
+            # Mover SL a BE
             self._move_sl_to_be(trade, cuenta)
             trade.be_applied = True
         # Reutilizar funciones comunes
@@ -1610,12 +1552,24 @@ class TradeManager:
 
     async def gestionar_trade_be_pnl(self, trade, cuenta):
         """
-        Lógica: al alcanzar X pips y tras parcial, poner SL en precio que permita perder solo lo ganado en la parcial, luego gestión normal.
+        Lógica: al alcanzar X pips, cerrar 30% del trade, calcular SL en base al monto ganado en esa parcial, mover el SL, luego gestión normal.
+        - Si el recorrido en pips >= be_pips y no se ha aplicado SL PnL, cierra 30%, calcula y mueve el SL.
+        - Luego ejecuta la gestión general.
         """
-        be_pips = cuenta.get("be_pips", 35)
+        be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
-        if recorrido >= be_pips and getattr(trade, "parcial_ganada", False) and not getattr(trade, "sl_pnl_applied", False):
-            pnl_ganado = getattr(trade, "pnl_parcial", 0.0)
+        if recorrido >= be_pips and not getattr(trade, "sl_pnl_applied", False):
+            # Cierre parcial 30%
+            client = self.mt5._client_for(cuenta)
+            pos_list = client.positions_get(ticket=int(trade.ticket))
+            pnl_ganado = 0.0
+            if pos_list:
+                await self._do_partial_close(cuenta, trade.ticket, 30, reason=f"BE_PNL {be_pips}pips")
+                # Intentar obtener el PnL de la parcial recién cerrada
+                pos = pos_list[0]
+                if hasattr(pos, "profit"):
+                    pnl_ganado = float(getattr(pos, "profit", 0.0)) * 0.3  # Aproximación: 30% del profit actual
+            # Calcular y mover SL en base al PnL ganado
             sl_price = self._calcular_sl_por_pnl(trade, cuenta, pnl_ganado)
             self._move_sl(trade, cuenta, sl_price)
             trade.sl_pnl_applied = True
@@ -1624,12 +1578,18 @@ class TradeManager:
 
     # Métodos auxiliares (esqueleto)
     def _get_current_price(self, symbol, cuenta):
+        """
+        Obtiene el precio actual (bid) del símbolo para la cuenta dada.
+        """
         client = self.mt5._client_for(cuenta)
         tick = client.symbol_info_tick(symbol)
         return getattr(tick, "bid", None) if tick else None
 
     def _close_partial_and_be(self, trade, cuenta, tp1):
-        # Cerrar parcial (50%) y mover SL a BE
+        """
+        Realiza cierre parcial (50%) y mueve el SL a BE para el trade dado.
+        Llama a early_partial_close y luego a la lógica de BE.
+        """
         client = self.mt5._client_for(cuenta)
         ticket = trade.ticket
         # Cierre parcial
@@ -1639,6 +1599,9 @@ class TradeManager:
         pass
 
     def _get_recorrido_pips(self, trade, cuenta):
+        """
+        Calcula el recorrido en pips desde la entrada hasta el precio actual para el trade dado.
+        """
         client = self.mt5._client_for(cuenta)
         pos_list = client.positions_get(ticket=int(trade.ticket))
         if not pos_list:
@@ -1654,6 +1617,9 @@ class TradeManager:
         return round(recorrido, 1)
 
     def _move_sl_to_be(self, trade, cuenta):
+        """
+        Mueve el SL del trade al precio de entrada (break-even).
+        """
         client = self.mt5._client_for(cuenta)
         pos_list = client.positions_get(ticket=int(trade.ticket))
         if not pos_list:
@@ -1664,7 +1630,10 @@ class TradeManager:
         asyncio.create_task(self.mt5.modify_sl(cuenta, trade.ticket, entry, reason="BE-auto", provider_tag=trade.provider_tag))
 
     def _calcular_sl_por_pnl(self, trade, cuenta, pnl_ganado):
-        # Calcular el precio de SL que permita perder solo lo ganado
+        """
+        Calcula el precio de SL que permite perder solo lo ganado en una parcial para el trade dado.
+        Utiliza la función auxiliar centralizada.
+        """
         client = self.mt5._client_for(cuenta)
         pos_list = client.positions_get(ticket=int(trade.ticket))
         if not pos_list:
@@ -1672,24 +1641,14 @@ class TradeManager:
         pos = pos_list[0]
         entry = float(getattr(pos, "price_open", 0.0))
         volume = float(getattr(pos, "volume", 0.01))
-        # Calcular distancia en pips equivalente a pnl_ganado
-        # Suponiendo 1 pip = valor_pip (depende del símbolo y lotaje)
-        valor_pip = self._valor_pip(trade.symbol, volume, cuenta)
-        pips_equivalentes = abs(pnl_ganado / valor_pip) if valor_pip else 0
         point = float(getattr(client.symbol_info(trade.symbol), "point", 0.00001))
-        if trade.direction.upper() == "BUY":
-            sl_price = entry + (pips_equivalentes * point)
-        else:
-            sl_price = entry - (pips_equivalentes * point)
-        return round(sl_price, 5)
+        return calcular_sl_por_pnl(entry, trade.direction, pnl_ganado, volume, point, trade.symbol)
 
     def _valor_pip(self, symbol, volume, cuenta):
-        # Estimar el valor de un pip para el símbolo y volumen
-        # Ejemplo para XAUUSD y FX
-        if symbol.upper().startswith("XAU"):
-            return 1.0 * volume  # 1 pip = $1 por lote en oro
-        else:
-            return 0.1 * volume  # Ejemplo para FX, ajustar según broker
+        """
+        Wrapper para la función auxiliar valor_pip.
+        """
+        return valor_pip(symbol, volume)
 
     def _move_sl(self, trade, cuenta, sl_price):
         client = self.mt5._client_for(cuenta)

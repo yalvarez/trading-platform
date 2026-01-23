@@ -4,8 +4,8 @@ from mt5linux import MetaTrader5
 class MT5Client:
     def get_pip_size(self, symbol: str) -> float:
         """
-        Returns the pip size for a given symbol using symbol_info.
-        Tries pip_size, then tick_size, then point as fallback.
+        Devuelve el tamaño de pip para un símbolo usando symbol_info.
+        Intenta pip_size, luego tick_size, luego point como fallback.
         """
         info = self.symbol_info(symbol)
         if not info:
@@ -66,6 +66,9 @@ class MT5Client:
             close_vol = volume
         order_type = 1 if getattr(pos, 'type', 0) == 0 else 0  # 0=buy, 1=sell
         price = self.tick_price(symbol, 'SELL' if order_type == 1 else 'BUY')
+        if price is None or price == 0.0:
+            print(f"[MT5Client][ERROR] No se pudo obtener el precio actual de {symbol} para cierre parcial. Abortando operación.")
+            return False
         # Probar todos los filling modes
         for type_filling in [1, 3, 2]:  # IOC, FOK, RETURN
             req = {
@@ -95,23 +98,41 @@ class MT5Client:
         return False
 
     def __init__(self, host: str, port: int):
+        """
+        Inicializa el cliente MT5 con host y puerto dados.
+        """
         self.mt5 = MetaTrader5(host=host, port=port)
         self.mt5.initialize()
 
     def tick_price(self, symbol: str, direction: str) -> float:
+        """
+        Devuelve el precio actual (ask para BUY, bid para SELL) del símbolo.
+        """
         t = self.mt5.symbol_info_tick(symbol)
         if not t:
             return 0.0
         return float(t.ask if direction == "BUY" else t.bid)
 
     def positions_get(self, *args, **kwargs):
+        """
+        Devuelve las posiciones abiertas según los argumentos dados.
+        """
         return self.mt5.positions_get(*args, **kwargs)
 
     def order_send(self, req: dict):
+        """
+        Envía una orden a MT5 usando el diccionario de parámetros req.
+        """
         return self.mt5.order_send(req)
 
     def symbol_info(self, symbol: str):
+        """
+        Devuelve la información del símbolo desde MT5.
+        """
         return self.mt5.symbol_info(symbol)
 
     def symbol_select(self, symbol: str, enable: bool = True):
+        """
+        Selecciona o deselecciona un símbolo en MT5.
+        """
         return self.mt5.symbol_select(symbol, enable)
