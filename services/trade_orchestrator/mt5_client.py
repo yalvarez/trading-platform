@@ -70,6 +70,8 @@ class MT5Client:
             print(f"[MT5Client][ERROR] No se pudo obtener el precio actual de {symbol} para cierre parcial. Abortando operación.")
             return False
         # Probar todos los filling modes
+        import logging
+        log = logging.getLogger("trade_orchestrator.mt5_client")
         for type_filling in [1, 3, 2]:  # IOC, FOK, RETURN
             req = {
                 "action": 1,  # TRADE_ACTION_DEAL
@@ -85,16 +87,19 @@ class MT5Client:
                 "type_filling": type_filling,
             }
             res = self.mt5.order_send(req)
-            print(f"[MT5Client] partial_close req: {req}")
-            print(f"[MT5Client] partial_close res: {res}")
+            log.critical(f"[MT5Client][CRITICAL] partial_close req: {req}")
+            log.critical(f"[MT5Client][CRITICAL] partial_close res: {res}")
+            # Consultar el estado de la posición después del intento
+            pos_list = self.mt5.positions_get(ticket=ticket)
+            log.critical(f"[MT5Client][CRITICAL] positions_get after partial_close: {pos_list}")
             if not res:
-                print(f"[MT5Client] No se recibió respuesta de order_send para ticket {ticket}")
+                log.critical(f"[MT5Client][CRITICAL] No se recibió respuesta de order_send para ticket {ticket}")
                 continue
             retcode = getattr(res, 'retcode', None)
             if retcode == 10009:
                 return True
             else:
-                print(f"[MT5Client] Retcode inesperado: {retcode}, mensaje: {getattr(res, 'comment', '')}")
+                log.critical(f"[MT5Client][CRITICAL] Retcode inesperado: {retcode}, mensaje: {getattr(res, 'comment', '')}")
         return False
 
     def __init__(self, host: str, port: int):
