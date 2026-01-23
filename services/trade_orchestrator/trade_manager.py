@@ -1,7 +1,7 @@
 # ...existing code...
 
 from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
-from services.trade_orchestrator.mt5_executor import MT5Executor
+from .mt5_executor import MT5Executor
 
 class TradeManager:
     # ...existing code...
