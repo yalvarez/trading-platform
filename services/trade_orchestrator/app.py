@@ -21,6 +21,7 @@ else:
 import importlib.util
 
 from common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
+from .notifications.telegram import TelegramNotifierAdapter
 from prometheus_client import start_http_server
 
 
@@ -88,27 +89,15 @@ async def main():
     r = await redis_client(s.redis_url)
     accounts = s.accounts()
 
-    # Initialize Telegram-based notifier (if configured)
+    # Inicialización centralizada del notificador Telegram
     notifier_adapter = None
     if s.enable_notifications:
-        chat_list = os.getenv("TG_NOTIFY_TARGET") or os.getenv("TG_SOURCE_CHATS") or ""
-        first_chat = None
-        if chat_list:
-            try:
-                first_chat = int(chat_list.split(",")[0].strip())
-            except Exception:
-                first_chat = None
-
-        notify_configs = []
-        for a in accounts:
-            notify_configs.append(NotificationConfig(account_name=a.get("name"), chat_id=first_chat))
-
         try:
             tg_notifier = RemoteTelegramNotifier(os.getenv("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
-            notifier_adapter = NotifierAdapter(tg_notifier)
-            log.info("RemoteTelegramNotifier initialized")
+            notifier_adapter = TelegramNotifierAdapter(tg_notifier)
+            log.info("TelegramNotifierAdapter initialized")
         except Exception as e:
-            log.error(f"Failed to initialize RemoteTelegramNotifier: {e}")
+            log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
 
     execu = MT5Executor(
         accounts,

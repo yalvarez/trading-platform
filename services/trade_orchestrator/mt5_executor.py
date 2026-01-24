@@ -13,6 +13,7 @@ log = logging.getLogger("trade_orchestrator.mt5_executor")
 
 from .mt5_client import MT5Client
 from .trade_utils import safe_comment, pips_to_price, calcular_lotaje
+from .notifications.telegram import TelegramNotifierAdapter
 
 @dataclass
 class MT5OpenResult:
@@ -75,20 +76,9 @@ class MT5Executor:
             self._notify_bg(account["name"], f"⚠️ early_partial_close: {percent*100:.0f}% cerrado pero SL no pudo moverse a BE | Ticket: {int(ticket)}")
             return False
     def _notify_bg(self, account_name, message):
-        """
-        Envía una notificación de fondo usando el notifier si está disponible, si no, loguea el mensaje.
-        """
-        if hasattr(self, 'notifier') and self.notifier:
-            try:
-                import asyncio
-                if asyncio.iscoroutinefunction(self.notifier):
-                    asyncio.create_task(self.notifier(account_name, message))
-                else:
-                    self.notifier(account_name, message)
-            except Exception as e:
-                log.error(f"[NOTIFY_BG] Error sending notification: {e}")
-        else:
-            log.info(f"[NOTIFY_BG][{account_name}] {message}")
+        notifier = TelegramNotifierAdapter(self.notifier)
+        import asyncio
+        asyncio.create_task(notifier.notify(account_name, message))
 
     async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None) -> bool:
         """

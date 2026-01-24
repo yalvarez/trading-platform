@@ -2,6 +2,7 @@
 
 from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
 from .mt5_executor import MT5Executor
+from .notifications.telegram import TelegramNotifierAdapter
 
 class TradeManager:
     # ...existing code...
@@ -459,39 +460,14 @@ class TradeManager:
     # Notifier
     # ----------------------------
     def _notify_bg(self, account_name: str, message: str):
-        # Notificaciones a Telegram deshabilitadas temporalmente
-        return
+        # Centraliza notificaciones Telegram
+        notifier = TelegramNotifierAdapter(self.notifier)
+        import asyncio
+        asyncio.create_task(notifier.notify(account_name, message))
 
     async def notify_trade_event(self, event: str, **kwargs):
-        """
-        Notifica al chat_id de la cuenta el evento relevante del trade.
-        event: 'opened', 'tp', 'sl', 'be', 'trailing', 'partial', 'addon', 'close', etc.
-        kwargs: datos relevantes del evento
-        """
-        if not self.notifier:
-            return
-        account_name = kwargs.get('account_name')
-        msg = None
-        if event == 'opened':
-            msg = f"🎯 TRADE OPENED | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} {kwargs.get('direction')} | Entry: {kwargs.get('entry_price')} | SL: {kwargs.get('sl_price')} | TP: {kwargs.get('tp_prices')} | Lote: {kwargs.get('lot')} | Provider: {kwargs.get('provider')}"
-        elif event == 'tp':
-            msg = f"🎯 TP HIT | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | TP{kwargs.get('tp_index')}: {kwargs.get('tp_price')} | Precio actual: {kwargs.get('current_price')}"
-        elif event == 'partial':
-            msg = f"🎯 Partial Close | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | {kwargs.get('close_percent')}% | Motivo: {kwargs.get('reason')}"
-        elif event == 'sl':
-            msg = f"❌ SL HIT | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | SL: {kwargs.get('sl_price')} | Close: {kwargs.get('close_price')}"
-        elif event == 'be':
-            msg = kwargs.get('message')
-        elif event == 'trailing':
-            msg = kwargs.get('message')
-        elif event == 'addon':
-            msg = f"➕ Addon | Cuenta: {account_name} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | Precio: {kwargs.get('addon_price')} | Lote: {kwargs.get('addon_lot')}"
-        elif event == 'close':
-            msg = kwargs.get('message')
-        else:
-            msg = kwargs.get('message')
-        # Notificaciones a Telegram deshabilitadas temporalmente
-        return
+        notifier = TelegramNotifierAdapter(self.notifier)
+        await notifier.notify_trade_event(event, **kwargs)
 
 
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
@@ -837,7 +813,7 @@ class TradeManager:
                 message=f"❌ BE falló | Ticket: {int(ticket)}\nLa posición ya está cerrada (volumen=0)."
             )
             return
-        # Validar distancia mínima de stop
+        # Validar y ajustar distancia mínima de stop para BE
         # Acceso robusto a stops_level/stop_level
         if hasattr(info, "stops_level"):
             stop_level_raw = getattr(info, "stops_level", 0.0)
@@ -848,21 +824,36 @@ class TradeManager:
             stop_level_raw = 0.0
         min_stop = float(stop_level_raw) * float(getattr(info, 'point', point))
         price_current = float(getattr(pos, 'price_current', entry_price))
-        dist = abs(be - price_current)
-        if dist < min_stop:
-            log.error(f"[BE-DEBUG] No se puede aplicar BE, distancia mínima no cumplida | ticket={ticket} dist={dist} min_stop={min_stop}")
-            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nLa distancia mínima de stop no se cumple (dist={dist:.5f}, min_stop={min_stop:.5f}).")
+
+        # Ajustar el BE si no cumple la distancia mínima
+        be_attempt = be
+        max_be_retries = 10
+        for be_try in range(max_be_retries):
+            dist = abs(be_attempt - price_current)
+            if dist < min_stop:
+                # Ajustar el SL al valor más cercano permitido
+                if is_buy:
+                    be_attempt = price_current - min_stop
+                else:
+                    be_attempt = price_current + min_stop
+                log.warning(f"[BE-DEBUG] Ajustando BE para cumplir min_stop | ticket={ticket} intento={be_try+1} nuevo_BE={be_attempt} min_stop={min_stop}")
+            else:
+                break
+        else:
+            log.error(f"[BE-DEBUG] No se pudo ajustar BE para cumplir min_stop tras {max_be_retries} intentos | ticket={ticket}")
+            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)}\nNo se pudo ajustar el SL para cumplir la distancia mínima de stop.")
             await self.notify_trade_event(
                 'be',
                 account_name=account["name"],
-                message=f"❌ BE falló | Ticket: {int(ticket)}\nLa distancia mínima de stop no se cumple (dist={dist:.5f}, min_stop={min_stop:.5f})."
+                message=f"❌ BE falló | Ticket: {int(ticket)}\nNo se pudo ajustar el SL para cumplir la distancia mínima de stop."
             )
             return
+        log.info(f"[BE-DEBUG] BE calculation ajustado | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be_attempt}")
         log.info(f"[BE-DEBUG] BE calculation | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be}")
         # --- Probar todos los filling modes para modificar SL (BE) ---
         supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
+        be_applied = False
         for type_filling in supported_filling_modes:
-            # Obtener info de la posición actual para los campos requeridos
             pos_info = client.positions_get(ticket=int(ticket))
             if not pos_info or len(pos_info) == 0:
                 log.error(f"[BE-DEBUG] No se pudo obtener info de la posición para modificar SL | ticket={ticket}")
@@ -871,7 +862,7 @@ class TradeManager:
             req = {
                 "action": 6,  # TRADE_ACTION_SLTP (MT5)
                 "position": int(ticket),
-                "sl": float(be),
+                "sl": float(be_attempt),
                 "tp": float(getattr(pos0, 'tp', 0.0)),
                 "comment": self._safe_comment("BE-general"),
                 "type_filling": type_filling
@@ -880,36 +871,35 @@ class TradeManager:
             res = client.order_send(req)
             log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
             if res and getattr(res, "retcode", None) == 10009:
-                # Validar que el SL realmente cambió
                 await asyncio.sleep(1)
                 pos_check = client.positions_get(ticket=int(ticket))
                 sl_actual = None
                 if pos_check and len(pos_check) > 0:
                     sl_actual = float(getattr(pos_check[0], 'sl', 0.0))
-                if sl_actual is not None and abs(sl_actual - float(be)) < 1e-4:
-                    self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}")
-                    log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be)
+                if sl_actual is not None and abs(sl_actual - float(be_attempt)) < 1e-4:
+                    self._notify_bg(account["name"], f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be_attempt:.5f}")
+                    log.info("[TM] BE applied ticket=%s sl=%.5f", int(ticket), be_attempt)
                     await self.notify_trade_event(
                         'be',
                         account_name=account["name"],
-                        message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be:.5f}"
+                        message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be_attempt:.5f}"
                     )
                     log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
-                    return
+                    be_applied = True
+                    break
                 else:
-                    log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be} actual={sl_actual}")
+                    log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be_attempt} actual={sl_actual}")
                     self._notify_bg(
                         account["name"],
-                        f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be_attempt}, actual={sl_actual})"
                     )
                     await self.notify_trade_event(
                         'be',
                         account_name=account["name"],
-                        message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be}, actual={sl_actual})"
+                        message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be_attempt}, actual={sl_actual})"
                     )
                     return
             elif res and getattr(res, "retcode", None) not in [10030, 10013]:
-                # Si el error no es de filling mode, no seguir probando
                 retcode = getattr(res, 'retcode', None)
                 comment = getattr(res, 'comment', None)
                 log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment}")
@@ -923,17 +913,17 @@ class TradeManager:
                     message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
                 )
                 return
-        # Si ninguno funcionó
-        log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - No filling mode funcionó")
-        self._notify_bg(
-            account["name"],
-            f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
-        )
-        await self.notify_trade_event(
-            'be',
-            account_name=account["name"],
-            message=f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
-        )
+        if not be_applied:
+            log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - No filling mode funcionó")
+            self._notify_bg(
+                account["name"],
+                f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
+            )
+            await self.notify_trade_event(
+                'be',
+                account_name=account["name"],
+                message=f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
+            )
 
         v = float(pos.volume)
         step = float(info.volume_step) if float(info.volume_step) > 0 else 0.0
