@@ -333,7 +333,7 @@ async def main():
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             last_id = await redis.get(REDIS_OFFSET_KEY)
-            await redis.close()
+            await redis.aclose()
             return last_id or "$"
         except Exception as e:
             log.warning(f"[OFFSET] Could not get last_id from Redis: {e}")
@@ -347,7 +347,7 @@ async def main():
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             await redis.set(REDIS_OFFSET_KEY, last_id)
-            await redis.close()
+            await redis.aclose()
         except Exception as e:
             log.warning(f"[OFFSET] Could not set last_id in Redis: {e}")
 
