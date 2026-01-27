@@ -1,5 +1,5 @@
 import os, json, asyncio, logging, sys, uuid
-import aioredis
+import redis.asyncio as aioredis
 from common.config import Settings
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
@@ -331,7 +331,7 @@ async def main():
         """
         try:
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-            redis = await aioredis.from_url(redis_url, decode_responses=True)
+            redis = aioredis.from_url(redis_url, decode_responses=True)
             last_id = await redis.get(REDIS_OFFSET_KEY)
             await redis.close()
             return last_id or "$"
@@ -345,7 +345,7 @@ async def main():
         """
         try:
             redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-            redis = await aioredis.from_url(redis_url, decode_responses=True)
+            redis = aioredis.from_url(redis_url, decode_responses=True)
             await redis.set(REDIS_OFFSET_KEY, last_id)
             await redis.close()
         except Exception as e:
