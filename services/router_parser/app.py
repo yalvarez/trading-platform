@@ -271,6 +271,13 @@ async def main():
                         # Solo si tiene los campos mínimos para un comando
                         if sig.get("symbol") and sig.get("direction"):
                             # Construir comando básico (ajustar según tu lógica de negocio)
+                            # Obtener configuración de cuentas
+                            accounts_config = Settings.load().accounts()
+                            # Filtrar cuentas activas y que permitan el canal/chat_id
+                            target_accounts = [a for a in accounts_config if a.get("active") and chat_id and int(chat_id) in a.get("allowed_channels", [])]
+                            account_names = [a["name"] for a in target_accounts]
+                            # Determinar volumen: usar fixed_lot de la primera cuenta válida, o 0.01 por defecto
+                            volume = target_accounts[0]["fixed_lot"] if target_accounts else 0.01
                             command = {
                                 "signal_id": sig.get("trace", trace_id),
                                 "type": "open",
@@ -279,9 +286,10 @@ async def main():
                                 "entry_range": sig.get("entry_range"),
                                 "sl": sig.get("sl"),
                                 "tp": json.loads(sig.get("tps", "[]")),
-                                "accounts": [],  # Puedes poblar esto según lógica de ruteo/canales
+                                "accounts": account_names,
                                 "provider_tag": sig.get("provider_tag"),
                                 "timestamp": int(uuid.uuid1().time // 1e7),
+                                "volume": volume,
                             }
                             await bus.publish_command(command)
                             log.info(f"[COMMAND] Publicado en trade_commands: {command}")
