@@ -20,7 +20,8 @@ class TradeBus:
 
     async def listen_commands(self, last_id="$"):
         while True:
-            streams = await self.redis.xread([TRADE_COMMANDS_STREAM], latest_ids=[last_id], timeout=1000)
+            # Usar la API moderna: xread(streams: dict, block=ms)
+            streams = await self.redis.xread({TRADE_COMMANDS_STREAM: last_id}, block=1000)
             for stream, msgs in streams or []:
                 for msg_id, msg in msgs:
                     yield msg_id, json.loads(msg[b"data"].decode())
