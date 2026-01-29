@@ -30,7 +30,7 @@ async def xreadgroup_loop(
     stream: str,
     group: str,
     consumer: str,
-    block_ms: int = 2000,
+    block_ms: int = 200,
     count: int = 50,
     ): 
     while True:
@@ -64,7 +64,7 @@ async def xread_loop(
     r: "redis.Redis",
     stream: str,
     last_id: str = "$",
-    block_ms: int = 2000,
+    block_ms: int = 200,
     count: int = 50,
 ):
     while True:

@@ -1,55 +1,3 @@
-# ...existing code...
-
-from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
-from .mt5_executor import MT5Executor
-from .notifications.telegram import TelegramNotifierAdapter
-
-class TradeManager:
-    # ...existing code...
-    def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
-        """
-        Procesa mensajes de gestión Hannah como:
-        - "Secure half your Profits & set breakeven"
-        - "Asegura la mitad y mueve a BE"
-        Detecta intención de cierre parcial + BE y llama early_partial_close.
-        Retorna True si consumió el mensaje.
-        """
-        text = (raw_text or "").strip()
-        if not text:
-            return False
-
-        up = text.upper()
-        # Detectar frases clave (puedes ajustar/expandir)
-        has_partial = any(w in up for w in ["HALF", "MITAD", "PARTIAL", "PARCIAL", "SECURE HALF", "ASEGURA LA MITAD"])
-        has_be = any(w in up for w in ["BREAKEVEN", "BREAK EVEN", "BE", "SET BE", "MUEVE A BE", "MOVE TO BE", "SET BREAKEVEN"])
-
-        # Solo si ambas intenciones están presentes
-        if not (has_partial and has_be):
-            return False
-
-        # Ejecutar para cada cuenta activa con trade Hannah
-        any_matched_trade = False
-        for account in [a for a in self.mt5.accounts if a.get("active")]:
-            client = self.mt5._client_for(account)
-            positions = client.positions_get()
-            if not positions:
-                continue
-            pos_by_ticket = {p.ticket: p for p in positions}
-            for ticket, t in list(self.trades.items()):
-                if t.account_name != account["name"]:
-                    continue
-                if "HANNAH" not in (t.provider_tag or "").upper():
-                    continue
-                pos = pos_by_ticket.get(ticket)
-                if not pos or pos.magic != self.mt5.magic:
-                    continue
-                # Ejecutar early_partial_close (50%)
-                any_matched_trade = True
-                # Llamada asíncrona
-                import asyncio
-                asyncio.create_task(self.mt5.early_partial_close(account, ticket, percent=0.5, provider_tag="HANNAH", reason="msg_mgmt"))
-                self._notify_bg(account["name"], f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
-        return any_matched_trade
 # trade_manager.py
 
 import asyncio
@@ -75,10 +23,10 @@ import redis.asyncio as redis_async
 log = logging.getLogger("trade_orchestrator.trade_manager")
 
 # Metrics
-TRADES_OPENED = Counter('trades_opened_total', 'Total trades opened')
-TP_HITS = Counter('trade_tp_hits_total', 'TP hits', ['tp'])
-PARTIAL_CLOSES = Counter('trade_partial_closes_total', 'Partial closes')
-ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
+# TRADES_OPENED = Counter('trades_opened_total', 'Total trades opened')
+# TP_HITS = Counter('trade_tp_hits_total', 'TP hits', ['tp'])
+# PARTIAL_CLOSES = Counter('trade_partial_closes_total', 'Partial closes')
+# ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
 
 @dataclass
 class ManagedTrade:
@@ -141,7 +89,6 @@ class TradeManager:
         self.group_addon_count.setdefault((account_name, groupId), 0)
         log.info("[TM] ✅ registered ticket=%s acct=%s group=%s provider=%s tps=%s planned_sl=%s", ticket, account_name, groupId, provider_tag, tps, planned_sl)
         try:
-            TRADES_OPENED.inc()
             ACTIVE_TRADES.set(len(self.trades))
         except Exception:
             pass

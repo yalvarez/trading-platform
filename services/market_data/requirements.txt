@@ -1,2 +1,4 @@
 redis==5.0.7
 mt5linux==0.1.6
+aioredis
+prometheus_client

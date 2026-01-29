@@ -47,7 +47,14 @@ class MT5Executor:
             "comment": self._safe_comment(f"{provider_tag or ''}-REENTRY"),
             "type_time": 0,
         }
-        res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+        try:
+            log.info(f"[RUNNER][ORDER_SEND] Intentando abrir runner: req={req} account={account.get('name')}")
+            res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+            log.info(f"[RUNNER][ORDER_SEND] Respuesta de runner: {repr(res)}")
+        except Exception as e:
+            log.exception(f"[RUNNER][ORDER_SEND][EXCEPTION] Error inesperado al abrir runner: {e}")
+            self._notify_bg(account["name"], f"❌ Error EXCEPCIÓN al abrir runner | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp} | error={e}")
+            return None
         if res and getattr(res, "retcode", None) in (10009, 10008):
             self._notify_bg(account["name"], f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp}")
             return res
@@ -328,6 +335,7 @@ class MT5Executor:
         self.entry_wait_seconds = entry_wait_seconds
         self.entry_poll_ms = entry_poll_ms
 
+
     async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
         tickets = {}
         errors = {}
@@ -344,6 +352,15 @@ class MT5Executor:
                 account["provider_tag"] = provider_tag
                 account["tps"] = tps
                 accounts.append(account)
+
+        # Lanzar selección de símbolo en paralelo para todas las cuentas antes de abrir órdenes
+        async def select_symbol(account):
+            try:
+                client = self._client_for(account)
+                client.symbol_select(symbol, True)
+            except Exception as e:
+                log.warning(f"[SYMBOL_SELECT][PRELOAD] Error seleccionando símbolo {symbol} para {account.get('name')}: {e}")
+        await asyncio.gather(*(select_symbol(account) for account in accounts))
 
         async def send_order(account):
             planned_sl_val = None  # Siempre local y explícito
