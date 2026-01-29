@@ -1,6 +1,7 @@
 # Bus centralizado de comandos/eventos para trading
+
 import asyncio
-import aioredis
+import redis.asyncio as aioredis
 import json
 from .schema import TRADE_COMMANDS_STREAM, TRADE_EVENTS_STREAM
 
@@ -10,7 +11,7 @@ class TradeBus:
         self.redis = None
 
     async def connect(self):
-        self.redis = await aioredis.create_redis_pool(self.redis_url)
+        self.redis = aioredis.from_url(self.redis_url, decode_responses=False)
 
     async def close(self):
         self.redis.close()
@@ -24,7 +25,7 @@ class TradeBus:
 
     async def listen_commands(self, last_id="$"):
         while True:
-            streams = await self.redis.xread([TRADE_COMMANDS_STREAM], latest_ids=[last_id], timeout=1000)
+            streams = await self.redis.xread({TRADE_COMMANDS_STREAM: last_id}, block=1000)
             for stream, msgs in streams or []:
                 for msg_id, msg in msgs:
                     yield msg_id, json.loads(msg[b"data"].decode())
@@ -32,7 +33,7 @@ class TradeBus:
 
     async def listen_events(self, last_id="$"):
         while True:
-            streams = await self.redis.xread([TRADE_EVENTS_STREAM], latest_ids=[last_id], timeout=1000)
+            streams = await self.redis.xread({TRADE_EVENTS_STREAM: last_id}, block=1000)
             for stream, msgs in streams or []:
                 for msg_id, msg in msgs:
                     yield msg_id, json.loads(msg[b"data"].decode())

@@ -1,3 +1,4 @@
+
 import os, re, json, logging, uuid
 from common.config import Settings
 from common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
@@ -12,6 +13,9 @@ from parsers_goldbro_scalp import GoldBroScalpParser
 from parsers_torofx import ToroFxParser
 from parsers_daily_signal import DailySignalParser
 from parsers_hannah import HannahParser
+
+# Importar el bus centralizado para publicar comandos
+from bus import TradeBus
 
 
 # Add container label to log format for Grafana filtering
@@ -180,6 +184,9 @@ async def main():
         log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
         channels_config = {}
     router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds, channels_config=channels_config)
+    # Instanciar el bus centralizado para publicar comandos
+    bus = TradeBus(s.redis_url)
+    await bus.connect()
     group = "router_group"
     consumer = f"consumer_{os.getpid()}"
 
@@ -258,6 +265,24 @@ async def main():
                         sig["trace"] = trace_id
                         await xadd(r, Streams.SIGNALS, sig)
                         log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
+                        # --- NUEVO: Publicar comando en trade_commands si la señal es válida ---
+                        # Solo si tiene los campos mínimos para un comando
+                        if sig.get("symbol") and sig.get("direction"):
+                            # Construir comando básico (ajustar según tu lógica de negocio)
+                            command = {
+                                "signal_id": sig.get("trace", trace_id),
+                                "type": "open",
+                                "symbol": sig.get("symbol"),
+                                "direction": sig.get("direction"),
+                                "entry_range": sig.get("entry_range"),
+                                "sl": sig.get("sl"),
+                                "tp": json.loads(sig.get("tps", "[]")),
+                                "accounts": [],  # Puedes poblar esto según lógica de ruteo/canales
+                                "provider_tag": sig.get("provider_tag"),
+                                "timestamp": int(uuid.uuid1().time // 1e7),
+                            }
+                            await bus.publish_command(command)
+                            log.info(f"[COMMAND] Publicado en trade_commands: {command}")
                     else:
                         pass  # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
                 finally:
