@@ -63,6 +63,7 @@ class TradingMode(Enum):
     GENERAL = "general"
     BE_PIPS = "be_pips"
     BE_PNL = "be_pnl"
+    REENTRY = "reentry"
 
 from . import mt5_constants as mt5
 from .mt5_client import MT5Client
@@ -1486,6 +1487,7 @@ class TradeManager:
         - general: gestión clásica (TP, runner, trailing, BE, etc.)
         - be_pips: mueve SL a BE al alcanzar X pips, luego gestión normal
         - be_pnl: tras parcial y X pips, mueve SL para proteger ganancia, luego gestión normal
+        - reentry: cierra 100% en TP1, abre runner con menor lote, SL en entry, TP en TP2
         Si el modo es desconocido, usa la gestión general.
         """
         modo = cuenta.get("trading_mode", TradingMode.GENERAL.value)
@@ -1495,9 +1497,78 @@ class TradeManager:
             return await self.gestionar_trade_be_pips(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         elif modo == TradingMode.BE_PNL.value:
             return await self.gestionar_trade_be_pnl(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
+        elif modo == TradingMode.REENTRY.value:
+            return await self.gestionar_trade_reentry(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         else:
             # fallback a general si el modo es desconocido
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
+
+    async def gestionar_trade_reentry(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
+        """
+        Modalidad reentry:
+        - Al alcanzar TP1, cerrar 100% del trade original.
+        - Abrir un nuevo trade (runner) con menor lote, SL en entry, TP en TP2.
+        - El runner se gestiona con trailing o cierre manual.
+        """
+        # Obtener datos necesarios si no se pasan
+        if pos is None or point is None or is_buy is None or current is None:
+            client = self.mt5._client_for(cuenta)
+            pos_list = client.positions_get(ticket=int(trade.ticket))
+            if not pos_list:
+                return
+            pos = pos_list[0]
+            info = client.symbol_info(trade.symbol)
+            tick = client.symbol_info_tick(trade.symbol)
+            if not info or not tick:
+                return
+            point = float(info.point)
+            is_buy = (trade.direction == "BUY")
+            current = float(pos.price_current)
+
+        # TP1 alcanzado y no se ha hecho reentry
+        tp1 = trade.tps[0] if trade.tps else None
+        tp2 = trade.tps[1] if len(trade.tps) > 1 else None
+        if not tp1 or not tp2:
+            # Si no hay dos TPs, fallback a gestión general
+            return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
+
+        # Usar un flag en el trade para evitar múltiples ejecuciones
+        if not hasattr(trade, "reentry_done"):
+            trade.reentry_done = False
+
+        # Si TP1 alcanzado y no se ha hecho reentry
+        if (is_buy and current >= tp1) or (not is_buy and current <= tp1):
+            if not trade.reentry_done:
+                client = self.mt5._client_for(cuenta)
+                # Cerrar 100% del trade original
+                await self._do_partial_close(cuenta, trade.ticket, 100, reason="REENTRY_TP1")
+                # Abrir runner con menor lote (ej: 30% del volumen original), ajustado a múltiplo de 0.01 y mínimo 0.01
+                original_vol = float(getattr(pos, "volume", 0.01))
+                raw_runner_lot = original_vol * 0.3
+                info = client.symbol_info(trade.symbol)
+                step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
+                vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+                # Redondear hacia abajo al múltiplo de step
+                runner_lot = max(vmin, step * int(raw_runner_lot / step))
+                entry_price = float(getattr(pos, "price_open", current))
+                sl = entry_price
+                tp = tp2
+                # Abrir nueva posición runner
+                await self.mt5.open_runner_trade(
+                    cuenta,
+                    symbol=trade.symbol,
+                    direction=trade.direction,
+                    volume=runner_lot,
+                    sl=sl,
+                    tp=tp,
+                    provider_tag=f"{trade.provider_tag}_REENTRY"
+                )
+                trade.reentry_done = True
+                self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                return
+        # El runner se gestiona con trailing si está habilitado
+        if self.enable_trailing:
+            await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
 
     async def gestionar_trade_general(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """

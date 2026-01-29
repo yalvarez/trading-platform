@@ -21,6 +21,39 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
+    async def open_runner_trade(self, account: dict, symbol: str, direction: str, volume: float, sl: float, tp: float, provider_tag: str = None):
+        """
+        Abre una posición runner con los parámetros dados (usado en modalidad reentry).
+        - symbol: símbolo a operar
+        - direction: 'BUY' o 'SELL'
+        - volume: lote a abrir
+        - sl: precio de stop loss
+        - tp: precio de take profit
+        - provider_tag: etiqueta de proveedor para trazabilidad
+        """
+        client = self._client_for(account)
+        client.symbol_select(symbol, True)
+        order_type = 0 if direction.upper() == 'BUY' else 1
+        req = {
+            "action": 1,  # TRADE_ACTION_DEAL
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": order_type,
+            "price": float(client.tick_price(symbol, direction)),
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": int(getattr(self, 'default_deviation', 20)),
+            "magic": int(self.magic),
+            "comment": self._safe_comment(f"{provider_tag or ''}-REENTRY"),
+            "type_time": 0,
+        }
+        res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+        if res and getattr(res, "retcode", None) in (10009, 10008):
+            self._notify_bg(account["name"], f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp}")
+            return res
+        else:
+            self._notify_bg(account["name"], f"❌ Error al abrir runner | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp} | retcode={getattr(res,'retcode',None)}")
+            return res
     async def early_partial_close(
         self,
         account: dict,
