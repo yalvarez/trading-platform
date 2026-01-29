@@ -5,7 +5,7 @@ Also handles position management commands: "tomar parcial", "cierro mi entrada",
 
 import re
 from typing import Optional
-from parsers_base import SignalParser, ParseResult
+from .parsers_base import SignalParser, ParseResult
 import logging
 
 log = logging.getLogger("router_parser")

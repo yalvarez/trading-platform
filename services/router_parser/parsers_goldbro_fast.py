@@ -7,7 +7,7 @@ Format: "Compra/Vende ORO/GOLD ahora @2500" with optional price hint
 import re
 import os
 from typing import Optional
-from parsers_base import SignalParser, ParseResult
+from .parsers_base import SignalParser, ParseResult
 
 
 class GoldBroFastParser(SignalParser):

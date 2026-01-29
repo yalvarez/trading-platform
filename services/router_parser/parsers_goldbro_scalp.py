@@ -5,7 +5,7 @@ Format: ORO SCALP BUY Entry: 2500, SL: 2495, TP1: 2505 (70%), TP2: 2510 (100%)
 
 import re
 from typing import Optional, List
-from parsers_base import SignalParser, ParseResult
+from .parsers_base import SignalParser, ParseResult
 
 
 class GoldBroScalpParser(SignalParser):
