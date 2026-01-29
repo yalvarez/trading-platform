@@ -3,16 +3,17 @@ import os, re, json, logging, uuid
 from common.config import Settings
 from common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
 from common.signal_dedup import SignalDeduplicator
-from gb_filters import looks_like_followup
-from torofx_filters import looks_like_torofx_management
-from parsers_base import SignalParser, ParseResult
 
-from parsers_goldbro_fast import GoldBroFastParser
-from parsers_goldbro_long import GoldBroLongParser
-from parsers_goldbro_scalp import GoldBroScalpParser
-from parsers_torofx import ToroFxParser
-from parsers_daily_signal import DailySignalParser
-from parsers_hannah import HannahParser
+from .gb_filters import looks_like_followup
+from .torofx_filters import looks_like_torofx_management
+from .parsers_base import SignalParser, ParseResult
+
+from .parsers_goldbro_fast import GoldBroFastParser
+from .parsers_goldbro_long import GoldBroLongParser
+from .parsers_goldbro_scalp import GoldBroScalpParser
+from .parsers_torofx import ToroFxParser
+from .parsers_daily_signal import DailySignalParser
+from .parsers_hannah import HannahParser
 
 # Importar el bus centralizado para publicar comandos
 from .bus import TradeBus
@@ -30,7 +31,8 @@ from common.config import FAST_UPDATE_WINDOW_SECONDS
 
 class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0, channels_config=None):
-        from parsers_limitless import LimitlessParser
+        from .parsers_limitless import LimitlessParser
+        from .parsers_limitless import LimitlessParser
         self.parser_map = {
             'hannah': HannahParser(),
             'goldbro_long': GoldBroLongParser(),
@@ -50,7 +52,7 @@ class SignalRouter:
         # --- 1. LIMITLESS si tiene 'Risk Price' ---
         norm_lower = norm.lower()
         if 'risk price' in norm_lower:
-            from parsers_limitless import LimitlessParser
+            from .parsers_limitless import LimitlessParser
             parser = LimitlessParser()
             try:
                 result = parser.parse(norm)
@@ -69,7 +71,7 @@ class SignalRouter:
             return None
         # --- 2. TOROFX si tiene 'Target: open' ---
         if 'target: open' in norm_lower:
-            from parsers_torofx import ToroFxParser
+            from .parsers_torofx import ToroFxParser
             parser = ToroFxParser()
             try:
                 result = parser.parse(norm)
@@ -87,7 +89,7 @@ class SignalRouter:
                 log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
             return None
         # --- 3. HANNAH si hace match (prioridad absoluta sobre cualquier otro parser) ---
-        from parsers_hannah import HannahParser
+        from .parsers_hannah import HannahParser
         hannah_parser = HannahParser()
         try:
             result = hannah_parser.parse(norm)
