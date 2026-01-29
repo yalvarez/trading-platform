@@ -15,7 +15,7 @@ from parsers_daily_signal import DailySignalParser
 from parsers_hannah import HannahParser
 
 # Importar el bus centralizado para publicar comandos
-from bus import TradeBus
+from .bus import TradeBus
 
 
 # Add container label to log format for Grafana filtering
