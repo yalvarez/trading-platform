@@ -8,5 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git gcc build-e
 RUN pip install --no-cache-dir -r trade_orchestrator/requirements.txt
 RUN pip install --no-cache-dir mt5linux==0.1.9
 
+# Agregar la raíz del proyecto al PYTHONPATH para imports absolutos
+ENV PYTHONPATH=/app
+
 # Ejecutar como paquete desde el directorio de servicios
 CMD ["python", "-m", "trade_orchestrator.app"]
