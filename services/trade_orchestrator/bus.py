@@ -1,6 +1,7 @@
 # Adaptador para consumir el bus centralizado de comandos/eventos
+
 import asyncio
-import aioredis
+import redis.asyncio as aioredis
 import json
 from services.market_data.centralized.schema import TRADE_COMMANDS_STREAM, TRADE_EVENTS_STREAM
 
@@ -10,7 +11,8 @@ class TradeBus:
         self.redis = None
 
     async def connect(self):
-        self.redis = await aioredis.create_redis_pool(self.redis_url)
+        # Usar la nueva API de redis-py (redis.asyncio)
+        self.redis = aioredis.from_url(self.redis_url, decode_responses=False)
 
     async def close(self):
         self.redis.close()
