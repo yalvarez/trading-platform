@@ -10,12 +10,7 @@ from enum import Enum
 from .mt5_executor import MT5Executor
 from .trade_utils import pips_to_price, safe_comment, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default, calcular_sl_por_pnl
 from .notifications.telegram import TelegramNotifierAdapter
-from prometheus_client import Counter, Gauge
-
-# Métricas
-ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
-PARTIAL_CLOSES = Counter('trade_partial_closes_total', 'Partial closes')
-TP_HITS = Counter('trade_tp_hits_total', 'TP hits', ['tp'])
+from services.market_data.centralized.metrics import TP_HITS, ACTIVE_TRADES, PARTIAL_CLOSES
 
 # Función valor_pip (dummy si no existe)
 def valor_pip(symbol, volume):
