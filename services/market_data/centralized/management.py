@@ -10,7 +10,7 @@ from .schema import TRADE_COMMANDS_STREAM, TRADE_EVENTS_STREAM
 log = logging.getLogger("centralized.management")
 
 
-from services.common.config import Settings
+from ..common.config import Settings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
