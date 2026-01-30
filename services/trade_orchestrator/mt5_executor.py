@@ -24,35 +24,61 @@ class MT5Executor:
     async def open_runner_trade(self, account: dict, symbol: str, direction: str, volume: float, sl: float, tp: float, provider_tag: str = None):
         """
         Abre una posición runner con los parámetros dados (usado en modalidad reentry).
-        - symbol: símbolo a operar
-        - direction: 'BUY' o 'SELL'
-        - volume: lote a abrir
-        - sl: precio de stop loss
-        - tp: precio de take profit
-        - provider_tag: etiqueta de proveedor para trazabilidad
+        Igualada la lógica a open_complete_trade: ajuste de SL, logs de atributos, validación de trade_fill_mode.
         """
         client = self._client_for(account)
         client.symbol_select(symbol, True)
+        name = account.get('name')
         order_type = 0 if direction.upper() == 'BUY' else 1
+        price = float(client.tick_price(symbol, direction))
+        forced_sl = float(sl)
+        # --- Validar y ajustar SL si está demasiado cerca del precio actual ---
+        symbol_info = client.symbol_info(symbol)
+        available_attrs = dir(symbol_info) if symbol_info else []
+        log.info(f"[RUNNER][DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
+        min_stop_raw = None
+        if symbol_info:
+            if hasattr(symbol_info, "stops_level"):
+                min_stop_raw = getattr(symbol_info, "stops_level", None)
+            elif hasattr(symbol_info, "stop_level"):
+                min_stop_raw = getattr(symbol_info, "stop_level", 0.0)
+            else:
+                log.warning(f"[RUNNER][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
+                min_stop_raw = 0.0
+            fill_mode = getattr(symbol_info, "trade_fill_mode", None) if hasattr(symbol_info, "trade_fill_mode") else None
+        else:
+            min_stop_raw = 0.0
+            fill_mode = None
+        min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
+        log.info(f"[RUNNER][DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, trade_fill_mode={fill_mode}")
+        if min_stop > 0 and abs(price - forced_sl) < min_stop:
+            if direction.upper() == "BUY":
+                adjusted_sl = price - min_stop
+            else:
+                adjusted_sl = price + min_stop
+            log.warning(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
+            forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
+        # --- Preparar y loguear la orden ---
         req = {
             "action": 1,  # TRADE_ACTION_DEAL
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
-            "price": float(client.tick_price(symbol, direction)),
-            "sl": float(sl),
+            "price": price,
+            "sl": forced_sl,
             "tp": float(tp),
             "deviation": int(getattr(self, 'default_deviation', 20)),
             "magic": int(self.magic),
             "comment": self._safe_comment(f"{provider_tag or ''}-REENTRY"),
             "type_time": 0,
         }
-        res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+        log.info(f"[RUNNER][ORDER_PREP] account={account} | req={req}")
+        res = await self._best_filling_order_send(client, symbol, req, name)
         if res and getattr(res, "retcode", None) in (10009, 10008):
-            self._notify_bg(account["name"], f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp}")
+            self._notify_bg(name, f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {forced_sl} | TP: {tp}")
             return res
         else:
-            self._notify_bg(account["name"], f"❌ Error al abrir runner | Symbol: {symbol} | Vol: {volume} | SL: {sl} | TP: {tp} | retcode={getattr(res,'retcode',None)}")
+            self._notify_bg(name, f"❌ Error al abrir runner | Symbol: {symbol} | Vol: {volume} | SL: {forced_sl} | TP: {tp} | retcode={getattr(res,'retcode',None)}")
             return res
     async def early_partial_close(
         self,
