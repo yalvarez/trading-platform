@@ -7,6 +7,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 from enum import Enum
+from .mt5_executor import MT5Executor
+from .trade_utils import pips_to_price, safe_comment, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default, calcular_sl_por_pnl
+from .notifications.telegram import TelegramNotifierAdapter
+from prometheus_client import Counter, Gauge
+
+# Métricas
+ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
+PARTIAL_CLOSES = Counter('trade_partial_closes_total', 'Partial closes')
+TP_HITS = Counter('trade_tp_hits_total', 'TP hits', ['tp'])
+
+# Función valor_pip (dummy si no existe)
+def valor_pip(symbol, volume):
+    # Implementación real debe ir en trade_utils o similar
+    return 0.0
 class TradingMode(Enum):
     GENERAL = "general"
     BE_PIPS = "be_pips"
@@ -798,27 +812,22 @@ class TradeManager:
             return
         log.info(f"[BE-DEBUG] BE calculation ajustado | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be_attempt}")
         log.info(f"[BE-DEBUG] BE calculation | entry_price={entry_price} spread={spread} offset={offset} is_buy={is_buy} => BE={be}")
-        # --- Probar todos los filling modes para modificar SL (BE) ---
-        supported_filling_modes = [1, 3, 2]  # IOC, FOK, RETURN
-        be_applied = False
-        for type_filling in supported_filling_modes:
-            pos_info = client.positions_get(ticket=int(ticket))
-            if not pos_info or len(pos_info) == 0:
-                log.error(f"[BE-DEBUG] No se pudo obtener info de la posición para modificar SL | ticket={ticket}")
-                continue
-            pos0 = pos_info[0]
-            req = {
-                "action": 6,  # TRADE_ACTION_SLTP (MT5)
-                "position": int(ticket),
-                "sl": float(be_attempt),
-                "tp": float(getattr(pos0, 'tp', 0.0)),
-                "comment": self._safe_comment("BE-general"),
-                "type_filling": type_filling
-            }
-            log.info(f"[BE-DEBUG] Enviando order_send | req={req}")
-            res = client.order_send(req)
-            log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
-            if res and getattr(res, "retcode", None) == 10009:
+        mt5_executor = MT5Executor(self.mt5)
+        pos_info = client.positions_get(ticket=int(ticket))
+        if not pos_info or len(pos_info) == 0:
+            log.error(f"[BE-DEBUG] No se pudo obtener info de la posición para modificar SL | ticket={ticket}")
+            return
+        pos0 = pos_info[0]
+        req = {
+            "action": 6,  # TRADE_ACTION_SLTP (MT5)
+            "position": int(ticket),
+            "sl": float(be_attempt),
+            "tp": float(getattr(pos0, 'tp', 0.0)),
+            "comment": self._safe_comment("BE-general"),
+        }
+        res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
+        log.info(f"[BE-DEBUG] Resultado order_send | res={res}")
+        if res and getattr(res, "retcode", None) == 10009:
                 await asyncio.sleep(1)
                 pos_check = client.positions_get(ticket=int(ticket))
                 sl_actual = None
@@ -833,8 +842,6 @@ class TradeManager:
                         message=f"✅ BE aplicado | Ticket: {int(ticket)} | SL: {be_attempt:.5f}"
                     )
                     log.info(f"[BE-DEBUG] FIN _do_be OK | account={account.get('name')} ticket={ticket}")
-                    be_applied = True
-                    break
                 else:
                     log.error(f"[BE-DEBUG] SL no cambió tras BE | esperado={be_attempt} actual={sl_actual}")
                     self._notify_bg(
@@ -847,31 +854,20 @@ class TradeManager:
                         message=f"❌ BE falló | Ticket: {int(ticket)}\nSL no cambió tras BE (esperado={be_attempt}, actual={sl_actual})"
                     )
                     return
-            elif res and getattr(res, "retcode", None) not in [10030, 10013]:
-                retcode = getattr(res, 'retcode', None)
-                comment = getattr(res, 'comment', None)
-                log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment}")
-                self._notify_bg(
-                    account["name"],
-                    f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
-                )
-                await self.notify_trade_event(
-                    'be',
-                    account_name=account["name"],
-                    message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
-                )
-                return
-        if not be_applied:
-            log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - No filling mode funcionó")
+        else:
+            retcode = getattr(res, 'retcode', None)
+            comment = getattr(res, 'comment', None)
+            log.error(f"[BE-DEBUG] FIN _do_be FAIL | account={account.get('name')} ticket={ticket} - retcode={retcode} comment={comment}")
             self._notify_bg(
                 account["name"],
-                f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
+                f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
             )
             await self.notify_trade_event(
                 'be',
                 account_name=account["name"],
-                message=f"❌ BE falló | Ticket: {int(ticket)}\nNo filling mode funcionó para modificar SL."
+                message=f"❌ BE falló | Ticket: {int(ticket)}\nretcode={retcode} {comment}"
             )
+            return
 
         v = float(pos.volume)
         step = float(info.volume_step) if float(info.volume_step) > 0 else 0.0
