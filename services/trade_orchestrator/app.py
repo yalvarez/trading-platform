@@ -117,25 +117,27 @@ async def main():
         # Ejemplo: open, move_sl, close, partial_close, trailing, be
         # Aquí solo se muestra el esqueleto para 'open'
         if cmd["type"] == "open":
-            res = await execu.open_runner_trade(
-                account=next((a for a in accounts if a["name"] in cmd["accounts"]), None),
-                symbol=cmd["symbol"],
-                direction=cmd["direction"],
-                volume=cmd["volume"],
-                sl=cmd["sl"],
-                tp=cmd["tp"][0] if cmd["tp"] else None,
-                provider_tag=cmd.get("provider_tag", "CENTRALIZED")
-            )
-            # Publicar evento de ejecución
-            await bus.publish_event({
-                "signal_id": cmd["signal_id"],
-                "account": cmd["accounts"][0],
-                "type": "executed",
-                "ticket": getattr(res, "ticket", None),
-                "status": "success" if getattr(res, "ticket", None) else "error",
-                "details": str(res),
-                "timestamp": int(asyncio.get_event_loop().time())
-            })
+            # Ejecutar la orden para cada cuenta dict recibido
+            for account in cmd["accounts"]:
+                res = await execu.open_runner_trade(
+                    account=account,
+                    symbol=cmd["symbol"],
+                    direction=cmd["direction"],
+                    volume=cmd["volume"],
+                    sl=cmd["sl"],
+                    tp=cmd["tp"][0] if cmd["tp"] else None,
+                    provider_tag=cmd.get("provider_tag", "CENTRALIZED")
+                )
+                # Publicar evento de ejecución por cuenta
+                await bus.publish_event({
+                    "signal_id": cmd["signal_id"],
+                    "account": account,
+                    "type": "executed",
+                    "ticket": getattr(res, "ticket", None),
+                    "status": "success" if getattr(res, "ticket", None) else "error",
+                    "details": str(res),
+                    "timestamp": int(asyncio.get_event_loop().time())
+                })
         # TODO: Implementar otros tipos de comando (move_sl, close, etc.)
 
     async def loop_commands():
