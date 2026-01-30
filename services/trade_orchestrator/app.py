@@ -113,6 +113,7 @@ async def main():
         """
         Procesa un comando recibido del bus centralizado y ejecuta la acción correspondiente.
         """
+        log.info(f"[ORCHESTRATOR] Comando recibido: {cmd}")
         # TODO: Mapear tipos de comando a métodos de MT5Executor/TradeManager
         # Ejemplo: open, move_sl, close, partial_close, trailing, be
         # Aquí solo se muestra el esqueleto para 'open'
@@ -143,6 +144,7 @@ async def main():
     async def loop_commands():
         last_id = "$"
         async for msg_id, cmd in bus.listen_commands(last_id=last_id):
+            log.info(f"[ORCHESTRATOR] Mensaje recibido: id={msg_id} cmd={cmd}")
             await handle_command(cmd)
             last_id = msg_id
 
