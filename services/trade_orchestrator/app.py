@@ -134,8 +134,8 @@ async def main():
                     "signal_id": cmd["signal_id"],
                     "account": account,
                     "type": "executed",
-                    "ticket": getattr(res, "ticket", None),
-                    "status": "success" if getattr(res, "ticket", None) else "error",
+                    "ticket": getattr(res, "order", None),
+                    "status": "success" if getattr(res, "order", None) else "error",
                     "details": str(res),
                     "timestamp": int(asyncio.get_event_loop().time())
                 })
