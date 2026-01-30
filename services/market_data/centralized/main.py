@@ -31,9 +31,10 @@ async def main():
         streams = await redis.xread({"parsed_signals": last_id}, block=1000)
         for stream, msgs in streams or []:
             for msg_id, sig in msgs:
+                # Decodificar claves y valores si vienen como bytes
+                if any(isinstance(k, bytes) for k in sig.keys()):
+                    sig = {k.decode(): v.decode() if isinstance(v, bytes) else v for k, v in sig.items()}
                 # Procesar la señal parseada y construir el comando de trade
-                # Aquí debes aplicar la lógica de cuentas, volumen, modalidad, etc.
-                # Ejemplo mínimo:
                 command = {
                     "signal_id": sig.get("trace", sig.get("signal_id")),
                     "type": "open",
