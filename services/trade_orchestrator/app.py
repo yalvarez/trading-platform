@@ -143,10 +143,18 @@ async def main():
 
     async def loop_commands():
         last_id = "$"
-        async for msg_id, cmd in bus.listen_commands(last_id=last_id):
-            log.info(f"[ORCHESTRATOR] Mensaje recibido: id={msg_id} cmd={cmd}")
-            await handle_command(cmd)
-            last_id = msg_id
+        while True:
+            try:
+                # Debug: log before xread
+                log.debug(f"Esperando mensajes en trade_commands desde id={last_id}")
+                async for msg_id, cmd in bus.listen_commands(last_id=last_id):
+                    log.info(f"[ORCHESTRATOR] Mensaje recibido: id={msg_id} cmd={cmd}")
+                    await handle_command(cmd)
+                    last_id = msg_id
+                    log.debug(f"Procesado mensaje id={msg_id}, esperando el siguiente...")
+            except Exception as e:
+                log.error(f"Error en loop_commands: {e}")
+                await asyncio.sleep(2)
 
     # Lanzar el loop de gestión de trades en background
     asyncio.create_task(tm.run_forever())
