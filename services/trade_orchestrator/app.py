@@ -356,7 +356,9 @@ async def main():
         Loop principal que consume señales de trading y las procesa.
         """
         last_id = await get_last_id()
+        log.info(f"[DEBUG] Suscrito a stream {Streams.SIGNALS} desde offset {last_id}")
         async for msg_id, fields in xread_loop(r, Streams.SIGNALS, last_id=last_id):
+            log.info(f"[DEBUG] Mensaje recibido en stream {Streams.SIGNALS}: id={msg_id} fields={fields}")
             await handle_signal(fields)
             await set_last_id(msg_id)
 
