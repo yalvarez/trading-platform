@@ -6,6 +6,7 @@ main.py: Entry point para la lógica centralizada de gestión de trades.
 """
 import asyncio
 import logging
+import json
 from .bus import TradeBus
 from .metrics import TRADES_OPENED, TRADES_FAILED, TP_HITS, PARTIAL_CLOSES, ACTIVE_TRADES, TRAILING_ACTIVATED, BE_ACTIVATED
 from .management import CentralizedTradeManager
