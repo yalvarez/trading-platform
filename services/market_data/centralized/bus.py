@@ -6,7 +6,7 @@ import json
 from .schema import TRADE_COMMANDS_STREAM, TRADE_EVENTS_STREAM
 
 class TradeBus:
-    def __init__(self, redis_url="redis://localhost:6379/0"):
+    def __init__(self, redis_url="redis://redis:6379/0"):
         self.redis_url = redis_url
         self.redis = None
 
