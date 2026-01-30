@@ -34,7 +34,32 @@ async def main():
                 # Decodificar claves y valores si vienen como bytes
                 if any(isinstance(k, bytes) for k in sig.keys()):
                     sig = {k.decode(): v.decode() if isinstance(v, bytes) else v for k, v in sig.items()}
-                # Procesar la señal parseada y construir el comando de trade
+                # Poblar accounts y volume según la lógica de ruteo
+                from common.config import Settings
+                s = Settings.load()
+                accounts_config = s.accounts()
+                chat_id = None
+                # Buscar chat_id en la señal (puede venir como str o int)
+                if "chat_id" in sig:
+                    try:
+                        chat_id = int(sig["chat_id"])
+                    except Exception:
+                        chat_id = sig["chat_id"]
+                # Filtrar cuentas activas y permitidas para el chat_id
+                routed_accounts = []
+                volume = 0.01
+                for acct in accounts_config:
+                    if not acct.get("active", False):
+                        continue
+                    allowed = acct.get("allowed_channels", [])
+                    if chat_id is not None and allowed and int(chat_id) not in allowed:
+                        continue
+                    routed_accounts.append(acct["name"])
+                # Si hay solo una cuenta, usar su fixed_lot
+                if routed_accounts:
+                    acct_obj = next((a for a in accounts_config if a["name"] == routed_accounts[0]), None)
+                    if acct_obj and "fixed_lot" in acct_obj:
+                        volume = acct_obj["fixed_lot"]
                 command = {
                     "signal_id": sig.get("trace", sig.get("signal_id")),
                     "type": "open",
@@ -45,9 +70,8 @@ async def main():
                     "tp": json.loads(sig.get("tps", "[]")),
                     "provider_tag": sig.get("provider_tag"),
                     "timestamp": sig.get("timestamp"),
-                    # Aquí debes poblar accounts y volume según tu lógica
-                    "accounts": [],
-                    "volume": 0.01,
+                    "accounts": routed_accounts,
+                    "volume": volume,
                 }
                 await bus.publish_command(command)
                 logging.info(f"[CENTRALIZED] Comando publicado: {command}")
