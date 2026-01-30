@@ -60,6 +60,10 @@ async def main():
                     acct_obj = routed_accounts[0]
                     if acct_obj and "fixed_lot" in acct_obj:
                         volume = acct_obj["fixed_lot"]
+                if not routed_accounts:
+                    logging.warning(f"[CENTRALIZED] No hay cuentas ruteadas para chat_id={chat_id} signal={sig}")
+                    last_id = msg_id
+                    continue
                 command = {
                     "signal_id": sig.get("trace", sig.get("signal_id")),
                     "type": "open",
