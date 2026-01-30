@@ -109,9 +109,8 @@ class MT5Executor:
             self._notify_bg(account["name"], f"⚠️ early_partial_close: {percent*100:.0f}% cerrado pero SL no pudo moverse a BE | Ticket: {int(ticket)}")
             return False
     def _notify_bg(self, account_name, message):
-        notifier = TelegramNotifierAdapter(self.notifier)
-        import asyncio
-        asyncio.create_task(notifier.notify(account_name, message))
+        # Notificaciones deshabilitadas temporalmente para evitar retrasos en ejecución de trades
+        pass
 
     async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None) -> bool:
         """
@@ -332,6 +331,11 @@ class MT5Executor:
         tickets = {}
         errors = {}
 
+        # Tomar snapshot de precio al inicio para referencia
+        ref_client = self._client_for(self.accounts[0])
+        ref_price = ref_client.tick_price(symbol, direction)
+        ref_time = time.time()
+
         # Construir accounts con direction correcto para cada cuenta activa
         accounts = []
         for acct in self.accounts:
@@ -346,6 +350,7 @@ class MT5Executor:
                 accounts.append(account)
 
         async def send_order(account):
+            entry_start = time.time()
             planned_sl_val = None  # Siempre local y explícito
             order_type = 0 if (account.get('direction', 'BUY')).upper() == 'BUY' else 1
             # Inicializar variables para evitar referencias antes de asignación
@@ -383,8 +388,7 @@ class MT5Executor:
                 if not symbol_info:
                     log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
 
-                # --- Lógica de entrada: mitad del SL a hint+buffer ---
-                # Nueva lógica de entrada con tolerancia de 15 pips
+                # --- Lógica de entrada mejorada: sincronización y latencia ---
                 entry_lo = None
                 entry_hi = None
                 if entry_range and isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
@@ -401,60 +405,64 @@ class MT5Executor:
                 if symbol_info and hasattr(symbol_info, 'point'):
                     point = float(getattr(symbol_info, 'point', point))
                 pips_tolerance = 15 * point
+                # Log de referencia de precio inicial
+                log.info(f"[ENTRY][SYNC] Precio de referencia inicial: {ref_price} (timestamp={ref_time}) para {symbol} ({name})")
+                # Si el precio de referencia ya está en rango, entrar inmediatamente
                 if entry_lo is not None and entry_hi is not None:
                     if direction.upper() == "BUY":
-                        # Si el precio está más de 15 pips por encima del rango superior, no entra
-                        if price > entry_hi + pips_tolerance:
-                            log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
+                        if ref_price > entry_hi + pips_tolerance:
+                            log.warning(f"[ENTRY][SYNC] Precio de referencia {ref_price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
                             return
-                        # Si el precio está dentro del rango o hasta 15 pips por encima, entra
-                        if entry_lo <= price <= entry_hi + pips_tolerance:
-                            log.info(f"[ENTRY] Precio {price} dentro de rango [{entry_lo}, {entry_hi}] o hasta +15 pips. Ejecutando entrada.")
+                        if entry_lo <= ref_price <= entry_hi + pips_tolerance:
+                            log.info(f"[ENTRY][SYNC] Precio de referencia {ref_price} dentro de rango [{entry_lo}, {entry_hi}] o hasta +15 pips. Ejecutando entrada.")
+                            price = ref_price
                         else:
                             # Esperar a que el precio entre en el rango permitido
-                            log.info(f"[ENTRY] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name})...")
+                            log.info(f"[ENTRY][SYNC] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name})...")
                             deadline = time.time() + self.entry_wait_seconds
                             while time.time() <= deadline:
                                 price = client.tick_price(symbol, direction)
                                 if entry_lo <= price <= entry_hi + pips_tolerance:
-                                    log.info(f"[ENTRY] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}), ejecutando entrada.")
+                                    log.info(f"[ENTRY][SYNC] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}), ejecutando entrada.")
                                     break
                                 if price > entry_hi + pips_tolerance:
-                                    log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
+                                    log.warning(f"[ENTRY][SYNC] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
                                     return
                                 await asyncio.sleep(self.entry_poll_ms / 1000.0)
                             else:
-                                log.warning(f"[ENTRY] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
+                                log.warning(f"[ENTRY][SYNC] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
                                 return
                     else:
-                        # SELL: Si el precio está más de 15 pips por debajo del rango inferior, no entra
-                        if price < entry_lo - pips_tolerance:
-                            log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
+                        if ref_price < entry_lo - pips_tolerance:
+                            log.warning(f"[ENTRY][SYNC] Precio de referencia {ref_price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
                             return
-                        # Si el precio está dentro del rango o hasta 15 pips por debajo, entra
-                        if entry_lo - pips_tolerance <= price <= entry_hi:
-                            log.info(f"[ENTRY] Precio {price} dentro de rango [{entry_lo}, {entry_hi}] o hasta -15 pips. Ejecutando entrada.")
+                        if entry_lo - pips_tolerance <= ref_price <= entry_hi:
+                            log.info(f"[ENTRY][SYNC] Precio de referencia {ref_price} dentro de rango [{entry_lo}, {entry_hi}] o hasta -15 pips. Ejecutando entrada.")
+                            price = ref_price
                         else:
                             # Esperar a que el precio entre en el rango permitido
-                            log.info(f"[ENTRY] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name})...")
+                            log.info(f"[ENTRY][SYNC] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name})...")
                             deadline = time.time() + self.entry_wait_seconds
                             while time.time() <= deadline:
                                 price = client.tick_price(symbol, direction)
                                 if entry_lo - pips_tolerance <= price <= entry_hi:
-                                    log.info(f"[ENTRY] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}), ejecutando entrada.")
+                                    log.info(f"[ENTRY][SYNC] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}), ejecutando entrada.")
                                     break
                                 if price < entry_lo - pips_tolerance:
-                                    log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
+                                    log.warning(f"[ENTRY][SYNC] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
                                     return
                                 await asyncio.sleep(self.entry_poll_ms / 1000.0)
                             else:
-                                log.warning(f"[ENTRY] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
+                                log.warning(f"[ENTRY][SYNC] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
                                 return
                 else:
                     price = client.tick_price(symbol, direction)
                     if price is None or price == 0.0:
                         log.error(f"[PRICE][ERROR] No se pudo obtener el precio actual de {symbol} ({name}) para la entrada. Abortando operación.")
                         return
+                # Log de latencia de entrada
+                entry_end = time.time()
+                log.info(f"[ENTRY][SYNC] Latencia de entrada para {name}: {entry_end-entry_start:.3f}s desde inicio de open_complete_trade")
                 order_type = 0 if direction == "BUY" else 1
 
                 # --- Forzar SL si es necesario ---
