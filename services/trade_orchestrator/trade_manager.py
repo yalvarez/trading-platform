@@ -987,8 +987,8 @@ class TradeManager:
                     log.info(f"[BE-DEBUG] Intentando aplicar BE | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol} dir={t.direction} entry={t.entry_price} tp1={float(tp)}")
                     await self._do_be(account, pos.ticket, point, is_buy)
                     log.info(f"[BE-DEBUG] BE ejecutado | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol}")
-                # Runner solo tras TP2 (ahora para cualquier trade con al menos 2 TPs)
-                if tp_idx == 2:
+                # Runner solo tras TP1 (para cualquier trade con al menos 1 TP)
+                if tp_idx == 1:
                     t.runner_enabled = True
                 try:
                     TP_HITS.labels(tp=f"tp{tp_idx}").inc()

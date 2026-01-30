@@ -118,24 +118,23 @@ async def main():
         # Ejemplo: open, move_sl, close, partial_close, trailing, be
         # Aquí solo se muestra el esqueleto para 'open'
         if cmd["type"] == "open":
-            # Ejecutar la orden para cada cuenta dict recibido
+            # Ejecutar la orden normal para cada cuenta dict recibido
             for account in cmd["accounts"]:
-                res = await execu.open_runner_trade(
-                    account=account,
+                res = await execu.open_complete_trade(
+                    provider_tag=cmd.get("provider_tag", "CENTRALIZED"),
                     symbol=cmd["symbol"],
                     direction=cmd["direction"],
-                    volume=cmd["volume"],
+                    entry_range=None,  # Ajustar si se usa rango de entrada
                     sl=cmd["sl"],
-                    tp=cmd["tp"][0] if cmd["tp"] else None,
-                    provider_tag=cmd.get("provider_tag", "CENTRALIZED")
+                    tps=cmd["tp"] if "tp" in cmd else []
                 )
                 # Publicar evento de ejecución por cuenta
                 await bus.publish_event({
                     "signal_id": cmd["signal_id"],
                     "account": account,
                     "type": "executed",
-                    "ticket": getattr(res, "order", None),
-                    "status": "success" if getattr(res, "order", None) else "error",
+                    "ticket": getattr(res, "order", None) if res else None,
+                    "status": "success" if res and getattr(res, "order", None) else "error",
                     "details": str(res),
                     "timestamp": int(asyncio.get_event_loop().time())
                 })
