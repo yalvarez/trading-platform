@@ -22,38 +22,34 @@ async def main():
     # Lanzar el loop de gestión en background
     asyncio.create_task(manager.run())
 
-    # Ejemplo: publicar un comando de apertura de trade (simulado)
-    command = {
-        "signal_id": "demo001",
-        "type": "open",
-        "symbol": "XAUUSD",
-        "direction": "BUY",
-        "entry_price": 2025.10,
-        "sl": 2019.00,
-        "tp": [2028.00, 2032.00],
-        "volume": 0.1,
-        "accounts": ["acct1", "acct2"],
-        "timestamp": 1700000000
-    }
-    await bus.publish_command(command)
-    logging.info(f"Comando publicado: {command}")
 
-    # Escuchar eventos de ejecución y actualizar métricas
-    async for msg_id, event in bus.listen_events():
-        logging.info(f"Evento recibido: {event}")
-        if event["type"] == "executed" and event["status"] == "success":
-            TRADES_OPENED.labels(account=event["account"], symbol=command["symbol"]).inc()
-            ACTIVE_TRADES.labels(account=event["account"], symbol=command["symbol"]).inc()
-        elif event["type"] == "executed" and event["status"] == "error":
-            TRADES_FAILED.labels(account=event["account"], symbol=command["symbol"]).inc()
-        elif event["type"] == "tp_hit":
-            TP_HITS.labels(account=event["account"], symbol=command["symbol"], tp=event.get("tp", "")).inc()
-        elif event["type"] == "partial_closed":
-            PARTIAL_CLOSES.labels(account=event["account"], symbol=command["symbol"]).inc()
-        elif event["type"] == "trailing_activated":
-            TRAILING_ACTIVATED.labels(account=event["account"], symbol=command["symbol"]).inc()
-        elif event["type"] == "be_activated":
-            BE_ACTIVATED.labels(account=event["account"], symbol=command["symbol"]).inc()
+    # Escuchar señales parseadas y procesarlas
+    redis = bus.redis
+    last_id = "$"
+    while True:
+        streams = await redis.xread({"parsed_signals": last_id}, block=1000)
+        for stream, msgs in streams or []:
+            for msg_id, sig in msgs:
+                # Procesar la señal parseada y construir el comando de trade
+                # Aquí debes aplicar la lógica de cuentas, volumen, modalidad, etc.
+                # Ejemplo mínimo:
+                command = {
+                    "signal_id": sig.get("trace", sig.get("signal_id")),
+                    "type": "open",
+                    "symbol": sig.get("symbol"),
+                    "direction": sig.get("direction"),
+                    "entry_range": sig.get("entry_range"),
+                    "sl": sig.get("sl"),
+                    "tp": json.loads(sig.get("tps", "[]")),
+                    "provider_tag": sig.get("provider_tag"),
+                    "timestamp": sig.get("timestamp"),
+                    # Aquí debes poblar accounts y volume según tu lógica
+                    "accounts": [],
+                    "volume": 0.01,
+                }
+                await bus.publish_command(command)
+                logging.info(f"[CENTRALIZED] Comando publicado: {command}")
+                last_id = msg_id
 
 if __name__ == "__main__":
     asyncio.run(main())

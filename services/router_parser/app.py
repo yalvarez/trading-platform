@@ -265,25 +265,9 @@ async def main():
                         sig["chat_id"] = chat_id
                         sig["raw_text"] = text
                         sig["trace"] = trace_id
-                        await xadd(r, Streams.SIGNALS, sig)
-                        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
-                        # Publicar solo la señal parseada, sin lógica de cuentas, volumen ni modalidad
-                        if sig.get("symbol") and sig.get("direction"):
-                            command = {
-                                "signal_id": sig.get("trace", trace_id),
-                                "type": "open",
-                                "symbol": sig.get("symbol"),
-                                "direction": sig.get("direction"),
-                                "entry_range": sig.get("entry_range"),
-                                "sl": sig.get("sl"),
-                                "tp": json.loads(sig.get("tps", "[]")),
-                                "provider_tag": sig.get("provider_tag"),
-                                "timestamp": int(uuid.uuid1().time // 1e7),
-                                "chat_id": chat_id,
-                                "raw_text": text,
-                            }
-                            await bus.publish_command(command)
-                            log.info(f"[COMMAND] Publicado en trade_commands: {command}")
+                        # Publicar la señal parseada en el stream 'parsed_signals'
+                        await xadd(r, "parsed_signals", sig)
+                        log.info(f"[PARSED_SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
                     else:
                         pass  # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
                 finally:
