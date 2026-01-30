@@ -54,10 +54,10 @@ async def main():
                     allowed = acct.get("allowed_channels", [])
                     if chat_id is not None and allowed and int(chat_id) not in allowed:
                         continue
-                    routed_accounts.append(acct["name"])
+                    routed_accounts.append(acct)
                 # Si hay solo una cuenta, usar su fixed_lot
                 if routed_accounts:
-                    acct_obj = next((a for a in accounts_config if a["name"] == routed_accounts[0]), None)
+                    acct_obj = routed_accounts[0]
                     if acct_obj and "fixed_lot" in acct_obj:
                         volume = acct_obj["fixed_lot"]
                 command = {
