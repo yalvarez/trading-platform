@@ -76,30 +76,31 @@ class CentralizedTradeManager:
         - addon
         """
         account = event.get("account")
-        if not account or account not in self.account_settings:
-            log.warning(f"[MGMT] Cuenta no encontrada en settings: {account}")
+        account_name = account["name"] if isinstance(account, dict) else account
+        if not account_name or account_name not in self.account_settings:
+            log.warning(f"[MGMT] Cuenta no encontrada en settings: {account_name}")
             return
-        acc_settings = self.account_settings[account]
+        acc_settings = self.account_settings[account_name]
 
         # --- Break-even logic ---
         if self._should_apply_breakeven(event, acc_settings):
-            await self._apply_breakeven(event, acc_settings)
+            await self._apply_breakeven(event, acc_settings, account_name)
 
         # --- Trailing stop logic ---
         if self._should_apply_trailing(event, acc_settings):
-            await self._apply_trailing(event, acc_settings)
+            await self._apply_trailing(event, acc_settings, account_name)
 
         # --- Partial close logic ---
         if self._should_apply_partial_close(event, acc_settings):
-            await self._apply_partial_close(event, acc_settings)
+            await self._apply_partial_close(event, acc_settings, account_name)
 
         # --- Scaling logic ---
         if self._should_apply_scaling(event, acc_settings):
-            await self._apply_scaling(event, acc_settings)
+            await self._apply_scaling(event, acc_settings, account_name)
 
         # --- Addon logic ---
         if self._should_apply_addon(event, acc_settings):
-            await self._apply_addon(event, acc_settings)
+            await self._apply_addon(event, acc_settings, account_name)
 
     # --- Advanced management logic stubs ---
     def _should_apply_breakeven(self, event: dict, acc_settings: AccountTradeSettings) -> bool:
@@ -109,13 +110,13 @@ class CentralizedTradeManager:
             and event.get("tp_index", 0) >= acc_settings.breakeven_after_tp_hit
         )
 
-    async def _apply_breakeven(self, event: dict, acc_settings: AccountTradeSettings):
-        log.info(f"[BE] Activando break-even para {event['account']} ticket={event['ticket']}")
+    async def _apply_breakeven(self, event: dict, acc_settings: AccountTradeSettings, account_name: str):
+        log.info(f"[BE] Activando break-even para {account_name} ticket={event['ticket']}")
         cmd = {
             "signal_id": event["signal_id"],
             "type": "be",
             "symbol": event["symbol"],
-            "accounts": [event["account"]],
+            "accounts": [account_name],
             "ticket": event["ticket"],
             "be": {"enabled": True, "offset": acc_settings.breakeven_offset_pips},
             "timestamp": event["timestamp"]
@@ -125,13 +126,13 @@ class CentralizedTradeManager:
     def _should_apply_trailing(self, event: dict, acc_settings: AccountTradeSettings) -> bool:
         return event["type"] == "trailing_activated" and acc_settings.enable_trailing
 
-    async def _apply_trailing(self, event: dict, acc_settings: AccountTradeSettings):
-        log.info(f"[TRAILING] Reforzando trailing para {event['account']} ticket={event['ticket']}")
+    async def _apply_trailing(self, event: dict, acc_settings: AccountTradeSettings, account_name: str):
+        log.info(f"[TRAILING] Reforzando trailing para {account_name} ticket={event['ticket']}")
         cmd = {
             "signal_id": event["signal_id"],
             "type": "trailing",
             "symbol": event["symbol"],
-            "accounts": [event["account"]],
+            "accounts": [account_name],
             "ticket": event["ticket"],
             "trailing": {
                 "enabled": True,
@@ -146,13 +147,13 @@ class CentralizedTradeManager:
         # Placeholder: implement real condition for partial close
         return event["type"] == "partial_close" and acc_settings.enable_scaling
 
-    async def _apply_partial_close(self, event: dict, acc_settings: AccountTradeSettings):
-        log.info(f"[PARTIAL] Ejecutando cierre parcial para {event['account']} ticket={event['ticket']}")
+    async def _apply_partial_close(self, event: dict, acc_settings: AccountTradeSettings, account_name: str):
+        log.info(f"[PARTIAL] Ejecutando cierre parcial para {account_name} ticket={event['ticket']}")
         cmd = {
             "signal_id": event["signal_id"],
             "type": "partial_close",
             "symbol": event["symbol"],
-            "accounts": [event["account"]],
+            "accounts": [account_name],
             "ticket": event["ticket"],
             "partial": {
                 "percent": acc_settings.scale_down_percent
@@ -165,8 +166,8 @@ class CentralizedTradeManager:
         # Placeholder: implement real condition for scaling
         return event["type"] == "scaling" and acc_settings.enable_scaling
 
-    async def _apply_scaling(self, event: dict, acc_settings: AccountTradeSettings):
-        log.info(f"[SCALING] Ejecutando scaling para {event['account']} ticket={event['ticket']}")
+    async def _apply_scaling(self, event: dict, acc_settings: AccountTradeSettings, account_name: str):
+        log.info(f"[SCALING] Ejecutando scaling para {account_name} ticket={event['ticket']}")
         cmd = {
             "signal_id": event["signal_id"],
             "type": "scaling",
