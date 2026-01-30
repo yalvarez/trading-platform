@@ -293,6 +293,7 @@ class MT5Executor:
             log.info(f"[FILLING] Probar type_filling={f} para {symbol} | req={req_try}")
             res = await loop.run_in_executor(None, client.order_send, req_try)
             last_res = res
+            log.info(f"[ORDER_SEND][{account_name}] symbol={symbol} type_filling={f} req={req_try} response={repr(res)}")
             if res and getattr(res, "retcode", None) in (10009, 10008):
                 return res
             # Logging detallado si la orden falla
