@@ -142,7 +142,7 @@ async def main():
         # TODO: Implementar otros tipos de comando (move_sl, close, etc.)
 
     async def loop_commands():
-        last_id = "$"
+        last_id = "0"
         async for msg_id, cmd in bus.listen_commands(last_id=last_id):
             log.info(f"[ORCHESTRATOR] Mensaje recibido: id={msg_id} cmd={cmd}")
             await handle_command(cmd)
