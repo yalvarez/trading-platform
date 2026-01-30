@@ -384,53 +384,72 @@ class MT5Executor:
                     log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
 
                 # --- Lógica de entrada: mitad del SL a hint+buffer ---
-                entry_hint = None
+                # Nueva lógica de entrada con tolerancia de 15 pips
+                entry_lo = None
+                entry_hi = None
                 if entry_range and isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
-                    # Si es venta, usar el precio más bajo; si es compra, el más alto
-                    if direction.upper() == "SELL":
-                        entry_hint = float(min(entry_range))
-                    else:
-                        entry_hint = float(max(entry_range))
+                    entry_lo = float(min(entry_range))
+                    entry_hi = float(max(entry_range))
                 elif entry_range and isinstance(entry_range, (float, int)):
-                    entry_hint = float(entry_range)
+                    entry_lo = entry_hi = float(entry_range)
                 else:
                     log.warning(f"[ENTRY] No entry_range provided for {symbol} ({name}), skipping price wait.")
-                price = 0.0
-                forced_sl = sl
-                # Obtener SL real para calcular el rango
-                if not forced_sl or float(forced_sl) == 0.0:
-                    sl_val = None
-                else:
-                    sl_val = float(forced_sl)
-                buffer = self.entry_buffer_points
-                if entry_hint is not None and sl_val is not None:
-                    # Calcular mitad del SL
-                    mid_sl = (entry_hint + sl_val) / 2
-                    # Definir rango válido
+                price = client.tick_price(symbol, direction)
+                # Obtener el tamaño de pip para el símbolo
+                symbol_info = client.symbol_info(symbol)
+                point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
+                if symbol_info and hasattr(symbol_info, 'point'):
+                    point = float(getattr(symbol_info, 'point', point))
+                pips_tolerance = 15 * point
+                if entry_lo is not None and entry_hi is not None:
                     if direction.upper() == "BUY":
-                        valid_lo = min(mid_sl, entry_hint)
-                        valid_hi = entry_hint + buffer
-                    else:
-                        valid_lo = entry_hint - buffer
-                        valid_hi = max(mid_sl, entry_hint)
-                    # Obtener precio actual
-                    price = client.tick_price(symbol, direction)
-                    # Si el precio ya está en el rango, entrar inmediatamente
-                    if valid_lo <= price <= valid_hi:
-                        log.info(f"[ENTRY] Precio {price} dentro de rango [{valid_lo}, {valid_hi}] para {symbol} ({name}), entrando inmediatamente.")
-                    else:
-                        # Esperar a que el precio entre en el rango
-                        log.info(f"[ENTRY] Esperando precio en rango [{valid_lo}, {valid_hi}] para {symbol} ({name})...")
-                        deadline = time.time() + self.entry_wait_seconds
-                        while time.time() <= deadline:
-                            price = client.tick_price(symbol, direction)
-                            if valid_lo <= price <= valid_hi:
-                                log.info(f"[ENTRY] Precio {price} entró en rango [{valid_lo}, {valid_hi}] para {symbol} ({name}), ejecutando entrada.")
-                                break
-                            await asyncio.sleep(self.entry_poll_ms / 1000.0)
-                        else:
-                            log.warning(f"[ENTRY] No suitable price found in range [{valid_lo}, {valid_hi}] for {symbol} ({name}) during wait window. Skipping entry.")
+                        # Si el precio está más de 15 pips por encima del rango superior, no entra
+                        if price > entry_hi + pips_tolerance:
+                            log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
                             return
+                        # Si el precio está dentro del rango o hasta 15 pips por encima, entra
+                        if entry_lo <= price <= entry_hi + pips_tolerance:
+                            log.info(f"[ENTRY] Precio {price} dentro de rango [{entry_lo}, {entry_hi}] o hasta +15 pips. Ejecutando entrada.")
+                        else:
+                            # Esperar a que el precio entre en el rango permitido
+                            log.info(f"[ENTRY] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name})...")
+                            deadline = time.time() + self.entry_wait_seconds
+                            while time.time() <= deadline:
+                                price = client.tick_price(symbol, direction)
+                                if entry_lo <= price <= entry_hi + pips_tolerance:
+                                    log.info(f"[ENTRY] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}), ejecutando entrada.")
+                                    break
+                                if price > entry_hi + pips_tolerance:
+                                    log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
+                                    return
+                                await asyncio.sleep(self.entry_poll_ms / 1000.0)
+                            else:
+                                log.warning(f"[ENTRY] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
+                                return
+                    else:
+                        # SELL: Si el precio está más de 15 pips por debajo del rango inferior, no entra
+                        if price < entry_lo - pips_tolerance:
+                            log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
+                            return
+                        # Si el precio está dentro del rango o hasta 15 pips por debajo, entra
+                        if entry_lo - pips_tolerance <= price <= entry_hi:
+                            log.info(f"[ENTRY] Precio {price} dentro de rango [{entry_lo}, {entry_hi}] o hasta -15 pips. Ejecutando entrada.")
+                        else:
+                            # Esperar a que el precio entre en el rango permitido
+                            log.info(f"[ENTRY] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name})...")
+                            deadline = time.time() + self.entry_wait_seconds
+                            while time.time() <= deadline:
+                                price = client.tick_price(symbol, direction)
+                                if entry_lo - pips_tolerance <= price <= entry_hi:
+                                    log.info(f"[ENTRY] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}), ejecutando entrada.")
+                                    break
+                                if price < entry_lo - pips_tolerance:
+                                    log.warning(f"[ENTRY] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
+                                    return
+                                await asyncio.sleep(self.entry_poll_ms / 1000.0)
+                            else:
+                                log.warning(f"[ENTRY] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
+                                return
                 else:
                     price = client.tick_price(symbol, direction)
                     if price is None or price == 0.0:
