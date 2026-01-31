@@ -2,7 +2,7 @@ import os
 import httpx
 
 TELEGRAM_INGESTOR_URL = os.getenv("TELEGRAM_INGESTOR_URL", "http://localhost:8000")
-CHAT_ID = os.getenv("TG_TEST_CHAT_ID","8592452414")  # Pon aquí el chat_id de prueba o usa una variable de entorno
+CHAT_ID = os.getenv("TG_TEST_CHAT_ID","8410609272")  # Pon aquí el chat_id de prueba o usa una variable de entorno
 MENSAJE = "🔔 Prueba directa de notificación desde el contenedor orchestrator."
 
 def main():
