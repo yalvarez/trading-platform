@@ -90,14 +90,25 @@ async def main():
     accounts = s.accounts()
 
     # Inicialización centralizada del notificador Telegram
+    # Forzar habilitación de notificaciones
     notifier_adapter = None
-    if s.enable_notifications:
-        try:
-            tg_notifier = RemoteTelegramNotifier(os.getenv("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
-            notifier_adapter = TelegramNotifierAdapter(tg_notifier)
-            log.info("TelegramNotifierAdapter initialized")
-        except Exception as e:
-            log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
+    try:
+        tg_notifier = RemoteTelegramNotifier(os.getenv("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
+        notifier_adapter = TelegramNotifierAdapter(tg_notifier)
+        log.info("TelegramNotifierAdapter initialized (forced enable)")
+    except Exception as e:
+        log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
+
+    # Enviar mensaje de prueba al iniciar
+    try:
+        cuentas = s.accounts()
+        if cuentas and notifier_adapter:
+            cuenta_prueba = cuentas[0].get("name")
+            if cuenta_prueba:
+                log.info(f"Enviando mensaje de prueba de notificación a la cuenta: {cuenta_prueba}")
+                await notifier_adapter.notify(cuenta_prueba, "✅ Notificación de prueba enviada desde orchestrator.")
+    except Exception as e:
+        log.error(f"Error enviando notificación de prueba: {e}")
 
     execu = MT5Executor(
         accounts,
