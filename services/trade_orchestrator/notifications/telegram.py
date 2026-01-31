@@ -21,7 +21,11 @@ class TelegramNotifierAdapter:
             self.log.info(f"[NOTIFY][{account_name}] {message}")
             return
         try:
-            await self.notifier(account_name, message)
+            # Si el notificador tiene método 'notify', úsalo; si no, asume que es invocable
+            if hasattr(self.notifier, 'notify') and callable(getattr(self.notifier, 'notify')):
+                await self.notifier.notify(account_name, message)
+            else:
+                await self.notifier(account_name, message)
         except Exception as e:
             self.log.error(f"[NOTIFY][ERROR] {account_name}: {e}")
 
