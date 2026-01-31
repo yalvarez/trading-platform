@@ -1,6 +1,6 @@
 import os, json, asyncio, logging, sys, uuid
 import redis.asyncio as aioredis
-from common.config import Settings
+from services.common.config_db import ConfigProvider
 from common.redis_streams import redis_client, xread_loop, xadd, Streams
 from common.timewindow import parse_windows, in_windows
 
@@ -78,7 +78,8 @@ async def main():
     - Inicializa settings, métricas, Redis, cuentas y notificador.
     - Lanza los loops de señales y gestión de trades.
     """
-    s = Settings.load()
+    config = ConfigProvider()
+    s = config
     # start Prometheus metrics server
     try:
         metrics_port = int(os.getenv("METRICS_PORT", "8000"))
@@ -86,14 +87,14 @@ async def main():
         log.info(f"Prometheus metrics server started on :{metrics_port}")
     except Exception as e:
         log.error(f"Failed to start Prometheus metrics server: {e}")
-    r = await redis_client(s.redis_url)
-    accounts = s.accounts()
+    r = await redis_client(s.get("REDIS_URL", "redis://redis:6379/0"))
+    accounts = config.get_accounts()
 
     # Inicialización centralizada del notificador Telegram
     # Forzar habilitación de notificaciones
     notifier_adapter = None
     try:
-        tg_notifier = RemoteTelegramNotifier(os.getenv("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
+        tg_notifier = RemoteTelegramNotifier(config.get("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
         notifier_adapter = TelegramNotifierAdapter(tg_notifier)
         log.info("TelegramNotifierAdapter initialized (forced enable)")
     except Exception as e:
@@ -101,7 +102,7 @@ async def main():
 
     # Enviar mensaje de prueba al iniciar
     try:
-        cuentas = s.accounts()
+        cuentas = config.get_accounts()
         if cuentas and notifier_adapter:
             cuenta_prueba = cuentas[0].get("chat_id")
             if cuenta_prueba:
@@ -114,10 +115,10 @@ async def main():
         accounts,
         magic=987654,
         notifier=(notifier_adapter if notifier_adapter is not None else None),
-        trading_windows=s.trading_windows,
-        entry_wait_seconds=s.entry_wait_seconds,
-        entry_poll_ms=s.entry_poll_ms,
-        entry_buffer_points=s.entry_buffer_points,
+        trading_windows=config.get("TRADING_WINDOWS", "03:00-12:00,08:00-17:00"),
+        entry_wait_seconds=int(config.get("ENTRY_WAIT_SECONDS", 60)),
+        entry_poll_ms=int(config.get("ENTRY_POLL_MS", 500)),
+        entry_buffer_points=float(config.get("ENTRY_BUFFER_POINTS", 0.0)),
     )
 
     tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None))  # attach notifier if available
@@ -152,8 +153,8 @@ async def main():
             if account:
                 client = execu._client_for(account)
                 price = client.tick_price(symbol, direction)
-                # Obtener default_sl_pips desde entorno o config
-                default_sl_pips = float(os.getenv("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(os.getenv("DEFAULT_SL_PIPS", 100))
+                # Obtener default_sl_pips desde config
+                default_sl_pips = float(config.get("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(config.get("DEFAULT_SL_PIPS", 100))
                 point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
                 from .trade_utils import calcular_sl_default
                 forced_sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
@@ -249,9 +250,8 @@ async def main():
         for acct in accounts:
             allowed_channels = acct.get("allowed_channels")
             if allowed_channels is None:
-                filtered_accounts.append(acct)  # Si no está definido, acepta todos los canales
+                filtered_accounts.append(acct)
             else:
-                # Puede ser lista de int o str
                 if source_channel and any(int(ch) == source_channel for ch in allowed_channels):
                     filtered_accounts.append(acct)
         if not filtered_accounts:
@@ -341,7 +341,7 @@ async def main():
         Obtiene el último ID procesado de señales desde Redis.
         """
         try:
-            redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+            redis_url = config.get("REDIS_URL", 'redis://localhost:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             last_id = await redis.get(REDIS_OFFSET_KEY)
             await redis.aclose()
@@ -355,7 +355,7 @@ async def main():
         Guarda el último ID procesado de señales en Redis.
         """
         try:
-            redis_url = s.redis_url if hasattr(s, 'redis_url') else os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+            redis_url = config.get("REDIS_URL", 'redis://localhost:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             await redis.set(REDIS_OFFSET_KEY, last_id)
             await redis.aclose()

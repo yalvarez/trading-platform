@@ -5,7 +5,14 @@ from .mt5_executor import MT5Executor
 from .notifications.telegram import TelegramNotifierAdapter
 
 class TradeManager:
-    # ...existing code...
+    def __init__(self, mt5_executor, notifier=None, config_provider=None, redis_url=None, redis_conn=None):
+        self.mt5 = mt5_executor
+        self.notifier = notifier
+        self.config_provider = config_provider
+        self.redis_url = redis_url or (self.config_provider.get('REDIS_URL', 'redis://localhost:6379/0') if self.config_provider else os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+        self.redis = redis_conn
+        # ...other initialization...
+
     def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
         """
         Procesa mensajes de gestión Hannah como:
@@ -29,7 +36,8 @@ class TradeManager:
 
         # Ejecutar para cada cuenta activa con trade Hannah
         any_matched_trade = False
-        for account in [a for a in self.mt5.accounts if a.get("active")]:
+        accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
+        for account in [a for a in accounts if a.get("active")]:
             client = self.mt5._client_for(account)
             positions = client.positions_get()
             if not positions:
@@ -220,7 +228,8 @@ class TradeManager:
             return 100
 
         # Use the first active account for context (should be refactored to always have account)
-        account = next((a for a in self.mt5.accounts if a.get("active")), None)
+        accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
+        account = next((a for a in accounts if a.get("active")), None)
         client = self.mt5._client_for(account) if account else None
         pos_list = client.positions_get(ticket=int(ticket)) if client else []
         if not pos_list:
@@ -264,8 +273,8 @@ class TradeManager:
         # Deshabilitado este filtro por el momento
         # if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
         #     return
-        tramo_pips = float(os.getenv('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 30.0)))
-        percent_per_tramo = float(os.getenv('SCALING_PERCENT_PER_TRAMO', getattr(self, 'scaling_percent_per_tramo', 25)))
+        tramo_pips = float(self.config_provider.get('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 30.0)))
+        percent_per_tramo = float(self.config_provider.get('SCALING_PERCENT_PER_TRAMO', getattr(self, 'scaling_percent_per_tramo', 25)))
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
         symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
         client = self.mt5._client_for(account)
@@ -525,8 +534,7 @@ class TradeManager:
         self.group_addon_count = {}
 
         # --- Redis connection for PnL tracking ---
-        self.redis_url = redis_url or os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-        self.redis = redis_conn
+        # Already set in __init__
 
     # ----------------------------
     # Notifier
@@ -561,7 +569,7 @@ class TradeManager:
             default_sl_pips = getattr(self, 'default_sl', None)
             env_override = None
             if symbol_upper == "XAUUSD":
-                env_override = os.getenv("DEFAULT_SL_XAUUSD_PIPS")
+                env_override = self.config_provider.get("DEFAULT_SL_XAUUSD_PIPS") if self.config_provider else os.getenv("DEFAULT_SL_XAUUSD_PIPS")
             if env_override is not None:
                 try:
                     default_sl_pips = float(env_override)
@@ -616,7 +624,8 @@ class TradeManager:
         log.info("[RUN_FOREVER] TradeManager loop iniciado y activo.")
         tick_count = 0
         while True:
-            accounts = [a for a in self.mt5.accounts if a.get("active")]
+            accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
+            accounts = [a for a in accounts if a.get("active")]
             await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
             # tick_count += 1
             # if tick_count % 60 == 0:
@@ -712,7 +721,8 @@ class TradeManager:
         - Aplica gestión: TP, BE, trailing, addon
         - Maneja reconexión automática y errores de red para robustez
         """
-        for account in [a for a in self.mt5.accounts if a.get("active")]:
+        accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
+        for account in [a for a in accounts if a.get("active")]:
             try:
                 client = self.mt5._client_for(account)
                 if hasattr(client, 'connect_to_account') and not client.connect_to_account(account):
@@ -1340,9 +1350,9 @@ class TradeManager:
         trailing_min_change_pips = self.trailing_min_change_pips
         trailing_cooldown_sec = self.trailing_cooldown_sec
         trailing_activation_after_tp2 = self.trailing_activation_after_tp2
-        if hasattr(self, 'config'):
+        if self.config_provider:
             try:
-                trailing_cfg = self.config.get('trailing', {})
+                trailing_cfg = self.config_provider.get('trailing', {})
                 if acc_name in trailing_cfg and symbol in trailing_cfg[acc_name]:
                     cfg = trailing_cfg[acc_name][symbol]
                     trailing_activation_pips = cfg.get('activation_pips', trailing_activation_pips)

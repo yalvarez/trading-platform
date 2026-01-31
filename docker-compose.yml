@@ -1,4 +1,32 @@
 services:
+  # =========================
+  # Backend administrativo (FastAPI)
+  # =========================
+  postgres:
+    image: postgres:15
+    container_name: atp-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: trading_config
+      POSTGRES_USER: trading_user
+      POSTGRES_PASSWORD: trading_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  # =========================
+  backend_admin:
+    build:
+      context: ./backend_admin
+    container_name: atp-backend-admin
+    env_file:
+      - ./backend_admin/.env.example
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+  # =========================
   redis:
     image: redis:7-alpine
     container_name: atp-redis
@@ -22,8 +50,8 @@ services:
     image: gmag11/metatrader5_vnc:latest
     container_name: atp-mt5-acct1
     environment:
-      - CUSTOM_USER=yalvarezc
-      - PASSWORD=mt5VNCP@ss19375
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
     ports:
       - "3001:3000"
       - "8001:8001"
@@ -232,6 +260,7 @@ services:
       - grafana_data:/var/lib/grafana
 
 volumes:
+  pgdata:
   redis_data:
   mt5_acct1_config:
   mt5_acct2_config:

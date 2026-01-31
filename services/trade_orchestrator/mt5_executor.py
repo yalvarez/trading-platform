@@ -351,6 +351,7 @@ class MT5Executor:
         entry_wait_seconds: int = 60,
         entry_poll_ms: int = 500,
         entry_buffer_points: float = 0.0,
+        config_provider=None,
     ):
         self.accounts = accounts
         self.default_deviation = default_deviation
@@ -361,6 +362,7 @@ class MT5Executor:
         self.entry_buffer_points = entry_buffer_points
         self.entry_wait_seconds = entry_wait_seconds
         self.entry_poll_ms = entry_poll_ms
+        self.config_provider = config_provider
 
     async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
         tickets = {}
@@ -624,7 +626,7 @@ class MT5Executor:
                             import os
                             now = time.time()
                             try:
-                                window_seconds = int(os.getenv('DEDUP_TTL_SECONDS', '120'))
+                                window_seconds = int(self.config_provider.get('DEDUP_TTL_SECONDS', '120')) if self.config_provider else int(os.getenv('DEDUP_TTL_SECONDS', '120'))
                             except Exception:
                                 window_seconds = 120
                             # Logging: mostrar todos los trades candidatos
