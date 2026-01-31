@@ -27,11 +27,16 @@ async def startup_event():
 
 @app.post("/notify")
 async def notify(req: NotifyRequest):
+    print(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
+    log.info(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
     try:
         await client.send_message(req.chat_id, req.message)
+        print(f"[API][NOTIFY] Mensaje enviado correctamente a {req.chat_id}")
+        log.info(f"[API][NOTIFY] Mensaje enviado correctamente a {req.chat_id}")
         return {"status": "ok"}
     except Exception as e:
-        log.error(f"[API][ERROR] {e}")
+        print(f"[API][NOTIFY][ERROR] {e}")
+        log.error(f"[API][NOTIFY][ERROR] {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.get("/health")
