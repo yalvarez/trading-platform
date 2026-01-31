@@ -5,7 +5,7 @@ import os
 # Configuración desde variables de entorno o .env
 API_ID = int(os.getenv("TG_API_ID", ""))
 API_HASH = os.getenv("TG_API_HASH", "")
-SESSION_FILE = os.getenv("TELEGRAM_SESSION", "telegram_ingestor.session")
+SESSION_FILE = os.getenv("TELEGRAM_SESSION", "telegram_ingestor_api.session")
 
 # Si usas StringSession, carga el string, si no, usa el archivo
 if os.path.exists(SESSION_FILE):
