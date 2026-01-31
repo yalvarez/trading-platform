@@ -103,7 +103,7 @@ async def main():
     try:
         cuentas = s.accounts()
         if cuentas and notifier_adapter:
-            cuenta_prueba = cuentas[0].get("name")
+            cuenta_prueba = cuentas[0].get("chat_id")
             if cuenta_prueba:
                 log.info(f"Enviando mensaje de prueba de notificación a la cuenta: {cuenta_prueba}")
                 await notifier_adapter.notify(cuenta_prueba, "✅ Notificación de prueba enviada desde orchestrator.")

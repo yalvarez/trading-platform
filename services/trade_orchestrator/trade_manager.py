@@ -48,7 +48,7 @@ class TradeManager:
                 # Llamada asíncrona
                 import asyncio
                 asyncio.create_task(self.mt5.early_partial_close(account, ticket, percent=0.5, provider_tag="HANNAH", reason="msg_mgmt"))
-                self._notify_bg(account["name"], f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
+                self._notify_bg(account, f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
         return any_matched_trade
 # trade_manager.py
 
@@ -243,7 +243,7 @@ class TradeManager:
                 # Guardar el precio del cierre del primer tramo
                 if tramo == 1:
                     t.first_tramo_close_price = float(current)
-                self._notify_bg(account["name"], f"🎯 ScalingOut TOROFX: Parcial tramo {tramo} ({percent_per_tramo}%) ejecutado | Ticket: {int(pos.ticket)}")
+                self._notify_bg(account, f"🎯 ScalingOut TOROFX: Parcial tramo {tramo} ({percent_per_tramo}%) ejecutado | Ticket: {int(pos.ticket)}")
                 await self.notify_trade_event(
                     'partial',
                     account_name=account["name"],
@@ -286,12 +286,12 @@ class TradeManager:
                     log.info(f"[TOROFX-SCALING] Aplicando BE tras tercer tramo | req={be_req}")
                     be_res = await mt5_executor._best_filling_order_send(client, symbol, be_req, account.get('name'))
                     log.info(f"[TOROFX-SCALING] Resultado BE tras tercer tramo | res={be_res}")
-                    self._notify_bg(account["name"], f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {be_sl}")
+                    self._notify_bg(account, f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {be_sl}")
         # Activar trailing solo después del cierre del tercer tramo
         if 3 in t.actions_done and not t.trailing_active_last_tramo:
             t.trailing_active_last_tramo = True
             t.trailing_peak_last_tramo = float(current)
-            self._notify_bg(account["name"], f"🚦 Trailing activado tras tercer tramo | Ticket: {int(pos.ticket)} | Peak: {current}")
+            self._notify_bg(account, f"🚦 Trailing activado tras tercer tramo | Ticket: {int(pos.ticket)} | Peak: {current}")
 
         # Si el trailing tras el tercer tramo está activo, monitorear retroceso
         if t.trailing_active_last_tramo:
@@ -325,7 +325,7 @@ class TradeManager:
                     mt5_executor = MT5Executor(self.mt5)
                     res = await mt5_executor._best_filling_order_send(client, symbol, req, account.get('name'))
                     log.info(f"[TOROFX-SCALING] Resultado cierre trailing último tramo | res={res}")
-                    self._notify_bg(account["name"], f"🚦 Trailing: Trade cerrado por retroceso de {trailing_pips_last_tramo} pips | Ticket: {int(pos.ticket)}")
+                    self._notify_bg(account, f"🚦 Trailing: Trade cerrado por retroceso de {trailing_pips_last_tramo} pips | Ticket: {int(pos.ticket)}")
                     await self.notify_trade_event(
                         'close',
                         account_name=account["name"],
@@ -460,11 +460,17 @@ class TradeManager:
     # ----------------------------
     # Notifier
     # ----------------------------
-    def _notify_bg(self, account_name: str, message: str):
-        # Centraliza notificaciones Telegram
+    def _notify_bg(self, account: dict, message: str):
+        # Centraliza notificaciones Telegram usando chat_id
         notifier = TelegramNotifierAdapter(self.notifier)
         import asyncio
-        asyncio.create_task(notifier.notify(account_name, message))
+        chat_id = account.get("chat_id")
+        if chat_id:
+            asyncio.create_task(notifier.notify(chat_id, message))
+        else:
+            account_name = account.get("name")
+            import logging
+            logging.getLogger("trade_orchestrator.trade_manager").warning(f"No chat_id for account {account_name}, notificación no enviada: {message}")
 
     async def notify_trade_event(self, event: str, **kwargs):
         notifier = TelegramNotifierAdapter(self.notifier)

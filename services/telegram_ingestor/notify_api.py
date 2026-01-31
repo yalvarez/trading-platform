@@ -29,8 +29,14 @@ async def startup_event():
 async def notify(req: NotifyRequest):
     print(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
     log.info(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
+    # Validar que el chat_id sea numérico (int, puede ser negativo)
+    if not str(req.chat_id).lstrip('-').isdigit():
+        error_msg = f"chat_id inválido: '{req.chat_id}'. Debe ser el ID numérico, no el nombre."
+        print(f"[API][NOTIFY][ERROR] {error_msg}")
+        log.error(f"[API][NOTIFY][ERROR] {error_msg}")
+        return {"status": "error", "detail": error_msg}
     try:
-        chat_id = int(req.chat_id) if str(req.chat_id).lstrip('-').isdigit() else req.chat_id
+        chat_id = int(req.chat_id)
         await client.send_message(chat_id, req.message)
         print(f"[API][NOTIFY] Mensaje enviado correctamente a {chat_id}")
         log.info(f"[API][NOTIFY] Mensaje enviado correctamente a {chat_id}")
