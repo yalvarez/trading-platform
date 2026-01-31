@@ -50,6 +50,76 @@ class TradeManager:
                 asyncio.create_task(self.mt5.early_partial_close(account, ticket, percent=0.5, provider_tag="HANNAH", reason="msg_mgmt"))
                 self._notify_bg(account, f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
         return any_matched_trade
+        def runner_momentum_filter(self, symbol: str, candles: list[dict], min_rsi: float = 55, min_impulse: float = 0.3, min_volume: float = 1.0, max_atr: float = 2.0) -> bool:
+            """
+            Professional filter for runner trades based on price momentum.
+            Uses RSI, volume, candle impulse, and ATR.
+            Args:
+                symbol: Symbol name
+                candles: List of candle dicts with keys: open, close, high, low, volume
+                min_rsi: Minimum RSI threshold
+                min_impulse: Minimum impulse (|close-open|/ATR)
+                min_volume: Minimum volume threshold
+                max_atr: Maximum ATR allowed
+            Returns:
+                True if runner entry is allowed, False otherwise
+            """
+            import numpy as np
+            def calc_rsi(closes, period=14):
+                deltas = np.diff(closes)
+                seed = deltas[:period]
+                up = seed[seed > 0].sum() / period
+                down = -seed[seed < 0].sum() / period
+                rs = up / down if down != 0 else 0
+                rsi = np.zeros_like(closes)
+                rsi[:period] = 50
+                for i in range(period, len(closes)):
+                    delta = deltas[i - 1]
+                    upval = max(delta, 0)
+                    downval = -min(delta, 0)
+                    up = (up * (period - 1) + upval) / period
+                    down = (down * (period - 1) + downval) / period
+                    rs = up / down if down != 0 else 0
+                    rsi[i] = 100 - 100 / (1 + rs)
+                return rsi[-1]
+
+            def calc_atr(candles, period=14):
+                trs = []
+                for i in range(1, len(candles)):
+                    high = candles[i]["high"]
+                    low = candles[i]["low"]
+                    prev_close = candles[i-1]["close"]
+                    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                    trs.append(tr)
+                if len(trs) < period:
+                    return np.mean(trs) if trs else 0.0
+                return np.mean(trs[-period:])
+
+            closes = [c["close"] for c in candles]
+            volumes = [c["volume"] for c in candles]
+            rsi = calc_rsi(closes)
+            atr = calc_atr(candles)
+            last_candle = candles[-1]
+            impulse = abs(last_candle["close"] - last_candle["open"]) / (atr if atr > 0 else 1)
+            last_volume = last_candle["volume"]
+
+            # Logging for diagnostics
+            log.info(f"[RUNNER-FILTER] {symbol} RSI={rsi:.2f} Impulse={impulse:.2f} Volume={last_volume:.2f} ATR={atr:.2f}")
+
+            if rsi < min_rsi:
+                log.info(f"[RUNNER-FILTER] {symbol} rejected: RSI {rsi:.2f} < {min_rsi}")
+                return False
+            if impulse < min_impulse:
+                log.info(f"[RUNNER-FILTER] {symbol} rejected: Impulse {impulse:.2f} < {min_impulse}")
+                return False
+            if last_volume < min_volume:
+                log.info(f"[RUNNER-FILTER] {symbol} rejected: Volume {last_volume:.2f} < {min_volume}")
+                return False
+            if atr > max_atr:
+                log.info(f"[RUNNER-FILTER] {symbol} rejected: ATR {atr:.2f} > {max_atr}")
+                return False
+            log.info(f"[RUNNER-FILTER] {symbol} accepted for runner entry.")
+            return True
 # trade_manager.py
 
 import asyncio
@@ -178,6 +248,7 @@ class TradeManager:
         return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
+        import os
         # Configuración de trailing tras el tercer tramo
         trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
         if not hasattr(t, 'trailing_active_last_tramo'):
@@ -193,8 +264,8 @@ class TradeManager:
         # Deshabilitado este filtro por el momento
         # if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
         #     return
-        tramo_pips = getattr(self, 'scaling_tramo_pips', 30.0)
-        percent_per_tramo = getattr(self, 'scaling_percent_per_tramo', 25)
+        tramo_pips = float(os.getenv('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 30.0)))
+        percent_per_tramo = float(os.getenv('SCALING_PERCENT_PER_TRAMO', getattr(self, 'scaling_percent_per_tramo', 25)))
         entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
         symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
         client = self.mt5._client_for(account)
@@ -1056,8 +1127,15 @@ class TradeManager:
                     await self._do_be(account, pos.ticket, point, is_buy)
                     log.info(f"[BE-DEBUG] BE ejecutado | account={account['name']} ticket={int(pos.ticket)} symbol={t.symbol}")
                 # Runner solo tras TP2 (ahora para cualquier trade con al menos 2 TPs)
-                if tp_idx == 2:
-                    t.runner_enabled = True
+                    if tp_idx == 2:
+                        # --- Runner momentum filter integration ---
+                        candles = self._get_recent_candles(t.symbol) if hasattr(self, '_get_recent_candles') else None
+                        if candles and self.runner_momentum_filter(t.symbol, candles):
+                            t.runner_enabled = True
+                            log.info(f"[RUNNER-FILTER] Runner enabled for {t.symbol} ticket={int(pos.ticket)}")
+                        else:
+                            t.runner_enabled = False
+                            log.info(f"[RUNNER-FILTER] Runner NOT enabled for {t.symbol} ticket={int(pos.ticket)} (momentum filter failed)")
                 try:
                     TP_HITS.labels(tp=f"tp{tp_idx}").inc()
                 except Exception:
@@ -1548,29 +1626,33 @@ class TradeManager:
                 client = self.mt5._client_for(cuenta)
                 # Cerrar 100% del trade original
                 await self._do_partial_close(cuenta, trade.ticket, 100, reason="REENTRY_TP1")
-                # Abrir runner con menor lote (ej: 30% del volumen original), ajustado a múltiplo de 0.01 y mínimo 0.01
-                original_vol = float(getattr(pos, "volume", 0.01))
-                raw_runner_lot = original_vol * 0.3
-                info = client.symbol_info(trade.symbol)
-                step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
-                vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
-                # Redondear hacia abajo al múltiplo de step
-                runner_lot = max(vmin, step * int(raw_runner_lot / step))
-                entry_price = float(getattr(pos, "price_open", current))
-                sl = entry_price
-                tp = tp2
-                # Abrir nueva posición runner
-                await self.mt5.open_runner_trade(
-                    cuenta,
-                    symbol=trade.symbol,
-                    direction=trade.direction,
-                    volume=runner_lot,
-                    sl=sl,
-                    tp=tp,
-                    provider_tag=f"{trade.provider_tag}_REENTRY"
-                )
-                trade.reentry_done = True
-                self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                # Abrir runner solo si momentum filter lo permite
+                candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
+                if candles and self.runner_momentum_filter(trade.symbol, candles):
+                    original_vol = float(getattr(pos, "volume", 0.01))
+                    raw_runner_lot = original_vol * 0.3
+                    info = client.symbol_info(trade.symbol)
+                    step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
+                    vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+                    # Redondear hacia abajo al múltiplo de step
+                    runner_lot = max(vmin, step * int(raw_runner_lot / step))
+                    entry_price = float(getattr(pos, "price_open", current))
+                    sl = entry_price
+                    tp = tp2
+                    # Abrir nueva posición runner
+                    await self.mt5.open_runner_trade(
+                        cuenta,
+                        symbol=trade.symbol,
+                        direction=trade.direction,
+                        volume=runner_lot,
+                        sl=sl,
+                        tp=tp,
+                        provider_tag=f"{trade.provider_tag}_REENTRY"
+                    )
+                    trade.reentry_done = True
+                    self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                else:
+                    self._notify_bg(cuenta["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
                 return
         # El runner se gestiona con trailing si está habilitado
         if self.enable_trailing:
