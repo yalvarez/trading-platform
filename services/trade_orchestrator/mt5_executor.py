@@ -44,6 +44,7 @@ class MT5Executor:
                 min_stop_raw = getattr(symbol_info, "stop_level", 0.0)
             else:
                 log.warning(f"[RUNNER][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
+                self._notify_bg(name, f"⚠️ SymbolInfo para {symbol} no tiene stops_level ni stop_level. Usando 0.0. Puede afectar la gestión de SL.")
                 min_stop_raw = 0.0
             fill_mode = getattr(symbol_info, "trade_fill_mode", None) if hasattr(symbol_info, "trade_fill_mode") else None
         else:
@@ -57,6 +58,7 @@ class MT5Executor:
             else:
                 adjusted_sl = price + min_stop
             log.warning(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
+            self._notify_bg(name, f"⚠️ SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
             forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
         # --- Preparar y loguear la orden ---
         req = {
@@ -135,8 +137,12 @@ class MT5Executor:
             self._notify_bg(account["name"], f"⚠️ early_partial_close: {percent*100:.0f}% cerrado pero SL no pudo moverse a BE | Ticket: {int(ticket)}")
             return False
     def _notify_bg(self, account_name, message):
-        # Notificaciones deshabilitadas temporalmente para evitar retrasos en ejecución de trades
-        pass
+        # Notifica por Telegram si el adaptador está disponible
+        try:
+            if hasattr(self, 'notifier') and self.notifier:
+                asyncio.create_task(self.notifier.notify(account_name, message))
+        except Exception as e:
+            log.error(f"[NOTIFY][ERROR] {account_name}: {e}")
 
     async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None) -> bool:
         """
@@ -325,9 +331,11 @@ class MT5Executor:
             # Logging detallado si la orden falla
             if res and getattr(res, "retcode", None) != 10030:
                 log.warning(f"[ORDER-FAIL] retcode={getattr(res,'retcode',None)} comment={getattr(res,'comment',None)} req={req_try} res={res}")
+                self._notify_bg(account_name, f"❌ Error al enviar orden: retcode={getattr(res,'retcode',None)} comment={getattr(res,'comment',None)}")
                 return res
             if res and getattr(res, "retcode", None) == 10030:
                 log.warning(f"[ORDER-INVALID-REQUEST] retcode=10030 comment={getattr(res,'comment',None)} req={req_try} res={res}")
+                self._notify_bg(account_name, f"❌ Orden inválida: retcode=10030 comment={getattr(res,'comment',None)}")
         return last_res
 
 
@@ -414,6 +422,7 @@ class MT5Executor:
                 symbol_info = client.symbol_info(symbol)
                 if not symbol_info:
                     log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
+                    self._notify_bg(name, f"⚠️ No symbol_info para {symbol} ({name}) después de select. El símbolo puede no estar disponible en MT5.")
 
                 # --- Lógica de entrada mejorada: sincronización y latencia ---
                 entry_lo = None
@@ -425,6 +434,7 @@ class MT5Executor:
                     entry_lo = entry_hi = float(entry_range)
                 else:
                     log.warning(f"[ENTRY] No entry_range provided for {symbol} ({name}), skipping price wait.")
+                    self._notify_bg(name, f"⚠️ No entry_range para {symbol} ({name}), se omite espera de precio.")
                 price = client.tick_price(symbol, direction)
                 # Obtener el tamaño de pip para el símbolo
                 symbol_info = client.symbol_info(symbol)
