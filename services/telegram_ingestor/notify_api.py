@@ -30,9 +30,10 @@ async def notify(req: NotifyRequest):
     print(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
     log.info(f"[API][NOTIFY] Recibido: chat_id={req.chat_id}, message={req.message}")
     try:
-        await client.send_message(req.chat_id, req.message)
-        print(f"[API][NOTIFY] Mensaje enviado correctamente a {req.chat_id}")
-        log.info(f"[API][NOTIFY] Mensaje enviado correctamente a {req.chat_id}")
+        chat_id = int(req.chat_id) if str(req.chat_id).lstrip('-').isdigit() else req.chat_id
+        await client.send_message(chat_id, req.message)
+        print(f"[API][NOTIFY] Mensaje enviado correctamente a {chat_id}")
+        log.info(f"[API][NOTIFY] Mensaje enviado correctamente a {chat_id}")
         return {"status": "ok"}
     except Exception as e:
         print(f"[API][NOTIFY][ERROR] {e}")
