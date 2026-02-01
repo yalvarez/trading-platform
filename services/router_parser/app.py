@@ -179,7 +179,7 @@ async def main():
     except Exception as e:
         log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
         channels_config = {}
-    router = SignalRouter(r, dedup_ttl=s.dedup_ttl_seconds, channels_config=channels_config)
+    router = SignalRouter(r, dedup_ttl=s["dedup_ttl_seconds"], channels_config=channels_config)
     group = "router_group"
     consumer = f"consumer_{os.getpid()}"
 
