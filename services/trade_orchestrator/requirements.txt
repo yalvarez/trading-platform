@@ -5,3 +5,4 @@ telethon==1.36.0
 prometheus_client==0.16.0
 mt5linux
 httpx
+psycopg2-binary
