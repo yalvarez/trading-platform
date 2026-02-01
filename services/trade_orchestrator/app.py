@@ -130,6 +130,7 @@ async def main():
         """
         trace_id = uuid.uuid4().hex[:8]
         orig_trace = fields.get("trace", "NO_TRACE")
+        log.info(f"[SIGNAL][TRACE] handle_signal llamado: trace_id={trace_id} orig_trace={orig_trace} fields={fields}")
         
         if not in_windows(parse_windows(s["trading_windows"])):
             log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
@@ -275,20 +276,24 @@ async def main():
             tps=tps,
         )
 
-        log.info("[SIGNAL] open_complete_trade done trace=%s", trace_id)
 
-        # register opened
-        for acct_name, ticket in res.tickets_by_account.items():
-            log.info(f"[TRACE][SIGNAL] SL propagado a register_trade: {sl}")
-            tradeManager.register_trade(
-                account_name=acct_name,
-                ticket=ticket,
-                symbol=symbol,
-                direction=direction,
-                provider_tag=provider_tag,
-                tps=tps,
-                planned_sl=float(sl) if sl else None,
-            )
+        log.info("[SIGNAL] open_complete_trade done trace=%s result=%s", trace_id, res)
+
+        if not res.tickets_by_account:
+            log.error(f"[SIGNAL][ERROR] No se abrió ningún trade. Errores: {res.errors_by_account}")
+        else:
+            # register opened
+            for acct_name, ticket in res.tickets_by_account.items():
+                log.info(f"[TRACE][SIGNAL] SL propagado a register_trade: {sl}")
+                tradeManager.register_trade(
+                    account_name=acct_name,
+                    ticket=ticket,
+                    symbol=symbol,
+                    direction=direction,
+                    provider_tag=provider_tag,
+                    tps=tps,
+                    planned_sl=float(sl) if sl else None,
+                )
 
         # Notify trade opened (friendly message) if notifier available
         if notifier_adapter is not None:
@@ -327,13 +332,19 @@ async def main():
         """
         text = fields.get("text","")
         hint = fields.get("provider_hint","")
+        chat_id = int(fields.get("chat_id","0"))
+        log.info(f"[MGMT] Mensaje de gestión recibido: provider_hint={hint} chat_id={chat_id} text={text}")
         if hint == "TOROFX":
-            tradeManager.handle_torofx_management_message(int(fields.get("chat_id","0")), text)
+            result = tradeManager.handle_torofx_management_message(chat_id, text)
+            log.info(f"[MGMT] Resultado handle_torofx_management_message: {result}")
         elif hint == "HANNAH":
-            tradeManager.handle_hannah_management_message(int(fields.get("chat_id","0")), text)
+            result = tradeManager.handle_hannah_management_message(chat_id, text)
+            log.info(f"[MGMT] Resultado handle_hannah_management_message: {result}")
         elif hint == "GOLD_BROTHERS":
             # aquí puedes enrutar a handle_bg_* si quieres
-            pass
+            log.info(f"[MGMT] Mensaje GOLD_BROTHERS recibido pero no manejado explícitamente.")
+        else:
+            log.warning(f"[MGMT] Mensaje de gestión con provider_hint desconocido: {hint}")
 
     REDIS_OFFSET_KEY = "signals:last_id"
 
@@ -370,7 +381,7 @@ async def main():
         last_id = await get_last_id()
         log.info(f"[DEBUG] Suscrito a stream {Streams.SIGNALS} desde offset {last_id}")
         async for msg_id, fields in xread_loop(r, Streams.SIGNALS, last_id=last_id):
-            log.info(f"[DEBUG] Mensaje recibido en stream {Streams.SIGNALS}: id={msg_id} fields={fields}")
+            log.info(f"[SIGNAL] Mensaje recibido en stream {Streams.SIGNALS}: id={msg_id} fields={fields}")
             await handle_signal(fields)
             await set_last_id(msg_id)
 
@@ -378,7 +389,8 @@ async def main():
         """
         Loop principal que consume mensajes de gestión y los procesa.
         """
-        async for _, fields in xread_loop(r, Streams.MGMT, last_id="$"):
+        async for msg_id, fields in xread_loop(r, Streams.MGMT, last_id="$"):
+            log.info(f"[MGMT] Mensaje recibido en stream MGMT: id={msg_id} fields={fields}")
             await handle_mgmt(fields)
 
     # Lanzar el loop de gestión de trades en background
