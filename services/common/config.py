@@ -32,6 +32,9 @@ class Settings:
             "addon_max_count": int(config.get("ADDON_MAX_COUNT", 2)),
             "addon_lot_factor": float(config.get("ADDON_LOT_FACTOR", 0.5)),
             "fast_update_window_seconds": float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30)),
+            "TG_API_ID": config.get("TG_API_ID"),
+            "TG_API_HASH": config.get("TG_API_HASH"),
+            "TG_PHONE": config.get("TG_PHONE"),
         }
 
     @staticmethod
