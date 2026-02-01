@@ -1,7 +1,5 @@
 services:
   # =========================
-  # Backend administrativo (FastAPI)
-  # =========================
   postgres:
     image: postgres:15
     container_name: atp-postgres
@@ -20,9 +18,9 @@ services:
       context: ./backend_admin
     container_name: atp-backend-admin
     env_file:
-      - ./backend_admin/.env.example
+      - ./backend_admin/.env
     ports:
-      - "5000:8001"
+      - "5000:5000"
     depends_on:
       - postgres
     restart: unless-stopped
@@ -40,11 +38,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-  # =========================
-  # MT5 ACCOUNTS (8)
-  # Each one exposes:
-  # - Web VNC: 3000
-  # - RPyC MT5 bridge: 8001
   # =========================
   mt5_acct1:
     image: gmag11/metatrader5_vnc:latest

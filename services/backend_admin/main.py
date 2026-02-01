@@ -102,8 +102,6 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
-
-
 # --- ENDPOINTS ---
 @app.get("/settings", dependencies=[Depends(check_auth)])
 def list_settings(db=Depends(get_db)):
