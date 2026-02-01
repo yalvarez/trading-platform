@@ -121,7 +121,7 @@ async def main():
         entry_buffer_points=float(config.get("ENTRY_BUFFER_POINTS", 0.0)),
     )
 
-    tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None))  # attach notifier if available
+    tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None), config_provider=config)  # attach notifier and config_provider
 
     async def handle_signal(fields: dict):
         """
