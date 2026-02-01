@@ -1,6 +1,21 @@
+
 import os
 import json
 import psycopg2
+
+def run_schema_sql(db_url, schema_path):
+    with open(schema_path, 'r', encoding='utf-8') as f:
+        sql = f.read()
+    conn = psycopg2.connect(db_url)
+    cur = conn.cursor()
+    # Ejecutar múltiples sentencias separadas por ';'
+    for statement in sql.split(';'):
+        stmt = statement.strip()
+        if stmt:
+            cur.execute(stmt)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def migrate_env_to_db(db_url):
     conn = psycopg2.connect(db_url)
@@ -53,4 +68,6 @@ def migrate_env_to_db(db_url):
 
 if __name__ == "__main__":
     db_url = os.environ.get("CONFIG_DB_URL", "postgresql://trading_user:trading_pass@localhost:5432/trading_config")
+    schema_path = os.path.join(os.path.dirname(__file__), "config_db_schema_full.sql")
+    run_schema_sql(db_url, schema_path)
     migrate_env_to_db(db_url)
