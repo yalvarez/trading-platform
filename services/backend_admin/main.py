@@ -1,3 +1,30 @@
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import psycopg2
+import os
+from typing import List, Optional
+from models import Setting, Account, Channel, Provider, AccountChannel, ChannelProvider
+
+app = FastAPI()
+security = HTTPBasic()
+
+# Simple auth (replace with env vars or a better method in production)
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
+
+DB_URL = os.getenv("CONFIG_DB_URL", "postgresql://user:password@db:5432/config")
+
+def get_db():
+    conn = psycopg2.connect(DB_URL)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
 # --- SETTINGS PUT/DELETE ---
 @app.put("/settings/{key}", dependencies=[Depends(check_auth)])
 def update_setting(key: str, setting: Setting, db=Depends(get_db)):
@@ -74,29 +101,6 @@ def delete_channel_provider(cp: ChannelProvider, db=Depends(get_db)):
         cur.execute("DELETE FROM channel_providers WHERE channel_id=%s AND provider_id=%s", (cp.channel_id, cp.provider_id))
         db.commit()
     return {"ok": True}
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-
-import psycopg2
-import os
-from typing import List, Optional
-from models import Setting, Account, Channel, Provider, AccountChannel, ChannelProvider
-
-app = FastAPI()
-security = HTTPBasic()
-
-# Simple auth (replace with env vars or a better method in production)
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
-
-DB_URL = os.getenv("CONFIG_DB_URL", "postgresql://user:password@db:5432/config")
-
-def get_db():
-    conn = psycopg2.connect(DB_URL)
-    try:
-        yield conn
-    finally:
-        conn.close()
 
 def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
