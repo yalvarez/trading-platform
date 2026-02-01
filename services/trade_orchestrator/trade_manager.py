@@ -9,7 +9,7 @@ class TradeManager:
         self.mt5 = mt5_executor
         self.notifier = notifier
         self.config_provider = config_provider
-        self.redis_url = redis_url or (self.config_provider.get('REDIS_URL', 'redis://localhost:6379/0') if self.config_provider else os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+        self.redis_url = redis_url or (self.config_provider.get('REDIS_URL', 'redis://redis:6379/0') if self.config_provider else os.getenv('REDIS_URL', 'redis://redis:6379/0'))
         self.redis = redis_conn
         # ...other initialization...
 
