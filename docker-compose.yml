@@ -19,7 +19,7 @@ services:
       dockerfile: services/backend_admin/Dockerfile
     container_name: atp-backend-admin
     env_file:
-      - ./services/backend_admin/.env
+      - .env
     ports:
       - "5000:5000"
     depends_on:
