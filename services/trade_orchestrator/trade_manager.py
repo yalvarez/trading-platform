@@ -365,10 +365,9 @@ class TradeManager:
         self.mt5 = mt5_exec if mt5 is None else mt5
         self.magic = magic
         self.loop_sleep_sec = loop_sleep_sec
-
+        self.config_provider = config_provider
         self.scalp_tp1_percent = scalp_tp1_percent
         self.scalp_tp2_percent = scalp_tp2_percent
-
         self.long_tp1_percent = long_tp1_percent
         self.long_tp2_percent = long_tp2_percent
         self.default_sl = default_sl
