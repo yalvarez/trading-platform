@@ -1,7 +1,7 @@
 import os, re, json, logging, uuid
-from common.config import Settings
-from common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
-from common.signal_dedup import SignalDeduplicator
+from services.common.config import Settings
+from services.common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
+from services.common.signal_dedup import SignalDeduplicator
 from gb_filters import looks_like_followup
 from torofx_filters import looks_like_torofx_management
 from parsers_base import SignalParser, ParseResult
@@ -22,7 +22,7 @@ log = logging.getLogger("router_parser")
 
 
 
-from common.config import FAST_UPDATE_WINDOW_SECONDS
+from services.common.config import FAST_UPDATE_WINDOW_SECONDS
 
 class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0, channels_config=None):
@@ -171,7 +171,7 @@ class SignalRouter:
 
 async def main():
     import json
-    from common.config import CHANNELS_CONFIG_JSON
+    from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s.redis_url)
     try:

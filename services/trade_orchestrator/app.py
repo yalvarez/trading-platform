@@ -1,8 +1,8 @@
 import os, json, asyncio, logging, sys, uuid
 import redis.asyncio as aioredis
 from services.common.config_db import ConfigProvider
-from common.redis_streams import redis_client, xread_loop, xadd, Streams
-from common.timewindow import parse_windows, in_windows
+from services.common.redis_streams import redis_client, xread_loop, xadd, Streams
+from services.common.timewindow import parse_windows, in_windows
 
 from .mt5_executor import MT5Executor
 from .trade_manager import TradeManager
@@ -20,7 +20,7 @@ else:
         sys.path.insert(0, _svc_c)
 import importlib.util
 
-from common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
+from services.common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
 from .notifications.telegram import TelegramNotifierAdapter
 from prometheus_client import start_http_server
 

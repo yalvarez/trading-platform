@@ -2,7 +2,7 @@ import os, sys, json, asyncio
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from telethon import TelegramClient
-from common.telegram_notifier import TelegramNotifier, NotificationConfig
+from services.common.telegram_notifier import TelegramNotifier, NotificationConfig
 
 async def main():
     # derive a target chat id from env

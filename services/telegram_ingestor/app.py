@@ -1,7 +1,7 @@
 import os, asyncio, json, logging
 from telethon import TelegramClient, events
-from common.config import Settings, env
-from common.redis_streams import redis_client, xadd, Streams
+from services.common.config import Settings, env
+from services.common.redis_streams import redis_client, xadd, Streams
 
 
 # Add container label to log format for Grafana filtering
@@ -22,7 +22,7 @@ async def main():
             await asyncio.sleep(600)  # Solo cada 10 minutos
 
     import json
-    from common.config import CHANNELS_CONFIG_JSON
+    from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s.redis_url)
 
