@@ -5,6 +5,7 @@ import json
 
 config = ConfigProvider()
 FAST_UPDATE_WINDOW_SECONDS = float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30))
+CHANNELS_CONFIG_JSON = config.get("CHANNELS_CONFIG_JSON", "{}")
 
 class Settings:
     @staticmethod
