@@ -72,5 +72,5 @@ def migrate_env_to_db(db_url):
 if __name__ == "__main__":
     db_url = os.environ.get("CONFIG_DB_URL", "postgresql://trading_user:trading_pass@localhost:5432/trading_config")
     schema_path = os.path.join(os.path.dirname(__file__), "config_db_schema_full.sql")
-    run_schema_sql(db_url, schema_path)
+    #run_schema_sql(db_url, schema_path)
     migrate_env_to_db(db_url)
