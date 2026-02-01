@@ -8,19 +8,18 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 from enum import Enum
-
-class TradingMode(Enum):
-    GENERAL = "general"
-    BE_PIPS = "be_pips"
-    BE_PNL = "be_pnl"
-    REENTRY = "reentry"
-
 from . import mt5_constants as mt5
 from .mt5_client import MT5Client
 from prometheus_client import Counter, Gauge
 import logging
 import datetime
 import redis.asyncio as redis_async
+
+class TradingMode(Enum):
+    GENERAL = "general"
+    BE_PIPS = "be_pips"
+    BE_PNL = "be_pnl"
+    REENTRY = "reentry"
 
 log = logging.getLogger("trade_orchestrator.trade_manager")
 
@@ -493,18 +492,11 @@ class TradeManager:
         Cada cuenta se gestiona de forma independiente para mejorar la latencia.
         """
         log.info("[RUN_FOREVER] TradeManager loop iniciado y activo.")
-        tick_count = 0
+        
         while True:
             accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
             accounts = [a for a in accounts if a.get("active")]
             await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
-            # tick_count += 1
-            # if tick_count % 60 == 0:
-            #     if tick_count % 600 == 0:
-            #         log.info(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
-            #     else:
-            #         log.debug(f"[RUN_FOREVER] TradeManager sigue activo. Ticks: {tick_count}")
-            # await asyncio.sleep(self.loop_sleep_sec)
 
     async def _tick_once_account(self, account):
         """
@@ -527,8 +519,8 @@ class TradeManager:
 
             # Elimina trades cerrados
             for ticket in list(self.trades.keys()):
-                t = self.trades[ticket]
-                if t.account_name != account["name"]:
+                trade = self.trades[ticket]
+                if trade.account_name != account["name"]:
                     continue
                 if ticket not in pos_by_ticket:
                     try:
@@ -541,33 +533,36 @@ class TradeManager:
                 pass
 
             # Gestión de cada trade activo
-            for ticket, t in list(self.trades.items()):
-                if t.account_name != account["name"]:
+            for ticket, trade in list(self.trades.items()):
+                if trade.account_name != account["name"]:
                     continue
 
                 pos = pos_by_ticket.get(ticket)
+                
                 if not pos:
                     continue
+                
                 if pos.magic != self.mt5.magic:
                     continue
 
-                info = client.symbol_info(t.symbol)
-                tick = client.symbol_info_tick(t.symbol)
+                info = client.symbol_info(trade.symbol)
+                tick = client.symbol_info_tick(trade.symbol)
+                
                 if not info or not tick:
                     continue
 
                 point = float(info.point)
-                is_buy = (t.direction == "BUY")
+                is_buy = (trade.direction == "BUY")
                 current = float(pos.price_current)
 
                 # Guarda entry y volumen inicial si no están
-                if t.entry_price is None:
-                    t.entry_price = float(pos.price_open)
-                if t.initial_volume is None:
-                    t.initial_volume = float(pos.volume)
+                if trade.entry_price is None:
+                    trade.entry_price = float(pos.price_open)
+                if trade.initial_volume is None:
+                    trade.initial_volume = float(pos.volume)
 
                 # Llamada a la gestión según modalidad, ahora con contexto completo
-                await self.gestionar_trade(t, account, pos=pos, point=point, is_buy=is_buy, current=current)
+                await self.gestionar_trade(trade, account, pos=pos, point=point, is_buy=is_buy, current=current)
         
         except Exception as e:
             # Supresión de errores de conexión repetidos
@@ -1445,6 +1440,174 @@ class TradeManager:
         # Consumimos el mensaje si era de gestión TOROFX (aunque no haya match en ese instante)
         return True
 
+    def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
+        """
+        Procesa mensajes de gestión de Hannah:
+        - Solo ejecuta cierre parcial y BE si NO se ha alcanzado TP1.
+        - Si el precio actual está por debajo del entry y no se puede aplicar BE, cierra el trade completamente.
+        - Si ya se alcanzó TP1, ignora el mensaje y sigue la gestión normal.
+        """
+        import re
+        text = (raw_text or "").strip()
+        if not text:
+            return False
+
+        up = text.upper()
+
+        # --- Cierre inmediato de todas las posiciones ---
+        close_all_keywords = ["CLOSE ALL", "CLOSE ALL POSITIONS", "PRICE SPIKED"]
+        if any(k in up for k in close_all_keywords):
+            any_matched_trade = False
+            provider_tag_match = "HANNAH"
+            for account in [a for a in self.mt5.accounts if a.get("active")]:
+                client = self.mt5._client_for(account)
+                positions = client.positions_get()
+                if not positions:
+                    continue
+                pos_by_ticket = {p.ticket: p for p in positions}
+                for ticket, t in list(self.trades.items()):
+                    if t.account_name != account["name"]:
+                        continue
+                    if provider_tag_match not in (t.provider_tag or "").upper():
+                        continue
+                    pos = pos_by_ticket.get(ticket)
+                    if not pos or pos.magic != self.mt5.magic:
+                        continue
+                    action_key = f"HANNAH_CLOSE_ALL"
+                    if hasattr(t, "actions_done") and action_key in t.actions_done:
+                        continue
+                    if not hasattr(t, "actions_done"):
+                        t.actions_done = set()
+                    self._do_partial_close(account, ticket, 100, reason="HANNAH close all (alert)")
+                    self._notify_bg(
+                        account["name"],
+                        f"🚨 HANNAH: Cierre inmediato por alerta\nTicket: {ticket}"
+                    )
+                    t.actions_done.add(action_key)
+                    any_matched_trade = True
+            return any_matched_trade
+
+        # --- Cierre parcial 50% (sin BE, sin TP1 check) ---
+        close_half_keywords = ["CLOSE HALF", "HALF GUYS", "HALF NOW", "HALF ONLY"]
+        if any(k in up for k in close_half_keywords):
+            any_matched_trade = False
+            provider_tag_match = "HANNAH"
+            for account in [a for a in self.mt5.accounts if a.get("active")]:
+                client = self.mt5._client_for(account)
+                positions = client.positions_get()
+                if not positions:
+                    continue
+                pos_by_ticket = {p.ticket: p for p in positions}
+                for ticket, t in list(self.trades.items()):
+                    if t.account_name != account["name"]:
+                        continue
+                    if provider_tag_match not in (t.provider_tag or "").upper():
+                        continue
+                    pos = pos_by_ticket.get(ticket)
+                    if not pos or pos.magic != self.mt5.magic:
+                        continue
+                    action_key = f"HANNAH_CLOSE_HALF"
+                    if hasattr(t, "actions_done") and action_key in t.actions_done:
+                        continue
+                    if not hasattr(t, "actions_done"):
+                        t.actions_done = set()
+                    self._do_partial_close(account, ticket, 50, reason="HANNAH close half (alert)")
+                    self._notify_bg(
+                        account["name"],
+                        f"✂️ HANNAH: Cierre parcial 50% por alerta\nTicket: {ticket}"
+                    )
+                    t.actions_done.add(action_key)
+                    any_matched_trade = True
+            return any_matched_trade
+
+        # Detectar mensaje de gestión Hannah (palabras clave)
+        has_partial = any(w in up for w in ["SECURE", "HALF", "PROFITS", "COLECT", "COLLECT", "CIERRA", "CIERRE", "PARCIAL"])
+        has_be = any(w in up for w in ["BREAKEVEN", "BREAK EVEN", "BREAK-EVEN", "BE", "RISK FREE", "RISKLESS", "SIN RIESGO"])
+        # Ejemplo: "Secure half your Profits & set breakeven"
+        if not (has_partial and has_be):
+            return False
+
+        # Por defecto, cierre parcial 50%
+        pct = 50
+
+        # Buscar porcentaje explícito (opcional)
+        m_pct = re.search(r"(\d{1,3})\s*%", text)
+        if m_pct:
+            pct = max(1, min(100, int(m_pct.group(1))))
+
+        any_matched_trade = False
+        provider_tag_match = "HANNAH"
+        for account in [a for a in self.mt5.accounts if a.get("active")]:
+            client = self.mt5._client_for(account)
+            positions = client.positions_get()
+            if not positions:
+                continue
+            pos_by_ticket = {p.ticket: p for p in positions}
+
+            for ticket, t in list(self.trades.items()):
+                if t.account_name != account["name"]:
+                    continue
+                if provider_tag_match not in (t.provider_tag or "").upper():
+                    continue
+
+                pos = pos_by_ticket.get(ticket)
+                if not pos or pos.magic != self.mt5.magic:
+                    continue
+
+                # Si ya alcanzó TP1, ignorar el mensaje
+                if hasattr(t, "tp_hit") and 1 in getattr(t, "tp_hit", set()):
+                    continue
+
+                # Evitar repetir la acción
+                action_key = f"HANNAH_PARTIAL_BE_{pct}"
+                if hasattr(t, "actions_done") and action_key in t.actions_done:
+                    continue
+                if not hasattr(t, "actions_done"):
+                    t.actions_done = set()
+
+                info = self.mt5.symbol_info(t.symbol)
+                if not info:
+                    continue
+                point = float(info.point)
+                entry = float(pos.price_open)
+                current = float(pos.price_current)
+
+                # 1. Cierre parcial
+                self._do_partial_close(account, ticket, pct, reason="HANNAH partial+BE")
+                # 2. Intentar BE
+                be_applied = False
+                try:
+                    # Intentar mover SL a BE (usa _do_be si está disponible)
+                    is_buy = (t.direction == "BUY")
+                    # Si el precio actual está por debajo del entry, no se puede aplicar BE
+                    if (is_buy and current < entry) or ((not is_buy) and current > entry):
+                        # Cerrar trade completamente
+                        self._do_partial_close(account, ticket, 100, reason="HANNAH close loss (BE not possible)")
+                        self._notify_bg(
+                            account["name"],
+                            f"❌ HANNAH: BE no posible, trade cerrado por debajo del entry\nTicket: {ticket} | Entry: {entry:.2f} | Current: {current:.2f}"
+                        )
+                        t.actions_done.add(action_key)
+                        any_matched_trade = True
+                        continue
+                    # Si se puede aplicar BE
+                    # Si tienes un método async _do_be, deberías llamarlo con create_task o similar, aquí llamo directo por simplicidad
+                    self.mt5.set_be(account=account, ticket=int(ticket))
+                    self._notify_bg(
+                        account["name"],
+                        f"🔒 HANNAH: Parcial {pct}% y BE aplicado\nTicket: {ticket} | Entry: {entry:.2f} | Current: {current:.2f}"
+                    )
+                    be_applied = True
+                except Exception as e:
+                    self._notify_bg(
+                        account["name"],
+                        f"⚠️ HANNAH: Error al aplicar BE\nTicket: {ticket} | Error: {e}"
+                    )
+                t.actions_done.add(action_key)
+                any_matched_trade = True
+
+        return any_matched_trade
+
     async def gestionar_trade(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Decide y delega la gestión del trade según la modalidad configurada en la cuenta.
@@ -1479,13 +1642,17 @@ class TradeManager:
         if pos is None or point is None or is_buy is None or current is None:
             client = self.mt5._client_for(cuenta)
             pos_list = client.positions_get(ticket=int(trade.ticket))
+            
             if not pos_list:
                 return
+            
             pos = pos_list[0]
             info = client.symbol_info(trade.symbol)
             tick = client.symbol_info_tick(trade.symbol)
+            
             if not info or not tick:
                 return
+            
             point = float(info.point)
             is_buy = (trade.direction == "BUY")
             current = float(pos.price_current)
@@ -1509,17 +1676,20 @@ class TradeManager:
                 await self._do_partial_close(cuenta, trade.ticket, 100, reason="REENTRY_TP1")
                 # Abrir runner solo si momentum filter lo permite
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
+                
                 if candles and self.runner_momentum_filter(trade.symbol, candles):
                     original_vol = float(getattr(pos, "volume", 0.01))
                     raw_runner_lot = original_vol * 0.3
                     info = client.symbol_info(trade.symbol)
                     step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
                     vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+                    
                     # Redondear hacia abajo al múltiplo de step
                     runner_lot = max(vmin, step * int(raw_runner_lot / step))
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
+                    
                     # Abrir nueva posición runner
                     await self.mt5.open_runner_trade(
                         cuenta,
@@ -1530,11 +1700,13 @@ class TradeManager:
                         tp=tp,
                         provider_tag=f"{trade.provider_tag}_REENTRY"
                     )
+
                     trade.reentry_done = True
                     self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
                 else:
                     self._notify_bg(cuenta["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
                 return
+        
         # El runner se gestiona con trailing si está habilitado
         if self.enable_trailing:
             await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)

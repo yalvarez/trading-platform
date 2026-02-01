@@ -25,5 +25,8 @@ scrape_configs:
           __path__: /var/lib/docker/containers/*/*.log
     pipeline_stages:
       - docker: {}
+      - regex:
+        expression: 'container_label=(?P<container_label>[^ ]+)'
       - labels:
-          container_name:
+        container_name:
+        container_label:
