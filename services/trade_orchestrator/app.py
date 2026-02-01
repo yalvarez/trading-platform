@@ -100,28 +100,28 @@ async def main():
     except Exception as e:
         log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
 
-    # Enviar mensaje de prueba al iniciar
-    try:
-        cuentas = config.get_accounts()
-        if cuentas and notifier_adapter:
-            cuenta_prueba = cuentas[0].get("chat_id")
-            if cuenta_prueba:
-                log.info(f"Enviando mensaje de prueba de notificación a la cuenta: {cuenta_prueba}")
-                await notifier_adapter.notify(cuenta_prueba, "✅ Notificación de prueba enviada desde orchestrator.")
-    except Exception as e:
-        log.error(f"Error enviando notificación de prueba: {e}")
+    # # Enviar mensaje de prueba al iniciar
+    # try:
+    #     cuentas = config.get_accounts()
+    #     if cuentas and notifier_adapter:
+    #         cuenta_prueba = cuentas[0].get("chat_id")
+    #         if cuenta_prueba:
+    #             log.info(f"Enviando mensaje de prueba de notificación a la cuenta: {cuenta_prueba}")
+    #             await notifier_adapter.notify(cuenta_prueba, "✅ Notificación de prueba enviada desde orchestrator.")
+    # except Exception as e:
+    #     log.error(f"Error enviando notificación de prueba: {e}")
 
-    execu = MT5Executor(
+    tradeExecutor = MT5Executor(
         accounts,
         magic=987654,
         notifier=(notifier_adapter if notifier_adapter is not None else None),
         trading_windows=config.get("TRADING_WINDOWS", "03:00-12:00,08:00-17:00"),
-        entry_wait_seconds=int(config.get("ENTRY_WAIT_SECONDS", 60)),
+        entry_wait_seconds=int(config.get("ENTRY_WAIT_SECONDS", 120)),
         entry_poll_ms=int(config.get("ENTRY_POLL_MS", 500)),
         entry_buffer_points=float(config.get("ENTRY_BUFFER_POINTS", 0.0)),
     )
 
-    tm = TradeManager(execu, notifier=(notifier_adapter if notifier_adapter is not None else None), config_provider=config)  # attach notifier and config_provider
+    tradeManager = TradeManager(tradeExecutor, notifier=(notifier_adapter if notifier_adapter is not None else None), config_provider=config)  # attach notifier and config_provider
 
     async def handle_signal(fields: dict):
         """
@@ -151,7 +151,7 @@ async def main():
         if (not sl or float(sl) == 0.0) and is_fast:
             account = next((a for a in accounts if a.get("active")), None)
             if account:
-                client = execu._client_for(account)
+                client = tradeExecutor._client_for(account)
                 price = client.tick_price(symbol, direction)
                 # Obtener default_sl_pips desde config
                 default_sl_pips = float(config.get("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(config.get("DEFAULT_SL_PIPS", 100))
@@ -175,7 +175,7 @@ async def main():
         if not is_fast:
             # For each account, check for an existing trade with provider_tag 'GB_FAST' for this symbol/direction
             updated_any = False
-            for acct_name, trade in list(tm.trades.items()):
+            for acct_name, trade in list(tradeManager.trades.items()):
                 t = trade
                 if (
                     t.symbol == symbol
@@ -184,7 +184,7 @@ async def main():
                 ):
                     # Update the trade with new SL, TPs, and provider_tag
                     log.info(f"[TRACE][FAST-UPDATE] SL recibido para update_trade_signal: {sl}")
-                    tm.update_trade_signal(
+                    tradeManager.update_trade_signal(
                         ticket=t.ticket,
                         tps=tps,
                         planned_sl=float(sl) if sl else None,
@@ -194,7 +194,7 @@ async def main():
                     try:
                         account = next((a for a in accounts if a.get("name") == t.account_name), None)
                         if account and t.ticket and sl:
-                            result = await execu.modify_sl(account, t.ticket, float(sl), reason="full-signal")
+                            result = await tradeExecutor.modify_sl(account, t.ticket, float(sl), reason="full-signal")
                             if result:
                                 log.info(f"[FAST-UPDATE] SL updated in MT5 for ticket={t.ticket} acct={t.account_name} to SL={sl}")
                             else:
@@ -213,7 +213,7 @@ async def main():
                 # Get current price from any active account (first one)
                 account = next((a for a in accounts if a.get("active")), None)
                 if account:
-                    client = execu._client_for(account)
+                    client = tradeExecutor._client_for(account)
                     # Use tick_price to get current price in the right direction
                     # For BUY, price must be >= TP1; for SELL, price <= TP1
                     tp1 = float(tps[0])
@@ -226,7 +226,7 @@ async def main():
                     if price_past_tp1:
                         log.warning(f"[COMPLETE-SIGNAL] Price is past TP1 (current={current_price}, TP1={tp1}) for {symbol} {direction}. Not registering signal.")
                         # Close any open fast trade for this symbol/direction
-                        for acct_name, trade in list(tm.trades.items()):
+                        for acct_name, trade in list(tradeManager.trades.items()):
                             t = trade
                             if (
                                 t.symbol == symbol
@@ -235,7 +235,7 @@ async def main():
                             ):
                                 # Attempt to close the fast trade (full close)
                                 try:
-                                    client = execu._client_for(account)
+                                    client = tradeExecutor._client_for(account)
                                     # Use partial_close with 100% to close fully
                                     client.partial_close(account, t.ticket, 100)
                                     log.info(f"[COMPLETE-SIGNAL] Closed FAST trade ticket={t.ticket} acct={t.account_name} due to price past TP1.")
@@ -259,12 +259,12 @@ async def main():
             return
         # Ejecutar solo para las cuentas filtradas
         res = await MT5Executor(filtered_accounts,
-            magic=execu.magic,
-            notifier=execu.notifier,
-            trading_windows=execu.windows,
-            entry_wait_seconds=execu.entry_wait_seconds,
-            entry_poll_ms=execu.entry_poll_ms,
-            entry_buffer_points=execu.entry_buffer_points
+            magic=tradeExecutor.magic,
+            notifier=tradeExecutor.notifier,
+            trading_windows=tradeExecutor.windows,
+            entry_wait_seconds=tradeExecutor.entry_wait_seconds,
+            entry_poll_ms=tradeExecutor.entry_poll_ms,
+            entry_buffer_points=tradeExecutor.entry_buffer_points
         ).open_complete_trade(
             provider_tag=provider_tag,
             symbol=symbol,
@@ -279,7 +279,7 @@ async def main():
         # register opened
         for acct_name, ticket in res.tickets_by_account.items():
             log.info(f"[TRACE][SIGNAL] SL propagado a register_trade: {sl}")
-            tm.register_trade(
+            tradeManager.register_trade(
                 account_name=acct_name,
                 ticket=ticket,
                 symbol=symbol,
@@ -327,9 +327,9 @@ async def main():
         text = fields.get("text","")
         hint = fields.get("provider_hint","")
         if hint == "TOROFX":
-            tm.handle_torofx_management_message(int(fields.get("chat_id","0")), text)
+            tradeManager.handle_torofx_management_message(int(fields.get("chat_id","0")), text)
         elif hint == "HANNAH":
-            tm.handle_hannah_management_message(int(fields.get("chat_id","0")), text)
+            tradeManager.handle_hannah_management_message(int(fields.get("chat_id","0")), text)
         elif hint == "GOLD_BROTHERS":
             # aquí puedes enrutar a handle_bg_* si quieres
             pass
@@ -355,7 +355,7 @@ async def main():
         Guarda el último ID procesado de señales en Redis.
         """
         try:
-            redis_url = config.get("REDIS_URL", 'redis://localhost:6379/0')
+            redis_url = config.get("REDIS_URL", 'redis://redis:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             await redis.set(REDIS_OFFSET_KEY, last_id)
             await redis.aclose()
@@ -381,7 +381,7 @@ async def main():
             await handle_mgmt(fields)
 
     # Lanzar el loop de gestión de trades en background
-    asyncio.create_task(tm.run_forever())
+    asyncio.create_task(tradeManager.run_forever())
     await asyncio.gather(loop_signals(), loop_mgmt())
 
 if __name__ == "__main__":

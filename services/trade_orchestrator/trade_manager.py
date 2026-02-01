@@ -427,7 +427,6 @@ class TradeManager:
         notifier = TelegramNotifierAdapter(self.notifier)
         await notifier.notify_trade_event(event, **kwargs)
 
-
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
         t = self.trades.get(int(ticket))
         if not t:
