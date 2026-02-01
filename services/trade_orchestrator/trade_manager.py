@@ -1,135 +1,6 @@
-# ...existing code...
-
 from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
 from .mt5_executor import MT5Executor
 from .notifications.telegram import TelegramNotifierAdapter
-
-class TradeManager:
-    def __init__(self, mt5_executor, notifier=None, config_provider=None, redis_url=None, redis_conn=None):
-        self.mt5 = mt5_executor
-        self.notifier = notifier
-        self.config_provider = config_provider
-        self.redis_url = redis_url or (self.config_provider.get('REDIS_URL', 'redis://redis:6379/0') if self.config_provider else os.getenv('REDIS_URL', 'redis://redis:6379/0'))
-        self.redis = redis_conn
-        # ...other initialization...
-
-    def handle_hannah_management_message(self, source_chat_id: int, raw_text: str) -> bool:
-        """
-        Procesa mensajes de gestión Hannah como:
-        - "Secure half your Profits & set breakeven"
-        - "Asegura la mitad y mueve a BE"
-        Detecta intención de cierre parcial + BE y llama early_partial_close.
-        Retorna True si consumió el mensaje.
-        """
-        text = (raw_text or "").strip()
-        if not text:
-            return False
-
-        up = text.upper()
-        # Detectar frases clave (puedes ajustar/expandir)
-        has_partial = any(w in up for w in ["HALF", "MITAD", "PARTIAL", "PARCIAL", "SECURE HALF", "ASEGURA LA MITAD"])
-        has_be = any(w in up for w in ["BREAKEVEN", "BREAK EVEN", "BE", "SET BE", "MUEVE A BE", "MOVE TO BE", "SET BREAKEVEN"])
-
-        # Solo si ambas intenciones están presentes
-        if not (has_partial and has_be):
-            return False
-
-        # Ejecutar para cada cuenta activa con trade Hannah
-        any_matched_trade = False
-        accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
-        for account in [a for a in accounts if a.get("active")]:
-            client = self.mt5._client_for(account)
-            positions = client.positions_get()
-            if not positions:
-                continue
-            pos_by_ticket = {p.ticket: p for p in positions}
-            for ticket, t in list(self.trades.items()):
-                if t.account_name != account["name"]:
-                    continue
-                if "HANNAH" not in (t.provider_tag or "").upper():
-                    continue
-                pos = pos_by_ticket.get(ticket)
-                if not pos or pos.magic != self.mt5.magic:
-                    continue
-                # Ejecutar early_partial_close (50%)
-                any_matched_trade = True
-                # Llamada asíncrona
-                import asyncio
-                asyncio.create_task(self.mt5.early_partial_close(account, ticket, percent=0.5, provider_tag="HANNAH", reason="msg_mgmt"))
-                self._notify_bg(account, f"✂️ HANNAH: early_partial_close ejecutado\nTicket: {ticket} | {t.symbol} | {t.direction}")
-        return any_matched_trade
-        def runner_momentum_filter(self, symbol: str, candles: list[dict], min_rsi: float = 55, min_impulse: float = 0.3, min_volume: float = 1.0, max_atr: float = 2.0) -> bool:
-            """
-            Professional filter for runner trades based on price momentum.
-            Uses RSI, volume, candle impulse, and ATR.
-            Args:
-                symbol: Symbol name
-                candles: List of candle dicts with keys: open, close, high, low, volume
-                min_rsi: Minimum RSI threshold
-                min_impulse: Minimum impulse (|close-open|/ATR)
-                min_volume: Minimum volume threshold
-                max_atr: Maximum ATR allowed
-            Returns:
-                True if runner entry is allowed, False otherwise
-            """
-            import numpy as np
-            def calc_rsi(closes, period=14):
-                deltas = np.diff(closes)
-                seed = deltas[:period]
-                up = seed[seed > 0].sum() / period
-                down = -seed[seed < 0].sum() / period
-                rs = up / down if down != 0 else 0
-                rsi = np.zeros_like(closes)
-                rsi[:period] = 50
-                for i in range(period, len(closes)):
-                    delta = deltas[i - 1]
-                    upval = max(delta, 0)
-                    downval = -min(delta, 0)
-                    up = (up * (period - 1) + upval) / period
-                    down = (down * (period - 1) + downval) / period
-                    rs = up / down if down != 0 else 0
-                    rsi[i] = 100 - 100 / (1 + rs)
-                return rsi[-1]
-
-            def calc_atr(candles, period=14):
-                trs = []
-                for i in range(1, len(candles)):
-                    high = candles[i]["high"]
-                    low = candles[i]["low"]
-                    prev_close = candles[i-1]["close"]
-                    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                    trs.append(tr)
-                if len(trs) < period:
-                    return np.mean(trs) if trs else 0.0
-                return np.mean(trs[-period:])
-
-            closes = [c["close"] for c in candles]
-            volumes = [c["volume"] for c in candles]
-            rsi = calc_rsi(closes)
-            atr = calc_atr(candles)
-            last_candle = candles[-1]
-            impulse = abs(last_candle["close"] - last_candle["open"]) / (atr if atr > 0 else 1)
-            last_volume = last_candle["volume"]
-
-            # Logging for diagnostics
-            log.info(f"[RUNNER-FILTER] {symbol} RSI={rsi:.2f} Impulse={impulse:.2f} Volume={last_volume:.2f} ATR={atr:.2f}")
-
-            if rsi < min_rsi:
-                log.info(f"[RUNNER-FILTER] {symbol} rejected: RSI {rsi:.2f} < {min_rsi}")
-                return False
-            if impulse < min_impulse:
-                log.info(f"[RUNNER-FILTER] {symbol} rejected: Impulse {impulse:.2f} < {min_impulse}")
-                return False
-            if last_volume < min_volume:
-                log.info(f"[RUNNER-FILTER] {symbol} rejected: Volume {last_volume:.2f} < {min_volume}")
-                return False
-            if atr > max_atr:
-                log.info(f"[RUNNER-FILTER] {symbol} rejected: ATR {atr:.2f} > {max_atr}")
-                return False
-            log.info(f"[RUNNER-FILTER] {symbol} accepted for runner entry.")
-            return True
-# trade_manager.py
-
 import asyncio
 import time
 import re
@@ -137,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 from enum import Enum
+
 class TradingMode(Enum):
     GENERAL = "general"
     BE_PIPS = "be_pips"
