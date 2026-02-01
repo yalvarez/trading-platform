@@ -173,7 +173,7 @@ async def main():
     import json
     from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
-    r = await redis_client(s.redis_url)
+    r = await redis_client(s["redis_url"])
     try:
         channels_config = json.loads(CHANNELS_CONFIG_JSON)
     except Exception as e:
