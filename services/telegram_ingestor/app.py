@@ -1,6 +1,6 @@
 import os, asyncio, json, logging
 from telethon import TelegramClient, events
-from services.common.config import Settings, env
+from services.common.config import Settings
 from services.common.redis_streams import redis_client, xadd, Streams
 
 
@@ -24,11 +24,11 @@ async def main():
     import json
     from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
-    r = await redis_client(s.redis_url)
+    r = await redis_client(s["redis_url"])
 
-    api_id = int(env("TG_API_ID"))
-    api_hash = env("TG_API_HASH")
-    phone = env("TG_PHONE")
+    api_id = int(s["TG_API_ID"])
+    api_hash = s["TG_API_HASH"]
+    phone = s["TG_PHONE"]
     try:
         channels_config = json.loads(CHANNELS_CONFIG_JSON)
         chats = list(channels_config.keys())

@@ -1,4 +1,3 @@
-
 # ConfigProvider abstraction
 from services.common.config_db import ConfigProvider
 import json
