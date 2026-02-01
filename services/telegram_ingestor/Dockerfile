@@ -1,16 +1,16 @@
 FROM python:3.11-slim
-WORKDIR /app
-COPY services/telegram_ingestor/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY services/common ./common
-COPY services/telegram_ingestor/notify_api.py .
-COPY services/telegram_ingestor/app.py .
-COPY services/telegram_ingestor/telegram_ingestor.session .
-COPY services/telegram_ingestor/telegram_ingestor_api.session .
-COPY services/telegram_ingestor/list_chats.py .
-COPY services/telegram_ingestor/test_send_message.py .
-COPY services/telegram_ingestor/supervisord.conf ./supervisord.conf
 
-# Ejecuta API HTTP y proceso de ingesta en paralelo
+WORKDIR /app
+
+COPY services/ ./services/
+COPY services/telegram_ingestor/requirements.txt ./services/telegram_ingestor/requirements.txt
+RUN pip install --no-cache-dir -r ./services/telegram_ingestor/requirements.txt
+
+ENV PYTHONPATH="/app"
+
+WORKDIR /app/services/telegram_ingestor
+
 RUN pip install --no-cache-dir supervisor
+COPY supervisord.conf ./supervisord.conf
+
 CMD ["supervisord", "-c", "./supervisord.conf"]
