@@ -21,15 +21,17 @@ def migrate_env_to_db(db_url):
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
     # 1. Migrar settings generales
-    keys = [
-        'DEFAULT_SL_XAUUSD_PIPS','REDIS_URL','TG_API_ID','TG_API_HASH','TG_PHONE','TELEGRAM_INGESTOR_URL','TG_TEST_CHAT_ID','LOG_LEVEL','TRADING_WINDOWS','SCALING_TRAMO_PIPS','SCALING_PERCENT_PER_TRAMO','ENTRY_WAIT_SECONDS','ENTRY_POLL_MS','ENTRY_BUFFER_POINTS','MT5_WEB_USER','MT5_WEB_PASS','DEDUP_TTL_SECONDS','ENABLE_NOTIFICATIONS','ENABLE_ADVANCED_TRADE_MGMT','SCALP_TP1_PERCENT','SCALP_TP2_PERCENT','LONG_TP1_PERCENT','LONG_TP2_PERCENT','ENABLE_BREAKEVEN','BREAKEVEN_OFFSET_PIPS','ENABLE_TRAILING','TRAILING_ACTIVATION_PIPS','TRAILING_STOP_PIPS','ENABLE_ADDON','ADDON_MAX_COUNT','ADDON_LOT_FACTOR','FAST_UPDATE_WINDOW_SECONDS'
-    ]
-    for key in keys:
-        val = os.environ.get(key)
-        if val is not None:
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, val))
+    # keys = [
+    #     'DEFAULT_SL_XAUUSD_PIPS','REDIS_URL','TG_API_ID','TG_API_HASH','TG_PHONE','TELEGRAM_INGESTOR_URL','TG_TEST_CHAT_ID','LOG_LEVEL','TRADING_WINDOWS','SCALING_TRAMO_PIPS','SCALING_PERCENT_PER_TRAMO','ENTRY_WAIT_SECONDS','ENTRY_POLL_MS','ENTRY_BUFFER_POINTS','MT5_WEB_USER','MT5_WEB_PASS','DEDUP_TTL_SECONDS','ENABLE_NOTIFICATIONS','ENABLE_ADVANCED_TRADE_MGMT','SCALP_TP1_PERCENT','SCALP_TP2_PERCENT','LONG_TP1_PERCENT','LONG_TP2_PERCENT','ENABLE_BREAKEVEN','BREAKEVEN_OFFSET_PIPS','ENABLE_TRAILING','TRAILING_ACTIVATION_PIPS','TRAILING_STOP_PIPS','ENABLE_ADDON','ADDON_MAX_COUNT','ADDON_LOT_FACTOR','FAST_UPDATE_WINDOW_SECONDS'
+    # ]
+    # for key in keys:
+    #     val = os.environ.get(key)
+    #     if val is not None:
+    #         cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, val))
+    
     # 2. Migrar cuentas
     accounts_json = os.environ.get('ACCOUNTS_JSON')
+    print(f"[DEBUG] ACCOUNTS_JSON={accounts_json}")
     if accounts_json:
         accounts = json.loads(accounts_json)
         for acc in accounts:
@@ -43,6 +45,7 @@ def migrate_env_to_db(db_url):
                 cur.execute("INSERT INTO account_channels (account_id, channel_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (acc_id, ch))
     # 3. Migrar canales y proveedores
     channels_json = os.environ.get('CHANNELS_CONFIG_JSON')
+    print(f"[DEBUG] CHANNELS_CONFIG_JSON={channels_json}")
     if channels_json:
         channels = json.loads(channels_json)
         # Insertar proveedores únicos
