@@ -4,6 +4,7 @@ from services.common.config_db import ConfigProvider
 import json
 
 config = ConfigProvider()
+FAST_UPDATE_WINDOW_SECONDS = float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30))
 
 class Settings:
     @staticmethod
