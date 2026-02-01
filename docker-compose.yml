@@ -18,7 +18,7 @@ services:
       context: ./backend_admin
     container_name: atp-backend-admin
     env_file:
-      - ./backend_admin/.env
+      - ./services/backend_admin/.env
     ports:
       - "5000:5000"
     depends_on:
