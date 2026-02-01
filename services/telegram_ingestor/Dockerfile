@@ -11,6 +11,6 @@ ENV PYTHONPATH="/app"
 WORKDIR /app/services/telegram_ingestor
 
 RUN pip install --no-cache-dir supervisor
-COPY supervisord.conf ./supervisord.conf
+COPY services/telegram_ingestor/supervisord.conf ./supervisord.conf
 
 CMD ["supervisord", "-c", "./supervisord.conf"]
