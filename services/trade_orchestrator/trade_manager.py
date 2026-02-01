@@ -486,7 +486,8 @@ class TradeManager:
 
         default_sl: float = 60.0,  # SL por defecto en pips
 
-        notifier=None,
+        notifier=None, 
+        config_provider=None,
         notify_connect: bool | None = None,  # compat
         redis_url: str = None, redis_conn=None):
         self.mt5 = mt5_exec if mt5 is None else mt5
