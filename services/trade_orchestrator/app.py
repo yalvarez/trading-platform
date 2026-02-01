@@ -78,8 +78,9 @@ async def main():
     - Inicializa settings, métricas, Redis, cuentas y notificador.
     - Lanza los loops de señales y gestión de trades.
     """
+    from services.common.config import Settings
     config = ConfigProvider()
-    s = config
+    s = Settings.load()
     # start Prometheus metrics server
     try:
         metrics_port = int(os.getenv("METRICS_PORT", "8000"))
@@ -87,7 +88,7 @@ async def main():
         log.info(f"Prometheus metrics server started on :{metrics_port}")
     except Exception as e:
         log.error(f"Failed to start Prometheus metrics server: {e}")
-    r = await redis_client(s.get("REDIS_URL", "redis://redis:6379/0"))
+    r = await redis_client(s["redis_url"])
     accounts = config.get_accounts()
 
     # Inicialización centralizada del notificador Telegram
@@ -115,10 +116,10 @@ async def main():
         accounts,
         magic=987654,
         notifier=(notifier_adapter if notifier_adapter is not None else None),
-        trading_windows=config.get("TRADING_WINDOWS", "03:00-12:00,08:00-17:00"),
-        entry_wait_seconds=int(config.get("ENTRY_WAIT_SECONDS", 120)),
-        entry_poll_ms=int(config.get("ENTRY_POLL_MS", 500)),
-        entry_buffer_points=float(config.get("ENTRY_BUFFER_POINTS", 0.0)),
+        trading_windows=s["trading_windows"],
+        entry_wait_seconds=int(s["entry_wait_seconds"]),
+        entry_poll_ms=int(s["entry_poll_ms"]),
+        entry_buffer_points=float(s["entry_buffer_points"]),
     )
 
     tradeManager = TradeManager(tradeExecutor, notifier=(notifier_adapter if notifier_adapter is not None else None), config_provider=config)  # attach notifier and config_provider
@@ -130,7 +131,7 @@ async def main():
         trace_id = uuid.uuid4().hex[:8]
         orig_trace = fields.get("trace", "NO_TRACE")
         
-        if not in_windows(parse_windows(s.trading_windows)):
+        if not in_windows(parse_windows(s["trading_windows"])):
             log.info("[SKIP] signal outside windows (no connect). trace=%s", trace_id)
             await xadd(r, Streams.EVENTS, {"type": "skip", "reason": "outside_windows", "trace": trace_id})
             return
