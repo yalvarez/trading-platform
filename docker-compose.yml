@@ -15,7 +15,7 @@ services:
   # =========================
   backend_admin:
     build:
-      context: ./backend_admin
+      context: ./services/backend_admin
     container_name: atp-backend-admin
     env_file:
       - ./services/backend_admin/.env
