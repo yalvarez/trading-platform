@@ -60,6 +60,12 @@ class MT5Executor:
             log.warning(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
             self._notify_bg(name, f"⚠️ SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
             forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
+
+        # --- REFORZAR: No abrir runner si SL es None o 0.0 ---
+        if forced_sl is None or forced_sl == 0.0:
+            log.error(f"[RUNNER][ERROR] Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol} en cuenta {name}. No se abrirá la operación.")
+            self._notify_bg(name, f"❌ Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol}. No se abrirá la operación.")
+            return None
         # --- Preparar y loguear la orden ---
         req = {
             "action": 1,  # TRADE_ACTION_DEAL
@@ -504,11 +510,19 @@ class MT5Executor:
                 log.info(f"[ENTRY][SYNC] Latencia de entrada para {name}: {entry_end-entry_start:.3f}s desde inicio de open_complete_trade")
                 order_type = 0 if direction == "BUY" else 1
 
+
                 # --- Forzar SL si es necesario ---
                 forced_sl = sl
                 if not forced_sl or float(forced_sl) == 0.0:
                     forced_sl = await get_forced_sl(client, symbol, direction, price)
                     log.warning(f"[SL-FORCED] SL forzado para {name}: {forced_sl}")
+
+                # --- REFORZAR: No abrir trade si SL es None o 0.0 ---
+                if forced_sl is None or forced_sl == 0.0:
+                    log.error(f"[ENTRY][ERROR] Operación ABORTADA: SL inválido (None o 0.0) para {symbol} en cuenta {name}. No se abrirá la operación.")
+                    self._notify_bg(name, f"❌ Operación ABORTADA: SL inválido (None o 0.0) para {symbol}. No se abrirá la operación.")
+                    errors[name] = "SL inválido (None o 0.0)"
+                    return
 
                 # planned_sl_val SIEMPRE local y explícito, debe reflejar el SL realmente usado
                 try:
