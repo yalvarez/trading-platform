@@ -153,7 +153,7 @@ class TradeManager:
         return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
-        import os
+        account = self._ensure_account_dict(account)
         # Configuración de trailing tras el tercer tramo
         trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
         if not hasattr(t, 'trailing_active_last_tramo'):
@@ -437,15 +437,15 @@ class TradeManager:
     # ----------------------------
     def _notify_bg(self, account: dict, message: str):
         # Centraliza notificaciones Telegram usando chat_id
-        notifier = TelegramNotifierAdapter(self.notifier)
-        import asyncio
-        chat_id = account.get("chat_id")
-        if chat_id:
-            asyncio.create_task(notifier.notify(chat_id, message))
-        else:
-            account_name = account.get("name")
-            import logging
-            logging.getLogger("trade_orchestrator.trade_manager").warning(f"No chat_id for account {account_name}, notificación no enviada: {message}")
+         notifier = TelegramNotifierAdapter(self.notifier)
+        # import asyncio
+        # chat_id = account.get("chat_id")
+        # if chat_id:
+        #     asyncio.create_task(notifier.notify(chat_id, message))
+        # else:
+        #     account_name = account.get("name")
+        #     import logging
+        #     logging.getLogger("trade_orchestrator.trade_manager").warning(f"No chat_id for account {account_name}, notificación no enviada: {message}")
 
     async def notify_trade_event(self, event: str, **kwargs):
         notifier = TelegramNotifierAdapter(self.notifier)
@@ -527,6 +527,7 @@ class TradeManager:
         """
         Gestiona los trades de una sola cuenta (idéntico a la lógica previa de _tick_once, pero por cuenta).
         """
+        account = self._ensure_account_dict(account)
         try:
             client = self.mt5._client_for(account)
             if hasattr(client, 'connect_to_account') and not client.connect_to_account(account):
