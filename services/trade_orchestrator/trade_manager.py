@@ -59,6 +59,31 @@ class ManagedTrade:
 
 class TradeManager:
 
+    def _ensure_account_dict(self, account):
+        """
+        Garantiza que account sea un dict de cuenta válido.
+        Si recibe un string, busca el dict correspondiente en self.mt5.accounts y config_provider.get_accounts().
+        Si no lo encuentra, loguea y retorna None.
+        """
+        if isinstance(account, dict):
+            return account
+        name = str(account)
+        # Buscar en self.mt5.accounts
+        accounts = []
+        if hasattr(self.mt5, 'accounts') and self.mt5.accounts:
+            accounts.extend(self.mt5.accounts)
+        # Buscar en config_provider si existe
+        if hasattr(self, 'config_provider') and self.config_provider:
+            try:
+                accounts.extend(self.config_provider.get_accounts())
+            except Exception:
+                pass
+        for acc in accounts:
+            if acc.get('name') == name:
+                return acc
+        log.error(f"[TM][ERROR] No se encontró el dict de cuenta para el nombre: {name}. Abortando operación.")
+        return None
+
     @staticmethod
     # pips_to_price y safe_comment ahora están en trade_utils.py
     def _pips_to_price(self, symbol: str, pips: float, point: float) -> float:
@@ -890,6 +915,9 @@ class TradeManager:
         return 100
 
     async def _do_partial_close(self, account: dict, ticket: int, percent: int, reason: str):
+        account = self._ensure_account_dict(account)
+        if not account:
+            return
         log.info(f"[DEBUG] Entering _do_partial_close | account={account['name']} ticket={int(ticket)} percent={int(percent)} reason={reason}")
         client = self.mt5._client_for(account)
         # Obtener volumen antes del cierre parcial
@@ -1669,6 +1697,7 @@ class TradeManager:
         if not hasattr(trade, "reentry_done"):
             trade.reentry_done = False
 
+        log.info(f"[REENTRY] Evaluando el contenido de [cuenta] => {cuenta}.")
         # --- Robustecer: asegurar que cuenta sea dict ---
         cuenta_dict = cuenta
         if isinstance(cuenta, str):
@@ -1687,8 +1716,10 @@ class TradeManager:
             if not trade.reentry_done:
                 client = self.mt5._client_for(cuenta_dict)
                 log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Cerrando 100% trade original.")
+                
                 # Cerrar 100% del trade original
                 await self._do_partial_close(cuenta_dict, trade.ticket, 100, reason="REENTRY_TP1")
+                
                 # Abrir runner solo si momentum filter lo permite
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
                 if candles and self.runner_momentum_filter(trade.symbol, candles):
@@ -1697,12 +1728,14 @@ class TradeManager:
                     info = client.symbol_info(trade.symbol)
                     step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
                     vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+                    
                     # Redondear hacia abajo al múltiplo de step
                     runner_lot = max(vmin, step * int(raw_runner_lot / step))
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
                     log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
+                    
                     # Abrir nueva posición runner
                     await self.mt5.open_runner_trade(
                         cuenta_dict,
@@ -1876,6 +1909,9 @@ class TradeManager:
         return valor_pip(symbol, volume)
 
     def _move_sl(self, trade, cuenta, sl_price):
+        cuenta = self._ensure_account_dict(cuenta)
+        if not cuenta:
+            return
         client = self.mt5._client_for(cuenta)
         asyncio.create_task(self.mt5.modify_sl(cuenta, trade.ticket, sl_price, reason="BE-PNL", provider_tag=trade.provider_tag))
 
