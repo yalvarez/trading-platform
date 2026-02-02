@@ -55,6 +55,8 @@ class ManagedTrade:
 
     # ✅ dedup acciones por trade (gestión por mensajes)
     actions_done: set[str] = field(default_factory=set)
+    # Timestamp para ventana de gracia reentry
+    reentry_tp1_time: Optional[float] = None
 
 
 class TradeManager:
@@ -1717,27 +1719,31 @@ class TradeManager:
             if not trade.reentry_done:
                 client = self.mt5._client_for(cuenta_dict)
                 log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Cerrando 100% trade original.")
-                
                 # Cerrar 100% del trade original
                 await self._do_partial_close(cuenta_dict, trade.ticket, 100, reason="REENTRY_TP1")
-                
-                # Abrir runner solo si momentum filter lo permite
+                # Guardar timestamp de TP1 para ventana de gracia
+                trade.reentry_tp1_time = time.time()
+                # Intentar abrir runner
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
+                allow_runner = False
                 if candles and self.runner_momentum_filter(trade.symbol, candles):
+                    allow_runner = True
+                else:
+                    # Si momentum filter falla, permitir solo si estamos en ventana de gracia (5s desde TP1)
+                    if trade.reentry_tp1_time and (time.time() - trade.reentry_tp1_time) <= 3:
+                        allow_runner = True
+                        log.info(f"[REENTRY][GRACE] Ventana de gracia activa: permitiendo runner para {trade.symbol} ticket={trade.ticket}")
+                if allow_runner:
                     original_vol = float(getattr(pos, "volume", 0.01))
                     raw_runner_lot = original_vol * 0.3
                     info = client.symbol_info(trade.symbol)
                     step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
                     vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
-                    
-                    # Redondear hacia abajo al múltiplo de step
                     runner_lot = max(vmin, step * int(raw_runner_lot / step))
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
                     log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
-                    
-                    # Abrir nueva posición runner
                     await self.mt5.open_runner_trade(
                         cuenta_dict,
                         symbol=trade.symbol,
