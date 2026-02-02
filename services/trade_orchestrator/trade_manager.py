@@ -1657,6 +1657,7 @@ class TradeManager:
             is_buy = (trade.direction == "BUY")
             current = float(pos.price_current)
 
+
         # TP1 alcanzado y no se ha hecho reentry
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
@@ -1668,13 +1669,26 @@ class TradeManager:
         if not hasattr(trade, "reentry_done"):
             trade.reentry_done = False
 
+        # --- Robustecer: asegurar que cuenta sea dict ---
+        cuenta_dict = cuenta
+        if isinstance(cuenta, str):
+            # Buscar el dict de cuenta por nombre
+            cuentas = getattr(self.mt5, 'accounts', [])
+            match = next((a for a in cuentas if a.get('name') == cuenta), None)
+            if match:
+                cuenta_dict = match
+                log.warning(f"[REENTRY][FIX] 'cuenta' era str, corregido a dict para runner: {cuenta}")
+            else:
+                log.error(f"[REENTRY][ERROR] No se encontró el dict de cuenta para el nombre: {cuenta}. Abortando apertura de runner.")
+                return
+
         # Si TP1 alcanzado y no se ha hecho reentry
         if (is_buy and current >= tp1) or (not is_buy and current <= tp1):
             if not trade.reentry_done:
-                client = self.mt5._client_for(cuenta)
-                log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}. Cerrando 100% trade original.")
+                client = self.mt5._client_for(cuenta_dict)
+                log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Cerrando 100% trade original.")
                 # Cerrar 100% del trade original
-                await self._do_partial_close(cuenta, trade.ticket, 100, reason="REENTRY_TP1")
+                await self._do_partial_close(cuenta_dict, trade.ticket, 100, reason="REENTRY_TP1")
                 # Abrir runner solo si momentum filter lo permite
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
                 if candles and self.runner_momentum_filter(trade.symbol, candles):
@@ -1688,10 +1702,10 @@ class TradeManager:
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
-                    log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}: lot={runner_lot} SL={sl} TP={tp}")
+                    log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
                     # Abrir nueva posición runner
                     await self.mt5.open_runner_trade(
-                        cuenta,
+                        cuenta_dict,
                         symbol=trade.symbol,
                         direction=trade.direction,
                         volume=runner_lot,
@@ -1700,17 +1714,17 @@ class TradeManager:
                         provider_tag=f"{trade.provider_tag}_REENTRY"
                     )
                     trade.reentry_done = True
-                    self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
-                    log.info(f"[REENTRY] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
+                    self._notify_bg(cuenta_dict["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                    log.info(f"[REENTRY] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
                 else:
-                    self._notify_bg(cuenta["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
-                    log.info(f"[REENTRY] Momentum filter rechazó runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
+                    self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
+                    log.info(f"[REENTRY] Momentum filter rechazó runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
                 return
 
         # El runner se gestiona con trailing si está habilitado
-        if self.enable_trailing:
-            log.info(f"[REENTRY] Evaluando trailing para runner {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
-            await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
+        #if self.enable_trailing:
+        #    log.info(f"[REENTRY] Evaluando trailing para runner {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
+        #    await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
 
     async def gestionar_trade_general(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
