@@ -1661,7 +1661,7 @@ class TradeManager:
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
         if not tp1 or not tp2:
-            # Si no hay dos TPs, fallback a gestión general
+            log.info(f"[REENTRY] No hay suficientes TPs para modalidad reentry en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
         # Usar un flag en el trade para evitar múltiples ejecuciones
@@ -1672,24 +1672,23 @@ class TradeManager:
         if (is_buy and current >= tp1) or (not is_buy and current <= tp1):
             if not trade.reentry_done:
                 client = self.mt5._client_for(cuenta)
+                log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}. Cerrando 100% trade original.")
                 # Cerrar 100% del trade original
                 await self._do_partial_close(cuenta, trade.ticket, 100, reason="REENTRY_TP1")
                 # Abrir runner solo si momentum filter lo permite
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
-                
                 if candles and self.runner_momentum_filter(trade.symbol, candles):
                     original_vol = float(getattr(pos, "volume", 0.01))
                     raw_runner_lot = original_vol * 0.3
                     info = client.symbol_info(trade.symbol)
                     step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
                     vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
-                    
                     # Redondear hacia abajo al múltiplo de step
                     runner_lot = max(vmin, step * int(raw_runner_lot / step))
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
-                    
+                    log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}: lot={runner_lot} SL={sl} TP={tp}")
                     # Abrir nueva posición runner
                     await self.mt5.open_runner_trade(
                         cuenta,
@@ -1700,15 +1699,17 @@ class TradeManager:
                         tp=tp,
                         provider_tag=f"{trade.provider_tag}_REENTRY"
                     )
-
                     trade.reentry_done = True
                     self._notify_bg(cuenta["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                    log.info(f"[REENTRY] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
                 else:
                     self._notify_bg(cuenta["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
+                    log.info(f"[REENTRY] Momentum filter rechazó runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
                 return
-        
+
         # El runner se gestiona con trailing si está habilitado
         if self.enable_trailing:
+            log.info(f"[REENTRY] Evaluando trailing para runner {trade.symbol} ticket={trade.ticket} en cuenta {cuenta['name']}.")
             await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
 
     async def gestionar_trade_general(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
