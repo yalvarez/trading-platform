@@ -1796,6 +1796,12 @@ class TradeManager:
         if self.enable_trailing:
             await self._maybe_trailing(cuenta, pos, point, is_buy, current, trade)
 
+        # --- Scaling out para trades sin TP (ej. TOROFX) ---
+        provider_tag = getattr(trade, 'provider_tag', '') or ''
+        tps = getattr(trade, 'tps', [])
+        if (not tps) and ('TOROFX' in provider_tag.upper()):
+            await self._maybe_scaling_out_no_tp(cuenta, pos, point, is_buy, current, trade)
+
     async def gestionar_trade_be_pips(self, trade, cuenta, pos=None, point=None, is_buy=None, current=None):
         """
         Lógica: al alcanzar X pips, cerrar 30% del trade, mover SL a BE, luego gestión normal (TP, runner, trailing).

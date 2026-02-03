@@ -53,8 +53,16 @@ class RemoteTelegramNotifier:
         self.api_url = api_url.rstrip("/")
 
     async def notify(self, chat_id: str, message: str):
+        import logging
+        log = logging.getLogger("telegram_notifier")
+        # Try to convert chat_id to int (as required by ingestor)
+        try:
+            chat_id_int = int(str(chat_id))
+        except (ValueError, TypeError):
+            log.error(f"[NOTIFY][SKIP] chat_id '{chat_id}' is not a valid integer. Notification not sent.")
+            return
         async with httpx.AsyncClient() as client:
-            resp = await client.post(f"{self.api_url}/notify", json={"chat_id": chat_id, "message": message})
+            resp = await client.post(f"{self.api_url}/notify", json={"chat_id": str(chat_id_int), "message": message})
             resp.raise_for_status()
             return resp.json()
 
