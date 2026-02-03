@@ -300,7 +300,7 @@ class MT5Executor:
         #     fillmode = getattr(info, "trade_fill_mode", None)
         #     if fillmode is None:
         #         fillmode = getattr(info, "fill_mode", None)
-        
+        log.debug(f"[SYMBOL-INFO][DEBUG] {info}")
         fillmode = None
         if info:
             try:
