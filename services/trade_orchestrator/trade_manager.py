@@ -154,44 +154,50 @@ class TradeManager:
         pct_real = int((close_vol / v) * 100) if v > 0 else desired_percent
         return pct_real
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
-    async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, t: ManagedTrade):
+    async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, trade: ManagedTrade):
         account = self._ensure_account_dict(account)
         # Configuración de trailing tras el tercer tramo
         trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
-        if not hasattr(t, 'trailing_active_last_tramo'):
-            t.trailing_active_last_tramo = False
-        if not hasattr(t, 'trailing_peak_last_tramo'):
-            t.trailing_peak_last_tramo = None
+        if not hasattr(trade, 'trailing_active_last_tramo'):
+            trade.trailing_active_last_tramo = False
+        if not hasattr(trade, 'trailing_peak_last_tramo'):
+            trade.trailing_peak_last_tramo = None
         # Guardar el precio del cierre del primer tramo para BE futuro
-        if not hasattr(t, 'first_tramo_close_price'):
-            t.first_tramo_close_price = None
+        if not hasattr(trade, 'first_tramo_close_price'):
+            trade.first_tramo_close_price = None
         # Solo aplica a trades sin TP y con provider_tag TOROFX (o configurable)
-        if t.tps:
+        if trade.tps:
             return
         # Deshabilitado este filtro por el momento
         # if self.torofx_provider_tag_match not in (t.provider_tag or '').upper():
         #     return
         tramo_pips = float(self.config_provider.get('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 30.0)))
         percent_per_tramo = float(self.config_provider.get('SCALING_PERCENT_PER_TRAMO', getattr(self, 'scaling_percent_per_tramo', 25)))
-        entry = t.entry_price if t.entry_price is not None else float(pos.price_open)
-        symbol = t.symbol.upper() if hasattr(t, 'symbol') else ''
+        entry = trade.entry_price if trade.entry_price is not None else float(pos.price_open)
+        symbol = trade.symbol.upper() if hasattr(trade, 'symbol') else ''
         client = self.mt5._client_for(account)
         # Estado: guardar tramos ya ejecutados en t.actions_done
-        if not hasattr(t, 'actions_done') or t.actions_done is None:
-            t.actions_done = set()
+        if not hasattr(trade, 'actions_done') or trade.actions_done is None:
+            trade.actions_done = set()
         # Calcular cuántos tramos de 30 pips se han recorrido desde la entrada
         pips_ganados = (current - entry) / point if is_buy else (entry - current) / point
         tramos = int(pips_ganados // tramo_pips)
         # Ejecutar cierre parcial por cada tramo no ejecutado
         for tramo in range(1, tramos + 1):
-            if tramo in t.actions_done:
+            if tramo in trade.actions_done:
                 continue
-            # Cerrar el 25% del volumen actual
+            # Cerrar el porcentaje configurado del volumen actual, validando contra el mínimo permitido
             v = float(getattr(pos, 'volume', 0.0))
-            vmin = float(getattr(client.symbol_info(symbol), 'volume_min', 0.0))
-            step = float(getattr(client.symbol_info(symbol), 'volume_step', 0.01))
-            close_vol = max(step, round(v * percent_per_tramo / 100.0 / step) * step)
+            info = client.symbol_info(symbol)
+            vmin = float(getattr(info, 'volume_min', 0.01)) if info else 0.01
+            step = float(getattr(info, 'volume_step', 0.01)) if info else 0.01
+            # Redondeo y validación igual que early_partial_close
+            close_vol = round(v * percent_per_tramo / 100.0, 2 if symbol.startswith("XAU") else 2)
+            # Ajustar al múltiplo de step
+            close_vol = max(step, round(close_vol / step) * step)
+            # Validar límites: nunca cerrar menos que vmin ni igual/mayor que el volumen actual
             if close_vol < vmin or close_vol >= v:
+                log.info(f"[TOROFX-SCALING][SKIP] Volumen a cerrar inválido: {close_vol} (vmin={vmin}, actual={v}) en tramo {tramo}")
                 continue
             req = {
                 "action": 1,  # TRADE_ACTION_DEAL
@@ -204,7 +210,7 @@ class TradeManager:
                 "magic": self.magic,
                 # type_filling will be set by robust filling logic
                 "type_time": 0,
-                "comment": "ScalingOut"
+                "comment": "ScalingOut-" + str(tramo)
             }
             log.info(f"[TOROFX-SCALING] Enviando cierre parcial tramo {tramo} | req={req}")
             # Use robust filling logic from mt5_executor
@@ -217,10 +223,10 @@ class TradeManager:
             elif retcode not in (0, 10009, 10008):
                 log.error(f"[TOROFX-SCALING][ERROR] Cierre parcial tramo {tramo} falló | ticket={pos.ticket} retcode={retcode} res={res}")
             if res and retcode in (0, 10009, 10008):  # TRADE_RETCODE_DONE, etc
-                t.actions_done.add(tramo)
+                trade.actions_done.add(tramo)
                 # Guardar el precio del cierre del primer tramo
                 if tramo == 1:
-                    t.first_tramo_close_price = float(current)
+                    trade.first_tramo_close_price = float(current)
                 self._notify_bg(account, f"🎯 ScalingOut TOROFX: Parcial tramo {tramo} ({percent_per_tramo}%) ejecutado | Ticket: {int(pos.ticket)}")
                 await self.notify_trade_event(
                     'partial',
@@ -230,19 +236,11 @@ class TradeManager:
                     percent=percent_per_tramo,
                     tramo=tramo)
                 # Al cerrar el tercer tramo, poner BE al precio del cierre del primer tramo
-                if tramo == 3 and t.first_tramo_close_price:
-                    be_sl = float(t.first_tramo_close_price)
+                if tramo == 3 and trade.first_tramo_close_price:
+                    be_sl = float(trade.first_tramo_close_price)
                     # Validate min stop distance using centralized logic
-                    info = client.symbol_info(symbol)
-                    point = float(getattr(info, "point", 0.0))
-                    # Acceso robusto a stops_level/stop_level
-                    if hasattr(info, "stops_level"):
-                        stop_level_raw = getattr(info, "stops_level", 0.0)
-                    elif hasattr(info, "stop_level"):
-                        stop_level_raw = getattr(info, "stop_level", 0.0)
-                    else:
-                        log.warning(f"[TM][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
-                        stop_level_raw = 0.0
+                    point = float(getattr(info, "point", 0.0)) if info else 0.0
+                    stop_level_raw = getattr(info, "stops_level", getattr(info, "stop_level", 0.0)) if info else 0.0
                     stop_level = float(stop_level_raw) * point
                     price_current = float(current)
                     if is_buy:
@@ -266,17 +264,17 @@ class TradeManager:
                     log.info(f"[TOROFX-SCALING] Resultado BE tras tercer tramo | res={be_res}")
                     self._notify_bg(account, f"🔒 BE movido tras tercer tramo | Ticket: {int(pos.ticket)} | SL: {be_sl}")
         # Activar trailing solo después del cierre del tercer tramo
-        if 3 in t.actions_done and not t.trailing_active_last_tramo:
-            t.trailing_active_last_tramo = True
-            t.trailing_peak_last_tramo = float(current)
+        if 3 in trade.actions_done and not trade.trailing_active_last_tramo:
+            trade.trailing_active_last_tramo = True
+            trade.trailing_peak_last_tramo = float(current)
             self._notify_bg(account, f"🚦 Trailing activado tras tercer tramo | Ticket: {int(pos.ticket)} | Peak: {current}")
 
         # Si el trailing tras el tercer tramo está activo, monitorear retroceso
-        if t.trailing_active_last_tramo:
-            peak = t.trailing_peak_last_tramo or float(current)
+        if trade.trailing_active_last_tramo:
+            peak = trade.trailing_peak_last_tramo or float(current)
             # Actualizar el máximo alcanzado
             if (is_buy and current > peak) or (not is_buy and current < peak):
-                t.trailing_peak_last_tramo = float(current)
+                trade.trailing_peak_last_tramo = float(current)
                 peak = float(current)
             retroceso = calcular_trailing_retroceso(peak, current, point, is_buy)
             if retroceso >= trailing_pips_last_tramo:
@@ -311,7 +309,7 @@ class TradeManager:
                         symbol=symbol,
                         reason=f"Trailing retroceso {trailing_pips_last_tramo} pips"
                     )
-                    t.trailing_active_last_tramo = False
+                    trade.trailing_active_last_tramo = False
 
     async def notify_trailing(self, account, pos, new_sl):
         await self.notify_trade_event(
