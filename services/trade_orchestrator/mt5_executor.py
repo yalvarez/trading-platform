@@ -37,17 +37,15 @@ class MT5Executor:
         available_attrs = dir(symbol_info) if symbol_info else []
         log.info(f"[RUNNER][DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
         min_stop_raw = None
+        # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None, and never raise
+        fill_mode = None
         if symbol_info:
             min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
-            # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None, and never raise
-            fill_mode = None
-            if symbol_info is not None:
-                fill_mode = getattr(symbol_info, "trade_fill_mode", None)
-                if fill_mode is None:
-                    fill_mode = getattr(symbol_info, "fill_mode", None)
+            fill_mode = getattr(symbol_info, "trade_fill_mode", None)
+            if fill_mode is None:
+                fill_mode = getattr(symbol_info, "fill_mode", None)
         else:
             min_stop_raw = 0.0
-            fill_mode = None
         min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
         log.info(f"[RUNNER][DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
         if min_stop > 0 and abs(price - forced_sl) < min_stop:
@@ -297,14 +295,13 @@ class MT5Executor:
         ORDER_FILLING_RETURN = 2
         candidates = []
         # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
-        tfm = None
+        fillmode = None
         if info is not None:
-            tfm = getattr(info, "trade_fill_mode", None)
-            if tfm is None:
-                tfm = getattr(info, "fill_mode", None)
+            fillmode = getattr(info, "trade_fill_mode", None)
+            if fillmode is None:
+                fillmode = getattr(info, "fill_mode", None)
         enabled = getattr(info, "visible", None) if info else None
         trademode = getattr(info, "trade_mode", None) if info else None
-        fillmode = tfm
         bid = getattr(tick, "bid", None) if tick else None
         ask = getattr(tick, "ask", None) if tick else None
         ticktime = getattr(tick, "time", None) if tick else None
@@ -542,17 +539,14 @@ class MT5Executor:
                 log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
                 # Acceso robusto a stops_level, stop_level y fill_mode
                 min_stop_raw = None
+                fill_mode = None
                 if symbol_info:
                     min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
-                    # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
-                    fill_mode = None
-                    if symbol_info is not None:
-                        fill_mode = getattr(symbol_info, "trade_fill_mode", None)
-                        if fill_mode is None:
-                            fill_mode = getattr(symbol_info, "fill_mode", None)
+                    fill_mode = getattr(symbol_info, "trade_fill_mode", None)
+                    if fill_mode is None:
+                        fill_mode = getattr(symbol_info, "fill_mode", None)
                 else:
                     min_stop_raw = 0.0
-                    fill_mode = None
                 min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
                 log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
