@@ -39,8 +39,12 @@ class MT5Executor:
         min_stop_raw = None
         if symbol_info:
             min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
-            # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
-            fill_mode = getattr(symbol_info, "trade_fill_mode", getattr(symbol_info, "fill_mode", None))
+            # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None, and never raise
+            fill_mode = None
+            if symbol_info is not None:
+                fill_mode = getattr(symbol_info, "trade_fill_mode", None)
+                if fill_mode is None:
+                    fill_mode = getattr(symbol_info, "fill_mode", None)
         else:
             min_stop_raw = 0.0
             fill_mode = None
@@ -293,7 +297,11 @@ class MT5Executor:
         ORDER_FILLING_RETURN = 2
         candidates = []
         # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
-        tfm = getattr(info, "trade_fill_mode", getattr(info, "fill_mode", None)) if info else None
+        tfm = None
+        if info is not None:
+            tfm = getattr(info, "trade_fill_mode", None)
+            if tfm is None:
+                tfm = getattr(info, "fill_mode", None)
         enabled = getattr(info, "visible", None) if info else None
         trademode = getattr(info, "trade_mode", None) if info else None
         fillmode = tfm
@@ -537,7 +545,11 @@ class MT5Executor:
                 if symbol_info:
                     min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
                     # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
-                    fill_mode = getattr(symbol_info, "trade_fill_mode", getattr(symbol_info, "fill_mode", None))
+                    fill_mode = None
+                    if symbol_info is not None:
+                        fill_mode = getattr(symbol_info, "trade_fill_mode", None)
+                        if fill_mode is None:
+                            fill_mode = getattr(symbol_info, "fill_mode", None)
                 else:
                     min_stop_raw = 0.0
                     fill_mode = None
