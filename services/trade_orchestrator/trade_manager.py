@@ -171,6 +171,7 @@ class TradeManager:
         client = self.mt5._client_for(account)
         if not hasattr(trade, 'actions_done') or trade.actions_done is None:
             trade.actions_done = set()
+        point = 0.1
         pips_ganados = (current - entry) / point if is_buy else (entry - current) / point
         tramos = int(pips_ganados // tramo_pips)
         for tramo in range(1, tramos + 1):
