@@ -295,11 +295,22 @@ class MT5Executor:
         ORDER_FILLING_RETURN = 2
         candidates = []
         # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None
+        # fillmode = None
+        # if info is not None:
+        #     fillmode = getattr(info, "trade_fill_mode", None)
+        #     if fillmode is None:
+        #         fillmode = getattr(info, "fill_mode", None)
+        
         fillmode = None
-        if info is not None:
-            fillmode = getattr(info, "trade_fill_mode", None)
-            if fillmode is None:
-                fillmode = getattr(info, "fill_mode", None)
+        if info:
+            try:
+                fillmode = info.trade_fill_mode
+            except AttributeError:
+                try:
+                    fillmode = info.fill_mode
+                except AttributeError:
+                    fillmode = None
+
         enabled = getattr(info, "visible", None) if info else None
         trademode = getattr(info, "trade_mode", None) if info else None
         bid = getattr(tick, "bid", None) if tick else None
@@ -346,7 +357,6 @@ class MT5Executor:
                 log.warning(f"[ORDER-INVALID-REQUEST] retcode=10030 comment={getattr(res,'comment',None)} req={req_try} res={res}")
                 self._notify_bg(account_name, f"❌ Orden inválida: retcode=10030 comment={getattr(res,'comment',None)}")
         return last_res
-
 
     def __init__(
         self,
