@@ -422,7 +422,7 @@ class MT5Executor:
                 # Usar la función centralizada para calcular el SL por defecto
                 point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
                 info = client.symbol_info(symbol)
-                if info and hasattr(info, 'point'):
+                if info and getattr(info, 'point', None) is not None:
                     point = float(getattr(info, 'point', point))
                 default_sl = getattr(self, 'default_sl_xauusd', 300) if symbol.upper().startswith('XAU') else getattr(self, 'default_sl', 100)
                 return calcular_sl_default(symbol, direction, price, point, default_sl)
@@ -450,7 +450,7 @@ class MT5Executor:
                 # Obtener el tamaño de pip para el símbolo
                 symbol_info = client.symbol_info(symbol)
                 point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
-                if symbol_info and hasattr(symbol_info, 'point'):
+                if symbol_info and getattr(symbol_info, 'point', None) is not None:
                     point = float(getattr(symbol_info, 'point', point))
                 pips_tolerance = 15 * point
                 # Log de referencia de precio inicial
@@ -575,7 +575,7 @@ class MT5Executor:
                 elif risk_percent > 0 and forced_sl and float(forced_sl) > 0:
                     try:
                         acc_info = client.mt5.account_info()
-                        if acc_info and hasattr(acc_info, "balance"):
+                        if acc_info and getattr(acc_info, "balance", None) is not None:
                             balance = float(acc_info.balance)
                     except Exception as e:
                         log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
