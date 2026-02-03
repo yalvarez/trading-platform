@@ -1,3 +1,18 @@
+"""
+trade_utils.py - Funciones auxiliares y comunes para la gestión de trades.
+
+Centraliza lógica repetida y utilidades para mantener el código mantenible y documentado.
+
+Funciones principales:
+- pips_to_price: Conversión de pips a precio según el símbolo (oro o FX).
+- safe_comment: Genera comentarios seguros para órdenes, truncados y sin caracteres especiales.
+- valor_pip: Estima el valor de un pip para un símbolo y volumen dados.
+- calcular_sl_por_pnl: Calcula el precio de SL que permite perder solo lo ganado en una parcial.
+"""
+import re
+import os
+from typing import Optional
+
 def calcular_lotaje(balance: float, risk_money: float, sl_distance: float, tick_value: float, tick_size: float, lot_step: float, min_lot: float, fixed_lot: float = 0.0) -> float:
     """
     Calcula el lotaje a usar para una operación, usando lotaje fijo si se especifica, o dinámico según riesgo.
@@ -20,6 +35,7 @@ def calcular_lotaje(balance: float, risk_money: float, sl_distance: float, tick_
     lot = risk_money / (sl_distance * (tick_value / tick_size))
     lot = max(min_lot, round(lot / lot_step) * lot_step)
     return lot
+
 def calcular_volumen_parcial(current_volume: float, close_percent: float, step: float = 0.0, min_vol: float = 0.0) -> float:
     """
     Calcula el volumen a cerrar en un cierre parcial, ajustando al múltiplo de step y respetando el mínimo.
@@ -43,6 +59,7 @@ def calcular_volumen_parcial(current_volume: float, close_percent: float, step: 
     if close_vol > current_volume:
         close_vol = current_volume
     return close_vol
+
 def calcular_trailing_retroceso(peak: float, current: float, point: float, is_buy: bool) -> float:
     """
     Calcula el retroceso en pips desde el peak para trailing stop.
@@ -58,6 +75,7 @@ def calcular_trailing_retroceso(peak: float, current: float, point: float, is_bu
         return (peak - current) / point
     else:
         return (current - peak) / point
+
 def calcular_be_price(entry_price: float, direction: str, be_offset_pips: float, point: float, symbol: str) -> float:
     """
     Calcula el precio de break-even (BE) con offset, centralizando la lógica para BUY/SELL y oro/FX.
@@ -75,20 +93,6 @@ def calcular_be_price(entry_price: float, direction: str, be_offset_pips: float,
         return round(entry_price + offset, 2 if symbol.upper().startswith("XAU") else 5)
     else:
         return round(entry_price - offset, 2 if symbol.upper().startswith("XAU") else 5)
-"""
-trade_utils.py - Funciones auxiliares y comunes para la gestión de trades.
-
-Centraliza lógica repetida y utilidades para mantener el código mantenible y documentado.
-
-Funciones principales:
-- pips_to_price: Conversión de pips a precio según el símbolo (oro o FX).
-- safe_comment: Genera comentarios seguros para órdenes, truncados y sin caracteres especiales.
-- valor_pip: Estima el valor de un pip para un símbolo y volumen dados.
-- calcular_sl_por_pnl: Calcula el precio de SL que permite perder solo lo ganado en una parcial.
-"""
-import re
-import os
-from typing import Optional
 
 def pips_to_price(symbol: str, pips: float, point: float) -> float:
     """
@@ -154,7 +158,6 @@ def calcular_sl_por_pnl(entry: float, direction: str, pnl_ganado: float, volume:
     else:
         sl_price = entry - (pips_equivalentes * point)
     return round(sl_price, 5)
-
 
 def calcular_sl_default(symbol: str, direction: str, price: float, point: float, default_sl_pips: float) -> float:
     """

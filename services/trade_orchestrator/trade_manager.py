@@ -90,7 +90,6 @@ class TradeManager:
     # pips_to_price y safe_comment ahora están en trade_utils.py
     def _pips_to_price(self, symbol: str, pips: float, point: float) -> float:
         return pips_to_price(symbol, pips, point)
-
     def _safe_comment(self, tag: str) -> str:
         return safe_comment(tag, getattr(self, 'comment_prefix', 'TM'))
     def register_trade(self, account_name: str, ticket: int, symbol: str, direction: str, provider_tag: str, tps: list[float], planned_sl: float = None, group_id: int = None):
@@ -1014,7 +1013,6 @@ class TradeManager:
                 log.info(f"[PnL] Added {pnl} to {key}")
             except Exception as e:
                 log.warning(f"[PnL] Error updating Redis for {key}: {e}")
-
     # ----------------------------
     # ✅ Addon MIDPOINT Entry–SL (NO pirámide en ganancia)
     # ----------------------------
