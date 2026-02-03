@@ -112,7 +112,7 @@ class MT5Executor:
         if close_volume < 0.01:
             self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | Volumen a cerrar demasiado pequeño: {close_volume}")
             return False
-        # 1. Cerrar el porcentaje de la posición
+        # 1. Cerrar el porcentaje de la posición usando la misma lógica de fill mode que apertura
         req_close = {
             "action": 1,  # TRADE_ACTION_DEAL
             "position": int(ticket),
