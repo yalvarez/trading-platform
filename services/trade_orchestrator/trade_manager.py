@@ -1689,11 +1689,15 @@ class TradeManager:
             current = float(pos.price_current)
 
 
-        # TP1 alcanzado y no se ha hecho reentry
+        # Fallback a general solo una vez si no hay TPs suficientes
+        if not hasattr(trade, "_reentry_fallback_logged"):
+            trade._reentry_fallback_logged = False
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
         if not tp1 or not tp2:
-            log.info(f"[REENTRY] No hay suficientes TPs para modalidad reentry en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
+            if not trade._reentry_fallback_logged:
+                log.info(f"[REENTRY] No hay suficientes TPs para modalidad reentry en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
+                trade._reentry_fallback_logged = True
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
         # Usar un flag en el trade para evitar múltiples ejecuciones
@@ -1798,6 +1802,14 @@ class TradeManager:
         - Si el recorrido en pips >= be_pips y no se ha aplicado BE, cierra 30% y mueve SL a BE.
         - Luego ejecuta la gestión general.
         """
+        # Fallback a general solo una vez si no hay TPs
+        if not hasattr(trade, "_be_pips_fallback_logged"):
+            trade._be_pips_fallback_logged = False
+        if not trade.tps or len(trade.tps) == 0:
+            if not trade._be_pips_fallback_logged:
+                log.info(f"[BE_PIPS] No hay TPs para modalidad be_pips en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
+                trade._be_pips_fallback_logged = True
+            return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
         if recorrido >= be_pips and not getattr(trade, "be_applied", False):
@@ -1818,6 +1830,14 @@ class TradeManager:
         - Si el recorrido en pips >= be_pips y no se ha aplicado SL PnL, cierra 30%, calcula y mueve el SL.
         - Luego ejecuta la gestión general.
         """
+        # Fallback a general solo una vez si no hay TPs
+        if not hasattr(trade, "_be_pnl_fallback_logged"):
+            trade._be_pnl_fallback_logged = False
+        if not trade.tps or len(trade.tps) == 0:
+            if not trade._be_pnl_fallback_logged:
+                log.info(f"[BE_PNL] No hay TPs para modalidad be_pnl en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
+                trade._be_pnl_fallback_logged = True
+            return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
         if recorrido >= be_pips and not getattr(trade, "sl_pnl_applied", False):
