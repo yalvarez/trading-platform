@@ -46,12 +46,12 @@ class MT5Executor:
                 log.warning(f"[RUNNER][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
                 self._notify_bg(name, f"⚠️ SymbolInfo para {symbol} no tiene stops_level ni stop_level. Usando 0.0. Puede afectar la gestión de SL.")
                 min_stop_raw = 0.0
-                fill_mode = getattr(symbol_info, "fill_mode", None) if hasattr(symbol_info, "fill_mode") else None
+            fill_mode = getattr(symbol_info, "trade_fill_mode", None) if hasattr(symbol_info, "trade_fill_mode") else None
         else:
             min_stop_raw = 0.0
             fill_mode = None
         min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-        log.info(f"[RUNNER][DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
+        log.info(f"[RUNNER][DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, trade_fill_mode={fill_mode}")
         if min_stop > 0 and abs(price - forced_sl) < min_stop:
             if direction.upper() == "BUY":
                 adjusted_sl = price - min_stop
@@ -298,14 +298,14 @@ class MT5Executor:
         ORDER_FILLING_FOK = 3
         ORDER_FILLING_RETURN = 2
         candidates = []
-        tfm = getattr(info, "fill_mode", None) if info else None
+        tfm = getattr(info, "trade_fill_mode", None) if info else None
         enabled = getattr(info, "visible", None) if info else None
         trademode = getattr(info, "trade_mode", None) if info else None
-        fillmode = getattr(info, "fill_mode", None) if info else None
+        fillmode = getattr(info, "trade_fill_mode", None) if info else None
         bid = getattr(tick, "bid", None) if tick else None
         ask = getattr(tick, "ask", None) if tick else None
         ticktime = getattr(tick, "time", None) if tick else None
-        log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
+        log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} trade_fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
         # --- PATCH: Forzar FOK para StarTrader Demo y XAUUSD ---
         # Si la cuenta es 'StarTrader Demo' y el símbolo es XAUUSD, forzar solo FOK
         # Para revertir, eliminar este bloque
@@ -534,7 +534,7 @@ class MT5Executor:
                 symbol_info = client.symbol_info(symbol)
                 available_attrs = dir(symbol_info) if symbol_info else []
                 log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
-                # Acceso seguro a stops_level, stop_level y fill_mode
+                # Acceso seguro a stops_level, stop_level y trade_fill_mode
                 min_stop_raw = None
                 if symbol_info:
                     if hasattr(symbol_info, "stops_level"):
@@ -544,12 +544,12 @@ class MT5Executor:
                     else:
                         log.warning(f"[MT5_EXECUTOR][WARN] SymbolInfo for {symbol} no tiene stops_level ni stop_level. Usando 0.0")
                         min_stop_raw = 0.0
-                    fill_mode = getattr(symbol_info, "fill_mode", None) if hasattr(symbol_info, "fill_mode") else None
+                    fill_mode = getattr(symbol_info, "trade_fill_mode", None) if hasattr(symbol_info, "trade_fill_mode") else None
                 else:
                     min_stop_raw = 0.0
                     fill_mode = None
                 min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
+                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, trade_fill_mode={fill_mode}")
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
                     if direction.upper() == "BUY":
                         adjusted_sl = price - min_stop
