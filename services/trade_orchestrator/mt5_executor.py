@@ -302,18 +302,21 @@ class MT5Executor:
         ticktime = getattr(tick, "time", None) if tick else None
         log.info(f"[SYMBOL-STATE] symbol={symbol} enabled={enabled} trade_mode={trademode} fill_mode={fillmode} bid={bid} ask={ask} tick_time={ticktime}")
         # --- PATCH: Forzar FOK para StarTrader Demo y XAUUSD ---
-        # Si la cuenta es 'StarTrader Demo' y el símbolo es XAUUSD, forzar solo FOK
-        # Para revertir, eliminar este bloque
         force_fok = False
         if account_name == 'StarTrader Demo' and symbol.upper() == 'XAUUSD':
             force_fok = True
         # --- FIN PATCH ---
+        candidates = []
         if force_fok:
             candidates = [ORDER_FILLING_FOK]
             log.info(f"[FILLING-PATCH] Forzando FOK para cuenta StarTrader Demo y XAUUSD")
+        elif fillmode is None:
+            # If no fill mode is available, try all modes for compatibility
+            candidates = [ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN]
+            log.info(f"[FILLING-PATCH] fill_mode is None, probando todos los filling modes (IOC, FOK, RETURN)")
         else:
-            if tfm in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
-                candidates.append(int(tfm))
+            if fillmode in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
+                candidates.append(int(fillmode))
             for f in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN):
                 if f not in candidates:
                     candidates.append(f)
@@ -346,7 +349,7 @@ class MT5Executor:
         *,
         default_deviation: int = 50,
         magic: int = 987654,
-        comment_prefix: str = "YsaCopy",
+        comment_prefix: str = "YsaCopyNew",
         notifier=None,
         trading_windows: str = "03:00-12:00,08:00-17:00",
         entry_wait_seconds: int = 60,
