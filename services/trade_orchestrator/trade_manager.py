@@ -173,48 +173,17 @@ class TradeManager:
             trade.actions_done = set()
         pips_ganados = ((current - entry) if is_buy else (entry - current)) / 0.1
         tramo = int(pips_ganados // tramo_pips)
-        log.debug("tramos => {tramos}")
 
         # Usar partial close robusto
-        action_done = False
-
-        if tramo == 1 and tramo not in trade.actions_done:
-            trade.first_tramo_close_price = float(current)
-            result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{tramo}")
-            if result is not None:
-                trade.actions_done.add(tramo)
-                action_done = True
-
-        if tramo == 2 and tramo not in trade.actions_done:
-            trade.first_tramo_close_price = float(current)
-            result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{tramo}")
-            await self._do_be(account, int(pos.ticket), point, is_buy)
-            
-            if result is not None:
-                trade.actions_done.add(tramo)
-                action_done = True
-
-        # Tras el tramo 3, aplicar BE con precio del tramo 1 (si existe)
-        if tramo == 3 and tramo not in trade.actions_done:
-            trade.first_tramo_close_price = float(current)
-            result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{tramo}")
-            await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
-            
-            if result is not None:
-                trade.actions_done.add(tramo)
-                action_done = True        
-            
-        if action_done:
-            self._notify_bg(account, f"🎯 ScalingOut TOROFX: Parcial tramo {tramo} ({percent_per_tramo}%) ejecutado | Ticket: {int(pos.ticket)}")
-            await self.notify_trade_event(
-                'partial',
-                account_name=account["name"],
-                ticket=int(pos.ticket),
-                symbol=symbol,
-                percent=percent_per_tramo,
-                tramo=tramo)
-            action_done = False
-        
+        for t in [1, 2, 3]:
+            if tramo >= t and t not in trade.actions_done:
+                trade.first_tramo_close_price = float(current)
+                result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
+                if t == 2:
+                    await self._do_be(account, int(pos.ticket), point, is_buy)
+                if result is not None:
+                    trade.actions_done.add(t)
+                    break
         # Activar trailing solo después del cierre del tercer tramo
         if 3 in trade.actions_done and not trade.trailing_active_last_tramo:
             trade.trailing_active_last_tramo = True
