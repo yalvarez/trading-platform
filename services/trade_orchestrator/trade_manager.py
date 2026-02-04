@@ -58,7 +58,6 @@ class ManagedTrade:
     # Timestamp para ventana de gracia reentry
     reentry_tp1_time: Optional[float] = None
 
-
 class TradeManager:
 
     def _ensure_account_dict(self, account):
@@ -155,7 +154,7 @@ class TradeManager:
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, trade: ManagedTrade):
         account = self._ensure_account_dict(account)
-        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 40.0)
+        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
         if not hasattr(trade, 'trailing_active_last_tramo'):
             trade.trailing_active_last_tramo = False
         if not hasattr(trade, 'trailing_peak_last_tramo'):
@@ -185,15 +184,15 @@ class TradeManager:
                     await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
                     
                     if t == 1:
-                        trade.first_tramo_close_price = float(current)
-                    
+                        trade.first_tramo_close_price = float(current)                    
                     if t == 2:
-                        await self._do_be(account, int(pos.ticket), point, is_buy)
-                    
+                        await self._do_be(account, int(pos.ticket), point, is_buy)                    
                     if t == 3:
                         await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
 
                     trade.actions_done.add(action)
+
+                    await self.notify_trade_event('tramo',account_name=account["name"],ticket=int(pos.ticket),symbol=symbol,tramo=t,current_price=current)
                 except:
                     log.error(f"[TM][ERROR] Error en scaling out tramo {t} para ticket {int(pos.ticket)}")              
                 

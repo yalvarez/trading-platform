@@ -68,6 +68,8 @@ class TelegramNotifierAdapter:
             return f"🎯 Partial Close | Cuenta: {kwargs.get('account_name')} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | {kwargs.get('close_percent')}% | Motivo: {kwargs.get('reason')}"
         elif event == 'sl':
             return f"❌ SL HIT | Cuenta: {kwargs.get('account_name')} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | SL: {kwargs.get('sl_price')} | Close: {kwargs.get('close_price')}"
+        elif event == 'tramo':
+            return f"🎯 TRAMO HIT | Cuenta: {kwargs.get('account_name')} | Ticket: {kwargs.get('ticket')} | {kwargs.get('symbol')} | Tramo: {kwargs.get('tramo')} | Precio actual: {kwargs.get('current_price')}"
         elif event == 'be':
             return kwargs.get('message')
         elif event == 'trailing':

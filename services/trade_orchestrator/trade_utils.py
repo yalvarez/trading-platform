@@ -72,9 +72,9 @@ def calcular_trailing_retroceso(peak: float, current: float, point: float, is_bu
         Retroceso en pips (float)
     """
     if is_buy:
-        return (peak - current) / point
+        return (peak - current) / 0.01
     else:
-        return (current - peak) / point
+        return (current - peak) / 0.1
 
 def calcular_be_price(entry_price: float, direction: str, be_offset_pips: float, point: float, symbol: str) -> float:
     """
