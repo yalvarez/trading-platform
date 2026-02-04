@@ -179,6 +179,8 @@ class TradeManager:
             action = "HIT_TP_SCALING_TRAMO_{t}"
             if tramo >= t and action not in trade.actions_done:                
                 result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
+                log.info(f"[TM][SCALING_OUT] partial close result {result}")
+                
                 if t == 1:
                     trade.first_tramo_close_price = float(current)
                 if t == 2:
