@@ -184,7 +184,8 @@ class TradeManager:
                     await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
                     
                     if t == 1:
-                        trade.first_tramo_close_price = float(current)                    
+                        trade.first_tramo_close_price = float(current)
+                        await self._do_be(account, int(pos.ticket), point, is_buy,override_price=entry - 4.0)                    
                     if t == 2:
                         await self._do_be(account, int(pos.ticket), point, is_buy)                    
                     if t == 3:
