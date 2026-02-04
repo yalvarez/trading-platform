@@ -155,7 +155,7 @@ class TradeManager:
     # --- Scaling out para trades sin TP (ej. TOROFX) ---
     async def _maybe_scaling_out_no_tp(self, account: dict, pos, point: float, is_buy: bool, current: float, trade: ManagedTrade):
         account = self._ensure_account_dict(account)
-        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 30.0)
+        trailing_pips_last_tramo = getattr(self, 'torofx_trailing_last_tramo_pips', 40.0)
         if not hasattr(trade, 'trailing_active_last_tramo'):
             trade.trailing_active_last_tramo = False
         if not hasattr(trade, 'trailing_peak_last_tramo'):
@@ -164,16 +164,17 @@ class TradeManager:
             trade.first_tramo_close_price = None
         if trade.tps:
             return
-        tramo_pips = float(self.config_provider.get('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 30.0)))
+        tramo_pips = float(self.config_provider.get('SCALING_TRAMO_PIPS', getattr(self, 'scaling_tramo_pips', 40.0)))
         percent_per_tramo = float(self.config_provider.get('SCALING_PERCENT_PER_TRAMO', getattr(self, 'scaling_percent_per_tramo', 25)))
         entry = trade.entry_price if trade.entry_price is not None else float(pos.price_open)
         symbol = trade.symbol.upper() if hasattr(trade, 'symbol') else ''
         client = self.mt5._client_for(account)
         if not hasattr(trade, 'actions_done') or trade.actions_done is None:
             trade.actions_done = set()
-        point = 0.1
-        pips_ganados = (current - entry) / point if is_buy else (entry - current) / point
+        pips_ganados = ((current - entry) if is_buy else (entry - current)) / 0.1
         tramos = int(pips_ganados // tramo_pips)
+        log.debug("tramos => {tramos}")
+
         for tramo in range(1, tramos + 1):
             if tramo in trade.actions_done:
                 continue
@@ -289,7 +290,7 @@ class TradeManager:
         torofx_provider_tag_match: str = "TOROFX",  # substring en provider_tag
 
         # --- Scaling out config ---
-        scaling_tramo_pips: float = 30.0,
+        scaling_tramo_pips: float = 40.0,
         scaling_percent_per_tramo: int = 25,
 
         default_sl: float = 60.0,  # SL por defecto en pips
