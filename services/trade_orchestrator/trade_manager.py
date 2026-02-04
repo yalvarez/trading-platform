@@ -177,7 +177,7 @@ class TradeManager:
         # Usar partial close robusto
         for t in [1, 2, 3]:
 
-            action = "HIT_TP_SCALING_TRAMO_{t}"
+            action = f"HIT_TP_SCALING_TRAMO_{t}"
 
             if tramo >= t and action not in trade.actions_done:  
                 try:
