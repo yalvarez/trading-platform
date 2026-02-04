@@ -353,7 +353,7 @@ async def main():
         Obtiene el último ID procesado de señales desde Redis.
         """
         try:
-            redis_url = config.get("REDIS_URL", 'redis://localhost:6379/0')
+            redis_url = config.get("REDIS_URL", 'redis://redis:6379/0')
             redis = aioredis.from_url(redis_url, decode_responses=True)
             last_id = await redis.get(REDIS_OFFSET_KEY)
             await redis.aclose()
