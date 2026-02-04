@@ -195,7 +195,7 @@ class TradeManager:
                 action_done = True
 
         # Tras el tramo 3, aplicar BE con precio del tramo 1 (si existe)
-        if tramo == 2 and tramo not in trade.actions_done:
+        if tramo == 3 and tramo not in trade.actions_done:
             trade.first_tramo_close_price = float(current)
             result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{tramo}")
             await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
