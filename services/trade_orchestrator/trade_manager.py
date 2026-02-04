@@ -176,20 +176,28 @@ class TradeManager:
 
         # Usar partial close robusto
         for t in [1, 2, 3]:
+
             action = "HIT_TP_SCALING_TRAMO_{t}"
-            if tramo >= t and action not in trade.actions_done:                
-                result = await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
-                log.info(f"[TM][SCALING_OUT] partial close result {result}")
-                
-                if t == 1:
-                    trade.first_tramo_close_price = float(current)
-                if t == 2:
-                    await self._do_be(account, int(pos.ticket), point, is_buy)
-                if t == 3:
-                    await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
-                if result is not None:
+
+            if tramo >= t and action not in trade.actions_done:  
+                try:
+                    
+                    await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
+                    
+                    if t == 1:
+                        trade.first_tramo_close_price = float(current)
+                    
+                    if t == 2:
+                        await self._do_be(account, int(pos.ticket), point, is_buy)
+                    
+                    if t == 3:
+                        await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
+
                     trade.actions_done.add(action)
-                    break
+                except:
+                    log.error(f"[TM][ERROR] Error en scaling out tramo {t} para ticket {int(pos.ticket)}")              
+                
+                break
 
         # Activar trailing solo después del cierre del tercer tramo
         if "HIT_TP_SCALING_TRAMO_3" in trade.actions_done and not trade.trailing_active_last_tramo:
