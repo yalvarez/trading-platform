@@ -1600,54 +1600,57 @@ class TradeManager:
             current = float(pos.price_current)
 
 
-        # Fallback a general solo una vez si no hay TPs suficientes
-        if not hasattr(trade, "_reentry_fallback_logged"):
-            trade._reentry_fallback_logged = False
+        # Fallback a gestión general si no hay TPs suficientes
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
         if not tp1 or not tp2:
-            if not trade._reentry_fallback_logged:
-                log.info(f"[REENTRY] No hay suficientes TPs para modalidad reentry en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
-                trade._reentry_fallback_logged = True
+            log.info(f"[REENTRY-DEBUG] Fallback a gestión general: No hay suficientes TPs para reentry en {trade.symbol} ticket={trade.ticket}.")
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
         # Usar un flag en el trade para evitar múltiples ejecuciones
         if not hasattr(trade, "reentry_done"):
             trade.reentry_done = False
 
-        log.info(f"[REENTRY] Evaluando el contenido de [cuenta] => {cuenta}.")
-        # --- Robustecer: asegurar que cuenta sea dict ---
         cuenta_dict = cuenta
         if isinstance(cuenta, str):
-            # Buscar el dict de cuenta por nombre
             cuentas = getattr(self.mt5, 'accounts', [])
             match = next((a for a in cuentas if a.get('name') == cuenta), None)
             if match:
                 cuenta_dict = match
-                log.warning(f"[REENTRY][FIX] 'cuenta' era str, corregido a dict para runner: {cuenta}")
+                log.debug(f"[REENTRY-DEBUG] 'cuenta' era str, corregido a dict para runner: {cuenta}")
             else:
-                log.error(f"[REENTRY][ERROR] No se encontró el dict de cuenta para el nombre: {cuenta}. Abortando apertura de runner.")
+                log.error(f"[REENTRY-DEBUG] Abortando runner: No se encontró el dict de cuenta para el nombre: {cuenta}.")
                 return
 
         # Si TP1 alcanzado y no se ha hecho reentry
         if (is_buy and current >= tp1) or (not is_buy and current <= tp1):
             if not trade.reentry_done:
                 client = self.mt5._client_for(cuenta_dict)
-                log.info(f"[REENTRY] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Cerrando 100% trade original.")
-                # Cerrar 100% del trade original
+                log.info(f"[REENTRY-DEBUG] TP1 alcanzado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Cerrando 100% trade original.")
                 await self._do_partial_close(cuenta_dict, trade.ticket, 100, reason="REENTRY_TP1")
-                # Guardar timestamp de TP1 para ventana de gracia
                 trade.reentry_tp1_time = time.time()
-                # Intentar abrir runner
+                log.info(f"[REENTRY-DEBUG] Intentando abrir runner tras TP1... (ventana de gracia 5s)")
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
                 allow_runner = False
-                if candles and self.runner_momentum_filter(trade.symbol, candles):
-                    allow_runner = True
+                filter_reason = None
+                if candles:
+                    filter_result = self.runner_momentum_filter(trade.symbol, candles)
+                    log.info(f"[REENTRY-DEBUG] Momentum filter resultado: {filter_result}")
+                    if not filter_result:
+                        filter_reason = getattr(self, 'last_momentum_reason', None)
+                        log.info(f"[REENTRY-DEBUG] Motivo rechazo momentum: {filter_reason}")
+                    allow_runner = bool(filter_result)
                 else:
-                    # Si momentum filter falla, permitir solo si estamos en ventana de gracia (5s desde TP1)
-                    if trade.reentry_tp1_time and (time.time() - trade.reentry_tp1_time) <= 3:
+                    filter_reason = "No hay velas/candles para evaluar momentum"
+                    log.info(f"[REENTRY-DEBUG] Motivo rechazo momentum: {filter_reason}")
+                # Si momentum filter falla, permitir solo si estamos en ventana de gracia (5s desde TP1)
+                if not allow_runner and trade.reentry_tp1_time:
+                    segundos_restantes = 5 - (time.time() - trade.reentry_tp1_time)
+                    if segundos_restantes > 0:
                         allow_runner = True
-                        log.info(f"[REENTRY][GRACE] Ventana de gracia activa: permitiendo runner para {trade.symbol} ticket={trade.ticket}")
+                        log.info(f"[REENTRY-DEBUG] Ventana de gracia activa: quedan {segundos_restantes:.2f}s, permitiendo runner para {trade.symbol} ticket={trade.ticket}")
+                    else:
+                        log.info(f"[REENTRY-DEBUG] Ventana de gracia finalizada, runner abortado para {trade.symbol} ticket={trade.ticket}")
                 if allow_runner:
                     original_vol = float(getattr(pos, "volume", 0.01))
                     raw_runner_lot = original_vol * 0.3
@@ -1658,7 +1661,7 @@ class TradeManager:
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
-                    log.info(f"[REENTRY] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
+                    log.info(f"[REENTRY-DEBUG] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
                     await self.mt5.open_runner_trade(
                         cuenta_dict,
                         symbol=trade.symbol,
@@ -1670,10 +1673,11 @@ class TradeManager:
                     )
                     trade.reentry_done = True
                     self._notify_bg(cuenta_dict["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
-                    log.info(f"[REENTRY] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
+                    log.info(f"[REENTRY-DEBUG] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
                 else:
-                    self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: Momentum filter rechazó runner para {trade.symbol} en TP1")
-                    log.info(f"[REENTRY] Momentum filter rechazó runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
+                    motivo_skip = filter_reason or "Momentum filter rechazó runner"
+                    self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: {motivo_skip} para {trade.symbol} en TP1")
+                    log.info(f"[REENTRY-DEBUG] Runner abortado para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Motivo: {motivo_skip}")
                 return
 
         # El runner se gestiona con trailing si está habilitado
