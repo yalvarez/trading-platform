@@ -333,7 +333,7 @@ async def main():
         text = fields.get("text","")
         hint = fields.get("provider_hint","")
         chat_id = int(fields.get("chat_id","0"))
-        log.info(f"[MGMT] Mensaje de gestión recibido: provider_hint={hint} chat_id={chat_id} text={text}")
+        #log.info(f"[MGMT] Mensaje de gestión recibido: provider_hint={hint} chat_id={chat_id} text={text}")
         if hint == "TOROFX":
             result = tradeManager.handle_torofx_management_message(chat_id, text)
             log.info(f"[MGMT] Resultado handle_torofx_management_message: {result}")
@@ -341,7 +341,7 @@ async def main():
             result = tradeManager.handle_hannah_management_message(chat_id, text)
             log.info(f"[MGMT] Resultado handle_hannah_management_message: {result}")
         elif hint == "GOLD_BROTHERS":
-            # aquí puedes enrutar a handle_bg_* si quieres
+            result = tradeManager.handle_hannah_management_message(chat_id, text)
             log.info(f"[MGMT] Mensaje GOLD_BROTHERS recibido pero no manejado explícitamente.")
         else:
             log.warning(f"[MGMT] Mensaje de gestión con provider_hint desconocido: {hint}")
@@ -391,7 +391,7 @@ async def main():
         """
         async for msg_id, fields in xread_loop(r, Streams.MGMT, last_id="$"):
             log.info(f"[MGMT] Mensaje recibido en stream MGMT: id={msg_id} fields={fields}")
-            #await handle_mgmt(fields)
+            await handle_mgmt(fields)
 
     # Lanzar el loop de gestión de trades en background
     asyncio.create_task(tradeManager.run_forever())
