@@ -462,7 +462,7 @@ class MT5Executor:
                 point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
                 if symbol_info and getattr(symbol_info, 'point', None) is not None:
                     point = float(getattr(symbol_info, 'point', point))
-                pips_tolerance = int(self.config_provider.get('TOLERANCE_PIPS', '20')) * 0.1
+                pips_tolerance = float(self.config_provider.get('TOLERANCE_PIPS', '20')) * 0.1
                 # Log de referencia de precio inicial
                 log.info(f"[ENTRY][SYNC] Precio de referencia inicial: {ref_price} (timestamp={ref_time}) para {symbol} ({name})")
                 # Si el precio de referencia ya está en rango, entrar inmediatamente
