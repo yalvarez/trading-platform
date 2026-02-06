@@ -72,36 +72,91 @@ class TradeManager:
             self.last_momentum_reason = "MT5 client no disponible"
             log.error(f"[CANDLES-ERROR] MT5 client no disponible para obtener velas de {symbol}")
             return None
-        if not hasattr(client, 'copy_rates_from_pos'):
-            self.last_momentum_reason = "El cliente MT5 no tiene copy_rates_from_pos"
-            log.error(f"[CANDLES-ERROR] El cliente MT5 no tiene copy_rates_from_pos para {symbol}")
-            return None
-        try:
-            tf_map = {
-                'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30, 'H1': 60, 'H4': 240, 'D1': 1440
-            }
-            tf = tf_map.get(timeframe.upper(), 1)
-            candles = client.copy_rates_from_pos(symbol, tf, 0, count)
-            if not candles:
-                self.last_momentum_reason = f"No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)"
-                log.error(f"[CANDLES-ERROR] No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)")
-                return None
-            result = []
-            for c in candles:
-                result.append({
-                    'time': c.time,
-                    'open': c.open,
-                    'high': c.high,
-                    'low': c.low,
-                    'close': c.close
-                })
-            return result
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            self.last_momentum_reason = f"Error obteniendo velas: {e}"
-            log.error(f"[CANDLES-ERROR] Excepción obteniendo velas para {symbol} tf={timeframe}: {e}\n{tb}")
-            return None
+        tf_map = {
+            'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30, 'H1': 60, 'H4': 240, 'D1': 1440
+        }
+        tf = tf_map.get(timeframe.upper(), 1)
+        # Try copy_rates_from_pos
+        if hasattr(client, 'copy_rates_from_pos'):
+            try:
+                candles = client.copy_rates_from_pos(symbol, tf, 0, count)
+                if candles and len(candles) > 0:
+                    log.debug(f"[CANDLES-DEBUG] copy_rates_from_pos used for {symbol}, got {len(candles)} candles")
+                    result = []
+                    for c in candles:
+                        result.append({
+                            'time': c.time,
+                            'open': c.open,
+                            'high': c.high,
+                            'low': c.low,
+                            'close': c.close
+                        })
+                    return result
+                else:
+                    self.last_momentum_reason = f"No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)"
+                    log.error(f"[CANDLES-ERROR] No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                self.last_momentum_reason = f"Error obteniendo velas: {e}"
+                log.error(f"[CANDLES-ERROR] Excepción obteniendo velas para {symbol} tf={timeframe}: {e}\n{tb}")
+        # Fallback: try copy_rates_from
+        if hasattr(client, 'copy_rates_from'):
+            try:
+                from datetime import datetime
+                now = datetime.now()
+                candles = client.copy_rates_from(symbol, tf, now, count)
+                if candles and len(candles) > 0:
+                    log.debug(f"[CANDLES-DEBUG] copy_rates_from used for {symbol}, got {len(candles)} candles")
+                    result = []
+                    for c in candles:
+                        result.append({
+                            'time': c.time,
+                            'open': c.open,
+                            'high': c.high,
+                            'low': c.low,
+                            'close': c.close
+                        })
+                    return result
+                else:
+                    self.last_momentum_reason = f"No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía) [copy_rates_from]"
+                    log.error(f"[CANDLES-ERROR] No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía) [copy_rates_from]")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                self.last_momentum_reason = f"Error obteniendo velas (copy_rates_from): {e}"
+                log.error(f"[CANDLES-ERROR] Excepción obteniendo velas para {symbol} tf={timeframe} [copy_rates_from]: {e}\n{tb}")
+        # Fallback: try copy_rates_range
+        if hasattr(client, 'copy_rates_range'):
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                start = now - timedelta(minutes=count)
+                candles = client.copy_rates_range(symbol, tf, start, now)
+                if candles and len(candles) > 0:
+                    log.debug(f"[CANDLES-DEBUG] copy_rates_range used for {symbol}, got {len(candles)} candles")
+                    result = []
+                    for c in candles:
+                        result.append({
+                            'time': c.time,
+                            'open': c.open,
+                            'high': c.high,
+                            'low': c.low,
+                            'close': c.close
+                        })
+                    return result
+                else:
+                    self.last_momentum_reason = f"No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía) [copy_rates_range]"
+                    log.error(f"[CANDLES-ERROR] No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía) [copy_rates_range]")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                self.last_momentum_reason = f"Error obteniendo velas (copy_rates_range): {e}"
+                log.error(f"[CANDLES-ERROR] Excepción obteniendo velas para {symbol} tf={timeframe} [copy_rates_range]: {e}\n{tb}")
+        # If all fail
+        self.last_momentum_reason = f"[CANDLES-ERROR] No candle retrieval method succeeded for {symbol}"
+        log.error(self.last_momentum_reason)
+        return None
 
     def runner_momentum_filter(self, symbol: str, candles: list) -> bool:
         """
