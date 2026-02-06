@@ -65,20 +65,27 @@ class TradeManager:
         Por defecto usa timeframe M1 (1 minuto) y 10 velas.
         Devuelve una lista de dicts con open, high, low, close, time.
         """
+        import logging
+        log = logging.getLogger("trade_orchestrator.trade_manager")
         client = self.mt5._client_for(self.mt5.accounts[0]) if self.mt5 and hasattr(self.mt5, 'accounts') and self.mt5.accounts else None
-        if not client or not hasattr(client, 'copy_rates_from_pos'):
+        if not client:
+            self.last_momentum_reason = "MT5 client no disponible"
+            log.error(f"[CANDLES-ERROR] MT5 client no disponible para obtener velas de {symbol}")
+            return None
+        if not hasattr(client, 'copy_rates_from_pos'):
+            self.last_momentum_reason = "El cliente MT5 no tiene copy_rates_from_pos"
+            log.error(f"[CANDLES-ERROR] El cliente MT5 no tiene copy_rates_from_pos para {symbol}")
             return None
         try:
-            # MT5 timeframes: https://www.mql5.com/en/docs/constants/timeframes
             tf_map = {
                 'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30, 'H1': 60, 'H4': 240, 'D1': 1440
             }
             tf = tf_map.get(timeframe.upper(), 1)
-            # copy_rates_from_pos(symbol, timeframe, start_pos, count)
             candles = client.copy_rates_from_pos(symbol, tf, 0, count)
             if not candles:
+                self.last_momentum_reason = f"No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)"
+                log.error(f"[CANDLES-ERROR] No se obtuvieron velas para {symbol} tf={timeframe} (respuesta vacía)")
                 return None
-            # Convertir a lista de dicts
             result = []
             for c in candles:
                 result.append({
@@ -91,7 +98,9 @@ class TradeManager:
             return result
         except Exception as e:
             import traceback
+            tb = traceback.format_exc()
             self.last_momentum_reason = f"Error obteniendo velas: {e}"
+            log.error(f"[CANDLES-ERROR] Excepción obteniendo velas para {symbol} tf={timeframe}: {e}\n{tb}")
             return None
 
     def runner_momentum_filter(self, symbol: str, candles: list) -> bool:
