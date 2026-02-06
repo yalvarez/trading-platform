@@ -267,15 +267,15 @@ class TradeManager:
 
             if tramo >= t and action not in trade.actions_done:  
                 try:
-                    
-                    await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")
-                    
+                                        
                     if t == 1:
                         trade.first_tramo_close_price = float(current)
-                        await self._do_be(account, int(pos.ticket), point, is_buy,override_price=entry - 4.0)                    
+                        await self._do_be(account, int(pos.ticket), point, is_buy, override_price=entry - 4.0)                    
                     if t == 2:
+                        await self._do_partial_close(account, int(pos.ticket), percent=int((percent_per_tramo ) * 2), reason=f"ScalingOut-{t}")                    
                         await self._do_be(account, int(pos.ticket), point, is_buy)                    
                     if t == 3:
+                        await self._do_partial_close(account, int(pos.ticket), percent=int(percent_per_tramo), reason=f"ScalingOut-{t}")                    
                         await self._do_be(account, int(pos.ticket), point, is_buy, override_price=trade.first_tramo_close_price)
 
                     trade.actions_done.add(action)
@@ -1690,12 +1690,11 @@ class TradeManager:
         # Fallback a gestión general si no hay TPs suficientes
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
-        stop_fallback_log = False
-        
+        # Loguear fallback solo una vez por trade
         if not tp1 or not tp2:
-            if not stop_fallback_log:
+            if not hasattr(trade, '_fallback_logged_reentry'):
                 log.info(f"[REENTRY-DEBUG] Fallback a gestión general: No hay suficientes TPs para reentry en {trade.symbol} ticket={trade.ticket}.")
-                stop_fallback_log = True
+                trade._fallback_logged_reentry = True
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
         # Usar un flag en el trade para evitar múltiples ejecuciones
@@ -1829,12 +1828,10 @@ class TradeManager:
         - Luego ejecuta la gestión general.
         """
         # Fallback a general solo una vez si no hay TPs
-        if not hasattr(trade, "_be_pips_fallback_logged"):
-            trade._be_pips_fallback_logged = False
         if not trade.tps or len(trade.tps) == 0:
-            if not trade._be_pips_fallback_logged:
+            if not hasattr(trade, '_fallback_logged_be_pips'):
                 log.info(f"[BE_PIPS] No hay TPs para modalidad be_pips en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
-                trade._be_pips_fallback_logged = True
+                trade._fallback_logged_be_pips = True
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
@@ -1857,12 +1854,10 @@ class TradeManager:
         - Luego ejecuta la gestión general.
         """
         # Fallback a general solo una vez si no hay TPs
-        if not hasattr(trade, "_be_pnl_fallback_logged"):
-            trade._be_pnl_fallback_logged = False
         if not trade.tps or len(trade.tps) == 0:
-            if not trade._be_pnl_fallback_logged:
+            if not hasattr(trade, '_fallback_logged_be_pnl'):
                 log.info(f"[BE_PNL] No hay TPs para modalidad be_pnl en {trade.symbol} ticket={trade.ticket}. Fallback a gestión general.")
-                trade._be_pnl_fallback_logged = True
+                trade._fallback_logged_be_pnl = True
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
         be_pips = cuenta.get("be_pips", 30)
         recorrido = self._get_recorrido_pips(trade, cuenta)
