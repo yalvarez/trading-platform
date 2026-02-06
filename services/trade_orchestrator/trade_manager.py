@@ -59,6 +59,93 @@ class ManagedTrade:
     reentry_tp1_time: Optional[float] = None
 
 class TradeManager:
+    def _get_recent_candles(self, symbol: str, timeframe: str = 'M1', count: int = 10):
+        """
+        Obtiene las últimas 'count' velas para el símbolo dado usando el cliente MT5.
+        Por defecto usa timeframe M1 (1 minuto) y 10 velas.
+        Devuelve una lista de dicts con open, high, low, close, time.
+        """
+        client = self.mt5._client_for(self.mt5.accounts[0]) if self.mt5 and hasattr(self.mt5, 'accounts') and self.mt5.accounts else None
+        if not client or not hasattr(client, 'copy_rates_from_pos'):
+            return None
+        try:
+            # MT5 timeframes: https://www.mql5.com/en/docs/constants/timeframes
+            tf_map = {
+                'M1': 1, 'M5': 5, 'M15': 15, 'M30': 30, 'H1': 60, 'H4': 240, 'D1': 1440
+            }
+            tf = tf_map.get(timeframe.upper(), 1)
+            # copy_rates_from_pos(symbol, timeframe, start_pos, count)
+            candles = client.copy_rates_from_pos(symbol, tf, 0, count)
+            if not candles:
+                return None
+            # Convertir a lista de dicts
+            result = []
+            for c in candles:
+                result.append({
+                    'time': c.time,
+                    'open': c.open,
+                    'high': c.high,
+                    'low': c.low,
+                    'close': c.close
+                })
+            return result
+        except Exception as e:
+            import traceback
+            self.last_momentum_reason = f"Error obteniendo velas: {e}"
+            return None
+
+    def runner_momentum_filter(self, symbol: str, candles: list) -> bool:
+        """
+        Filtro de momentum para decidir si abrir el runner trade.
+        Usa las últimas velas para estimar si hay momentum en la dirección del trade original.
+        Estrategia simple: requiere al menos 7 de las últimas 10 velas cerrando en la dirección del trade (bullish para BUY, bearish para SELL),
+        y que el cierre actual esté cerca del máximo/mínimo local (para evitar reversas inmediatas).
+        Guarda la razón de rechazo en self.last_momentum_reason.
+        """
+        if not candles or len(candles) < 5:
+            self.last_momentum_reason = "No hay suficientes velas para momentum filter"
+            return False
+        # Determinar dirección dominante
+        closes = [c['close'] for c in candles]
+        opens = [c['open'] for c in candles]
+        ups = sum(1 for o, c in zip(opens, closes) if c > o)
+        downs = sum(1 for o, c in zip(opens, closes) if c < o)
+        direction = getattr(self, '_runner_expected_direction', 'BUY')
+        # Sensibilidad media: 6/10 velas en dirección
+        min_ok = max(3, len(candles) // 2 + 1)  # 6 de 10 si hay 10
+        if direction == 'BUY':
+            if ups < min_ok:
+                self.last_momentum_reason = f"Solo {ups} velas alcistas de {len(candles)}"
+                return False
+            # El cierre actual debe estar dentro del 50% superior del rango local
+            last_close = closes[-1]
+            highs = [c['high'] for c in candles]
+            lows = [c['low'] for c in candles]
+            max_high = max(highs)
+            min_low = min(lows)
+            rango = max_high - min_low
+            if rango == 0 or (max_high - last_close) > rango * 0.5:
+                self.last_momentum_reason = "El precio no está en la mitad superior del rango local"
+                return False
+        else:  # SELL
+            if downs < min_ok:
+                self.last_momentum_reason = f"Solo {downs} velas bajistas de {len(candles)}"
+                return False
+            # El cierre actual debe estar dentro del 50% inferior del rango local
+            last_close = closes[-1]
+            highs = [c['high'] for c in candles]
+            lows = [c['low'] for c in candles]
+            max_high = max(highs)
+            min_low = min(lows)
+            rango = max_high - min_low
+            if rango == 0 or (last_close - min_low) > rango * 0.5:
+                self.last_momentum_reason = "El precio no está en la mitad inferior del rango local"
+                return False
+        self.last_momentum_reason = None
+        return True
+
+    # Para que el filtro sepa la dirección esperada, setear antes de llamar:
+    # self._runner_expected_direction = trade.direction
 
     def _ensure_account_dict(self, account):
         """
@@ -1634,6 +1721,8 @@ class TradeManager:
                 await self._do_partial_close(cuenta_dict, trade.ticket, 100, reason="REENTRY_TP1")
                 trade.reentry_tp1_time = time.time()
                 log.info(f"[REENTRY-DEBUG] Intentando abrir runner tras TP1... (ventana de gracia 5s)")
+                # Setear dirección esperada para el filtro de momentum
+                self._runner_expected_direction = trade.direction
                 candles = self._get_recent_candles(trade.symbol) if hasattr(self, '_get_recent_candles') else None
                 allow_runner = False
                 filter_reason = None
@@ -1665,19 +1754,31 @@ class TradeManager:
                     entry_price = float(getattr(pos, "price_open", current))
                     sl = entry_price
                     tp = tp2
+                    if runner_lot <= 0:
+                        log.error(f"[REENTRY-ERROR] Volumen runner inválido: {runner_lot} | original_vol={original_vol} | step={step} | vmin={vmin} | symbol={trade.symbol} ticket={trade.ticket}")
+                        self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: Volumen runner inválido {runner_lot} | No se abre runner para {trade.symbol}")
+                        return
                     log.info(f"[REENTRY-DEBUG] Abriendo runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: lot={runner_lot} SL={sl} TP={tp}")
-                    await self.mt5.open_runner_trade(
-                        cuenta_dict,
-                        symbol=trade.symbol,
-                        direction=trade.direction,
-                        volume=runner_lot,
-                        sl=sl,
-                        tp=tp,
-                        provider_tag=f"{trade.provider_tag}_REENTRY"
-                    )
-                    trade.reentry_done = True
-                    self._notify_bg(cuenta_dict["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
-                    log.info(f"[REENTRY-DEBUG] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
+                    try:
+                        res = await self.mt5.open_runner_trade(
+                            cuenta_dict,
+                            symbol=trade.symbol,
+                            direction=trade.direction,
+                            volume=runner_lot,
+                            sl=sl,
+                            tp=tp,
+                            provider_tag=f"{trade.provider_tag}_REENTRY"
+                        )
+                        if res and getattr(res, 'retcode', None) in (0, 10009):  # 0=TRADE_RETCODE_DONE, 10009=TRADE_RETCODE_DONE
+                            log.info(f"[REENTRY-DEBUG] Runner abierto correctamente para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}.")
+                            trade.reentry_done = True
+                            self._notify_bg(cuenta_dict["name"], f"🔁 REENTRY: Cerrado 100% en TP1 y abierto runner {runner_lot} lotes | SL={sl} TP={tp}")
+                        else:
+                            log.error(f"[REENTRY-ERROR] Fallo al abrir runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}. Respuesta: {res}")
+                            self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: Fallo al abrir runner para {trade.symbol} | Respuesta: {res}")
+                    except Exception as e:
+                        log.exception(f"[REENTRY-ERROR] Excepción al abrir runner para {trade.symbol} ticket={trade.ticket} en cuenta {cuenta_dict['name']}: {e}")
+                        self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: Excepción al abrir runner para {trade.symbol}: {e}")
                 else:
                     motivo_skip = filter_reason or "Momentum filter rechazó runner"
                     self._notify_bg(cuenta_dict["name"], f"⛔ REENTRY: {motivo_skip} para {trade.symbol} en TP1")

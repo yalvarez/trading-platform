@@ -87,19 +87,19 @@ class MT5Client:
                 "type_filling": type_filling,
             }
             res = self.mt5.order_send(req)
-            log.critical(f"[MT5Client][CRITICAL] partial_close req: {req}")
-            log.critical(f"[MT5Client][CRITICAL] partial_close res: {res}")
+            log.debug(f"[MT5Client][PartialClose] req: {req}")
+            log.debug(f"[MT5Client][PartialClose] res: {res}")
             # Consultar el estado de la posición después del intento
             pos_list = self.mt5.positions_get(ticket=ticket)
-            log.critical(f"[MT5Client][CRITICAL] positions_get after partial_close: {pos_list}")
+            log.debug(f"[MT5Client][PartialClose] positions_get after partial_close: {pos_list}")
             if not res:
-                log.critical(f"[MT5Client][CRITICAL] No se recibió respuesta de order_send para ticket {ticket}")
+                log.error(f"[MT5Client] No se recibió respuesta de order_send para ticket {ticket}")
                 continue
             retcode = getattr(res, 'retcode', None)
             if retcode == 10009:
                 return True
             else:
-                log.critical(f"[MT5Client][CRITICAL] Retcode inesperado: {retcode}, mensaje: {getattr(res, 'comment', '')}")
+                log.error(f"[MT5Client] Retcode inesperado: {retcode}, mensaje: {getattr(res, 'comment', '')}")
         return False
 
     def __init__(self, host: str, port: int):

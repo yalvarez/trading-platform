@@ -35,7 +35,7 @@ class MT5Executor:
         # --- Validar y ajustar SL si está demasiado cerca del precio actual ---
         symbol_info = client.symbol_info(symbol)
         available_attrs = dir(symbol_info) if symbol_info else []
-        log.info(f"[RUNNER][DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
+        log.debug(f"[RUNNER] SymbolInfo attrs for {symbol}: {available_attrs}")
         min_stop_raw = None
         # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None, and never raise
         fill_mode = None
@@ -47,19 +47,19 @@ class MT5Executor:
         else:
             min_stop_raw = 0.0
         min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-        log.info(f"[RUNNER][DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
+        log.debug(f"[RUNNER] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
         if min_stop > 0 and abs(price - forced_sl) < min_stop:
             if direction.upper() == "BUY":
                 adjusted_sl = price - min_stop
             else:
                 adjusted_sl = price + min_stop
-            log.warning(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
+            log.info(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
             self._notify_bg(name, f"⚠️ SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
             forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
 
         # --- REFORZAR: No abrir runner si SL es None o 0.0 ---
         if forced_sl is None or forced_sl == 0.0:
-            log.error(f"[RUNNER][ERROR] Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol} en cuenta {name}. No se abrirá la operación.")
+            log.error(f"[RUNNER] Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol} en cuenta {name}. No se abrirá la operación.")
             self._notify_bg(name, f"❌ Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol}. No se abrirá la operación.")
             return None
         # --- Preparar y loguear la orden ---
@@ -76,7 +76,7 @@ class MT5Executor:
             "comment": self._safe_comment(f"{provider_tag or ''}-REENTRY"),
             "type_time": 0,
         }
-        log.info(f"[RUNNER][ORDER_PREP] account={account} | req={req}")
+        log.debug(f"[RUNNER][ORDER_PREP] account={account} | req={req}")
         res = await self._best_filling_order_send(client, symbol, req, name)
         if res and getattr(res, "retcode", None) in (10009, 10008):
             self._notify_bg(name, f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {forced_sl} | TP: {tp}")
@@ -188,11 +188,11 @@ class MT5Executor:
             "comment": self._safe_comment(comment_tag),
         }
         res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
-        log.info(f"[ORDER_SEND][DEBUG][SL-UPDATE] Respuesta completa de order_send: {repr(res)}")
+        log.debug(f"[ORDER_SEND][SL-UPDATE] Respuesta completa de order_send: {repr(res)}")
         ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))
         pos_list_after = client.positions_get(ticket=int(ticket))
         sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
-        log.info(f"[SL-UPDATE] SL después del intento: {sl_after}")
+        log.debug(f"[SL-UPDATE] SL después del intento: {sl_after}")
         if ok:
             self._notify_bg(account["name"], f"✅ SL actualizado | Ticket: {int(ticket)} | SL: {new_sl:.5f}")
             return True
@@ -240,18 +240,18 @@ class MT5Executor:
         off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
         from .trade_utils import calcular_be_price
         be_sl = calcular_be_price(entry, "BUY" if is_buy else "SELL", off_pips, point, symbol)
-        logging.info(f"[BE-DEBUG] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
+        logging.debug(f"[BE] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
         # Validar que el nuevo SL cumple con el mínimo stop level
         price_current = float(getattr(pos, "price_current", 0.0))
         if is_buy:
             min_sl = price_current - stop_level
             if be_sl > min_sl:
-                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}. Ajustando SL a {min_sl}")
+                logging.info(f"[BE] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}. Ajustando SL a {min_sl}")
                 be_sl = round(min_sl, 2 if symbol.upper().startswith("XAU") else 5)
         else:
             max_sl = price_current + stop_level
             if be_sl < max_sl:
-                logging.warning(f"[BE-DEBUG] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
+                logging.info(f"[BE] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
                 be_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
 
         req = {
