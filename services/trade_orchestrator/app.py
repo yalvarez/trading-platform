@@ -120,6 +120,7 @@ async def main():
         entry_wait_seconds=int(s["entry_wait_seconds"]),
         entry_poll_ms=int(s["entry_poll_ms"]),
         entry_buffer_points=float(s["entry_buffer_points"]),
+        config_provider=config,
     )
 
     tradeManager = TradeManager(tradeExecutor, notifier=(notifier_adapter if notifier_adapter is not None else None), config_provider=config)  # attach notifier and config_provider
