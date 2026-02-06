@@ -1603,8 +1603,12 @@ class TradeManager:
         # Fallback a gestión general si no hay TPs suficientes
         tp1 = trade.tps[0] if trade.tps else None
         tp2 = trade.tps[1] if len(trade.tps) > 1 else None
+        stop_fallback_log = False
+        
         if not tp1 or not tp2:
-            log.info(f"[REENTRY-DEBUG] Fallback a gestión general: No hay suficientes TPs para reentry en {trade.symbol} ticket={trade.ticket}.")
+            if not stop_fallback_log:
+                log.info(f"[REENTRY-DEBUG] Fallback a gestión general: No hay suficientes TPs para reentry en {trade.symbol} ticket={trade.ticket}.")
+                stop_fallback_log = True
             return await self.gestionar_trade_general(trade, cuenta, pos=pos, point=point, is_buy=is_buy, current=current)
 
         # Usar un flag en el trade para evitar múltiples ejecuciones
