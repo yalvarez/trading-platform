@@ -391,7 +391,7 @@ async def main():
         """
         async for msg_id, fields in xread_loop(r, Streams.MGMT, last_id="$"):
             log.info(f"[MGMT] Mensaje recibido en stream MGMT: id={msg_id} fields={fields}")
-            await handle_mgmt(fields)
+            #await handle_mgmt(fields)
 
     # Lanzar el loop de gestión de trades en background
     asyncio.create_task(tradeManager.run_forever())
