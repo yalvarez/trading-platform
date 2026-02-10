@@ -750,6 +750,24 @@ class TradeManager:
                     if t.initial_volume is None:
                         t.initial_volume = float(pos.volume)
 
+                       # --- Universal 250 pips/$25 profit auto-close rule ---
+                    # --- Universal 250 pips/$25 profit auto-close rule ---
+                    #profit_pips = (current - t.entry_price) / point if is_buy else (t.entry_price - current) / point
+                    price_diff = current - t.entry_price if is_buy else t.entry_price - current
+                    symbol_upper = t.symbol.upper()
+                    # For XAUUSD, 1 pip = 0.10, so 250 pips = $25
+                    if (symbol_upper == "XAUUSD" and price_diff >= 25) or (symbol_upper != "XAUUSD" and price_diff >= 25):
+                        # Only close if not already being closed
+                        log.info(f"[TM][UNIVERSAL-TP] Closing trade at +250 pips | account={account['name']} ticket={ticket} symbol={t.symbol} price_diff={price_diff:.1f} entry={t.entry_price} current={current}")
+                        await self._do_partial_close(account, int(pos.ticket), percent=100, reason="UniversalTP250Pips")
+                        await self.notify_trade_event(
+                            'close',
+                            account_name=account["name"],
+                            ticket=int(pos.ticket),
+                            symbol=t.symbol,
+                            reason="UniversalTP250Pips"
+                        )
+                        continue
                     # 1) Gestión de Take Profits
                     await self._maybe_take_profits(account, pos, point, is_buy, current, t)
 
