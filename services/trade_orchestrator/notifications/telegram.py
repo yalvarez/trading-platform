@@ -19,45 +19,64 @@ class TelegramNotifierAdapter:
     async def notify(self, target: str | int, message: str):
         """
         target: puede ser el nombre de la cuenta (str) o el chat_id (int o str numérico)
-        Si es un nombre de cuenta, busca el chat_id en ACCOUNTS_JSON.
+        Si es un nombre de cuenta, busca el chat_id usando Settings.accounts().
         Si es un chat_id numérico, lo usa directamente.
         """
-        import os, json
+        from services.common.config import Settings
         chat_id = None
         account_name = None
-        # Si es numérico, usar como chat_id
-        # if isinstance(target, int) or (isinstance(target, str) and target.lstrip('-').isdigit()):
-        #     chat_id = int(target)
-        # else:
-        #     # Buscar chat_id por nombre de cuenta
-        #     account_name = target
-        #     accounts_env = os.getenv('ACCOUNTS_JSON', '[]')
-        #     try:
-        #         accounts_list = json.loads(accounts_env)
-        #     except Exception:
-        #         accounts_list = []
-        #     for acct in accounts_list:
-        #         if acct.get('name') == account_name:
-        #             chat_id = acct.get('chat_id')
-        #             break
-        # if not chat_id:
-        #     self.log.error(f"[NOTIFY][ERROR] No se encontró chat_id para '{target}'")
-        #     return
-        # if not self.notifier:
-        #     self.log.info(f"[NOTIFY][{account_name or chat_id}] {message}")
-        #     return
-        # try:
-        #     if hasattr(self.notifier, 'notify') and callable(getattr(self.notifier, 'notify')):
-        #         await self.notifier.notify(str(chat_id), message)
-        #     else:
-        #         await self.notifier(str(chat_id), message)
-        # except Exception as e:
-        #     self.log.error(f"[NOTIFY][ERROR] {account_name or chat_id}: {e}")
+        if isinstance(target, int) or (isinstance(target, str) and target.lstrip('-').isdigit()):
+            chat_id = int(target)
+        else:
+            account_name = target
+            try:
+                accounts_list = Settings.accounts()
+            except Exception:
+                accounts_list = []
+            for acct in accounts_list:
+                if acct.get('name') == account_name:
+                    chat_id = acct.get('chat_id')
+                    break
+        if not chat_id:
+            self.log.error(f"[NOTIFY][ERROR] No se encontró chat_id para '{target}'")
+            return
+        if not self.notifier:
+            self.log.info(f"[NOTIFY][{account_name or chat_id}] {message}")
+            return
+        try:
+            if hasattr(self.notifier, 'notify') and callable(getattr(self.notifier, 'notify')):
+                await self.notifier.notify(str(chat_id), message)
+            else:
+                await self.notifier(str(chat_id), message)
+        except Exception as e:
+            self.log.error(f"[NOTIFY][ERROR] {account_name or chat_id}: {e}")
 
     async def notify_trade_event(self, event: str, **kwargs: Any):
+        from services.common.config import Settings
         account_name = kwargs.get('account_name')
         msg = self.format_event_message(event, **kwargs)
-        await self.notify(account_name, msg)
+        chat_id = None
+        try:
+            accounts_list = Settings.accounts()
+        except Exception:
+            accounts_list = []
+        for acct in accounts_list:
+            if acct.get('name') == account_name:
+                chat_id = acct.get('chat_id')
+                break
+        if not chat_id:
+            self.log.error(f"[NOTIFY][ERROR] No se encontró chat_id para '{account_name}' (evento: {event})")
+            return
+        if not self.notifier:
+            self.log.info(f"[NOTIFY][{account_name}] {msg}")
+            return
+        try:
+            if hasattr(self.notifier, 'notify') and callable(getattr(self.notifier, 'notify')):
+                await self.notifier.notify(str(chat_id), msg)
+            else:
+                await self.notifier(str(chat_id), msg)
+        except Exception as e:
+            self.log.error(f"[NOTIFY][ERROR] {account_name}: {e}")
 
     def format_event_message(self, event: str, **kwargs: Any) -> str:
         if event == 'opened':
