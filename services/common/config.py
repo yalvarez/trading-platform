@@ -8,6 +8,10 @@ CHANNELS_CONFIG_JSON = config.get("CHANNELS_CONFIG_JSON", "{}")
 
 class Settings:
     @staticmethod
+    def sl_max_pips():
+        return float(config.get("SL_MAX_PIPS", 120.0))
+
+    @staticmethod
     def load():
         return {
             "redis_url": config.get("REDIS_URL", "redis://redis:6379/0"),
@@ -40,32 +44,41 @@ class Settings:
     @staticmethod
     def accounts():
         # Load from DB if available, else fallback to env
-        import psycopg2
         db_url = config.db_url
-        if db_url:
-            conn = psycopg2.connect(db_url)
-            from services.common.config_db_loader import load_accounts
-            return load_accounts(conn)
+        try:
+            import psycopg2
+            if db_url:
+                conn = psycopg2.connect(db_url)
+                from services.common.config_db_loader import load_accounts
+                return load_accounts(conn)
+        except ImportError:
+            pass
         return json.loads(config.get("ACCOUNTS_JSON", "[]"))
 
     @staticmethod
     def signal_providers():
-        import psycopg2
         db_url = config.db_url
-        if db_url:
-            conn = psycopg2.connect(db_url)
-            from services.common.config_db_loader import load_signal_providers
-            return load_signal_providers(conn)
+        try:
+            import psycopg2
+            if db_url:
+                conn = psycopg2.connect(db_url)
+                from services.common.config_db_loader import load_signal_providers
+                return load_signal_providers(conn)
+        except ImportError:
+            pass
         # fallback: parse from CHANNELS_CONFIG_JSON
         return []
 
     @staticmethod
     def channel_providers():
-        import psycopg2
         db_url = config.db_url
-        if db_url:
-            conn = psycopg2.connect(db_url)
-            from services.common.config_db_loader import load_channel_providers
-            return load_channel_providers(conn)
+        try:
+            import psycopg2
+            if db_url:
+                conn = psycopg2.connect(db_url)
+                from services.common.config_db_loader import load_channel_providers
+                return load_channel_providers(conn)
+        except ImportError:
+            pass
         # fallback: parse from CHANNELS_CONFIG_JSON
         return {}

@@ -1,3 +1,22 @@
+def calcular_sl_respetando_maximo(symbol: str, price: float, direction: str, sl_pips: float, point: float, sl_max_pips: float) -> float:
+    """
+    Calcula el precio de SL respetando el máximo de pips permitido.
+    - symbol: símbolo (ej: XAUUSD)
+    - price: precio de entrada o actual
+    - direction: 'BUY' o 'SELL'
+    - sl_pips: distancia deseada en pips
+    - point: valor de un punto
+    - sl_max_pips: máximo permitido en pips
+    Devuelve el precio de SL ajustado si es necesario.
+    """
+    from services.common.config import Settings
+    max_pips = min(sl_pips, sl_max_pips)
+    sl_offset = pips_to_price(symbol, max_pips, point)
+    if direction.upper() == "BUY":
+        sl = price - sl_offset
+    else:
+        sl = price + sl_offset
+    return round(sl, 2 if symbol.upper().startswith("XAU") else 5)
 """
 trade_utils.py - Funciones auxiliares y comunes para la gestión de trades.
 

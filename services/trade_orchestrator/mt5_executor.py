@@ -31,7 +31,10 @@ class MT5Executor:
         name = account.get('name')
         order_type = 0 if direction.upper() == 'BUY' else 1
         price = float(client.tick_price(symbol, direction))
-        forced_sl = float(sl)
+        from services.common.config import Settings
+        from .trade_utils import calcular_sl_respetando_maximo
+        point = float(getattr(client.symbol_info(symbol), "point", 0.0))
+        forced_sl = calcular_sl_respetando_maximo(symbol, price, direction, float(sl), point, Settings.sl_max_pips())
         # --- Validar y ajustar SL si está demasiado cerca del precio actual ---
         symbol_info = client.symbol_info(symbol)
         available_attrs = dir(symbol_info) if symbol_info else []
@@ -146,7 +149,7 @@ class MT5Executor:
         except Exception as e:
             log.error(f"[NOTIFY][ERROR] {account_name}: {e}")
 
-    async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None) -> bool:
+    async def modify_sl(self, account: dict, ticket: int, new_sl: float, reason: str = "", provider_tag: str = None, reintentos: int = 5) -> bool:
         """
         Modifica el SL de la posición indicada por ticket a new_sl.
         Loguea el SL actual antes y después, el SL propuesto y el stop_level del símbolo.
@@ -167,6 +170,12 @@ class MT5Executor:
         sl_actual = float(getattr(pos, "sl", 0.0))
         stop_level = float(getattr(info, "stops_level", 0.0)) * point
         price_current = float(getattr(pos, "price_current", 0.0))
+        from services.common.config import Settings
+        from .trade_utils import calcular_sl_respetando_maximo
+        sl_max_pips = Settings.sl_max_pips()
+        # Centralizar el cálculo del SL respetando el máximo
+        sl_pips = abs((price_current - new_sl) / (0.1 if symbol.upper().startswith("XAU") else point))
+        new_sl = calcular_sl_respetando_maximo(symbol, price_current, "BUY" if is_buy else "SELL", sl_pips, point, sl_max_pips)
         # Validar que el nuevo SL cumple con el mínimo stop level
         if is_buy:
             min_sl = price_current - stop_level
@@ -187,18 +196,27 @@ class MT5Executor:
             "tp": float(getattr(pos, "tp", 0.0)),
             "comment": self._safe_comment(comment_tag),
         }
-        res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
-        log.debug(f"[ORDER_SEND][SL-UPDATE] Respuesta completa de order_send: {repr(res)}")
-        ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))
-        pos_list_after = client.positions_get(ticket=int(ticket))
-        sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
-        log.debug(f"[SL-UPDATE] SL después del intento: {sl_after}")
-        if ok:
-            self._notify_bg(account["name"], f"✅ SL actualizado | Ticket: {int(ticket)} | SL: {new_sl:.5f}")
-            return True
-        else:
-            self._notify_bg(account["name"], f"❌ SL update falló | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}")
-            return False
+        for intento in range(reintentos):
+            res = await self._best_filling_order_send(client, symbol, req, account.get('name'))
+            log.debug(f"[ORDER_SEND][SL-UPDATE][{intento+1}/{reintentos}] Respuesta completa de order_send: {repr(res)}")
+            ok = bool(res and getattr(res, "retcode", None) in (10009, 10008))
+            pos_list_after = client.positions_get(ticket=int(ticket))
+            sl_after = float(getattr(pos_list_after[0], "sl", 0.0)) if pos_list_after else None
+            log.debug(f"[SL-UPDATE] SL después del intento: {sl_after}")
+            if ok:
+                self._notify_bg(account["name"], f"✅ SL actualizado | Ticket: {int(ticket)} | SL: {new_sl:.5f}")
+                return True
+            # Si falla, intentar con un SL un poco más alejado pero nunca mayor a sl_max_pips
+            if is_buy:
+                new_sl -= pips_to_price(symbol, 1, point)  # Alejar 1 pip
+                sl_pips = abs((price_current - new_sl) / (0.1 if symbol.upper().startswith("XAU") else point))
+                new_sl = calcular_sl_respetando_maximo(symbol, price_current, "BUY", sl_pips, point, sl_max_pips)
+            else:
+                new_sl += pips_to_price(symbol, 1, point)
+                sl_pips = abs((price_current - new_sl) / (0.1 if symbol.upper().startswith("XAU") else point))
+                new_sl = calcular_sl_respetando_maximo(symbol, price_current, "SELL", sl_pips, point, sl_max_pips)
+        self._notify_bg(account["name"], f"❌ SL update falló tras {reintentos} intentos | Ticket: {int(ticket)} | retcode={getattr(res,'retcode',None)} {getattr(res,'comment',None)}")
+        return False
     def _safe_comment(self, tag: str) -> str:
         """
         Wrapper para safe_comment centralizado.
