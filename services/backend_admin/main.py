@@ -2,17 +2,26 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import psycopg2
 import os
+import logging
+import secrets
 from typing import List, Optional
 from models import Setting, Account, Channel, Provider, AccountChannel, ChannelProvider
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("backend_admin")
 
 app = FastAPI()
 security = HTTPBasic()
 
-# Simple auth (replace with env vars or a better method in production)
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
+# Credenciales admin - OBLIGATORIAS via env vars, sin fallback inseguro
+ADMIN_USER = os.getenv("ADMIN_USER", "")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "")
+if not ADMIN_USER or not ADMIN_PASS:
+    log.critical("[ADMIN] ADMIN_USER y ADMIN_PASS deben configurarse via variables de entorno. Servicio iniciado sin autenticacion valida.")
 
-DB_URL = os.getenv("CONFIG_DB_URL", "postgresql://user:password@db:5432/config")
+DB_URL = os.getenv("CONFIG_DB_URL", "")
+if not DB_URL:
+    raise RuntimeError("CONFIG_DB_URL es requerida. Configurar en .env")
 
 def get_db():
     conn = psycopg2.connect(DB_URL)
@@ -21,9 +30,15 @@ def get_db():
     finally:
         conn.close()
 
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
+    user_ok = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode()) if ADMIN_USER else False
+    pass_ok = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode()) if ADMIN_PASS else False
+    if not user_ok or not pass_ok:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 # --- SETTINGS PUT/DELETE ---
 @app.put("/settings/{key}", dependencies=[Depends(check_auth)])
@@ -102,9 +117,15 @@ def delete_channel_provider(cp: ChannelProvider, db=Depends(get_db)):
         db.commit()
     return {"ok": True}
 
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+def check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
+    user_ok = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode()) if ADMIN_USER else False
+    pass_ok = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode()) if ADMIN_PASS else False
+    if not user_ok or not pass_ok:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 # --- ENDPOINTS ---
 @app.get("/settings", dependencies=[Depends(check_auth)])

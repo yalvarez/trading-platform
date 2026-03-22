@@ -12,6 +12,7 @@ from parsers_goldbro_scalp import GoldBroScalpParser
 from parsers_torofx import ToroFxParser
 from parsers_daily_signal import DailySignalParser
 from parsers_hannah import HannahParser
+from parsers_tradepulse import TradePulseParser
 
 
 # Add container label to log format for Grafana filtering
@@ -35,6 +36,7 @@ class SignalRouter:
             'torofx': ToroFxParser(),
             'daily_signal': DailySignalParser(),
             'limitless': LimitlessParser(),
+            'tradepulse': TradePulseParser(),
         }
         self.channels_config = channels_config or {}
         self.deduplicator = SignalDeduplicator(redis_client, ttl_seconds=dedup_ttl)
@@ -46,8 +48,7 @@ class SignalRouter:
         # --- 1. LIMITLESS si tiene 'Risk Price' ---
         norm_lower = norm.lower()
         if 'risk price' in norm_lower:
-            from parsers_limitless import LimitlessParser
-            parser = LimitlessParser()
+            parser = self.parser_map['limitless']
             try:
                 result = parser.parse(norm)
                 if result:
@@ -65,8 +66,7 @@ class SignalRouter:
             return None
         # --- 2. TOROFX si tiene 'Target: open' ---
         if 'target: open' in norm_lower:
-            from parsers_torofx import ToroFxParser
-            parser = ToroFxParser()
+            parser = self.parser_map['torofx']
             try:
                 result = parser.parse(norm)
                 if result:
@@ -83,8 +83,7 @@ class SignalRouter:
                 log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
             return None
         # --- 3. HANNAH si hace match (prioridad absoluta sobre cualquier otro parser) ---
-        from parsers_hannah import HannahParser
-        hannah_parser = HannahParser()
+        hannah_parser = self.parser_map['hannah']
         try:
             result = hannah_parser.parse(norm)
             if result:
@@ -171,6 +170,9 @@ class SignalRouter:
 
 async def main():
     import json
+    from services.common.env_validator import validate_router_parser
+    validate_router_parser()
+
     from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s["redis_url"])
@@ -194,7 +196,7 @@ async def main():
 
                 # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
                 if looks_like_torofx_management(text) or ("stop loss" in text.lower() and "target: open" in text.lower()):
-                    sig = ToroFxParser().parse(text)
+                    sig = router.parser_map['torofx'].parse(text)
                     if sig:
                         trace_id = uuid.uuid4().hex[:8]
                         sig_dict = {}

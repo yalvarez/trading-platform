@@ -18,9 +18,7 @@ else:
     _svc_c = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'services'))
     if os.path.isdir(_svc_c):
         sys.path.insert(0, _svc_c)
-import importlib.util
-
-from services.common.telegram_notifier import RemoteTelegramNotifier, NotificationConfig
+from services.common.telegram_notifier import RemoteTelegramNotifier
 from .notifications.telegram import TelegramNotifierAdapter
 from prometheus_client import start_http_server
 
@@ -78,6 +76,9 @@ async def main():
     - Inicializa settings, métricas, Redis, cuentas y notificador.
     - Lanza los loops de señales y gestión de trades.
     """
+    from services.common.env_validator import validate_trade_orchestrator
+    validate_trade_orchestrator()
+
     from services.common.config import Settings
     config = ConfigProvider()
     s = Settings.load()
@@ -157,7 +158,7 @@ async def main():
                 client = tradeExecutor._client_for(account)
                 price = client.tick_price(symbol, direction)
                 # Obtener default_sl_pips desde config
-                default_sl_pips = float(config.get("    ", 300)) if symbol.upper().startswith("XAU") else float(config.get("DEFAULT_SL_PIPS", 100))
+                default_sl_pips = float(config.get("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(config.get("DEFAULT_SL_PIPS", 100))
                 point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
                 from .trade_utils import calcular_sl_default
                 forced_sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
@@ -260,15 +261,9 @@ async def main():
         if not filtered_accounts:
             log.info(f"[SKIP] Ninguna cuenta permite el canal {source_channel}. Signal ignorada.")
             return
-        # Ejecutar solo para las cuentas filtradas
-        res = await MT5Executor(filtered_accounts,
-            magic=tradeExecutor.magic,
-            notifier=tradeExecutor.notifier,
-            trading_windows=tradeExecutor.windows,
-            entry_wait_seconds=tradeExecutor.entry_wait_seconds,
-            entry_poll_ms=tradeExecutor.entry_poll_ms,
-            entry_buffer_points=tradeExecutor.entry_buffer_points
-        ).open_complete_trade(
+        # Ejecutar solo para las cuentas filtradas (reutiliza el singleton tradeExecutor)
+        res = await tradeExecutor.open_for_accounts(
+            filtered_accounts,
             provider_tag=provider_tag,
             symbol=symbol,
             direction=direction,

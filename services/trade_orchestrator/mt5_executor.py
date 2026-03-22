@@ -11,7 +11,6 @@ import logging
 
 log = logging.getLogger("trade_orchestrator.mt5_executor")
 
-from .mt5_client import MT5Client
 from .trade_utils import safe_comment, pips_to_price, calcular_lotaje
 from .notifications.telegram import TelegramNotifierAdapter
 
@@ -224,13 +223,13 @@ class MT5Executor:
         return safe_comment(tag, getattr(self, 'comment_prefix', 'TM'))
 
     def _client_for(self, account):
-        # Implementación básica: asume que la cuenta tiene un campo 'client' o que se puede construir aquí
-        # Ajusta según tu arquitectura real
-        if 'client' in account:
-            return account['client']
-        # Si tienes un pool de clientes, puedes buscarlo aquí
-        # Por defecto, crea uno nuevo (ajusta host/port según tu sistema)
-        return MT5Client(account.get('host', 'localhost'), account.get('port', 18812))
+        """
+        Devuelve el cliente MT5 para la cuenta dada.
+        Usa el pool global — un solo cliente por (host, port) reutilizado en toda
+        la vida del proceso. Elimina los 50-100ms de MT5.initialize() por llamada.
+        """
+        from .mt5_pool import MT5ClientPool
+        return MT5ClientPool.get_for_account(account)
 
     async def _apply_be(self, account: dict, ticket: int, be_offset_pips: Optional[float] = None, reason: str = "") -> bool:
         """
@@ -401,18 +400,31 @@ class MT5Executor:
         self.entry_poll_ms = entry_poll_ms
         self.config_provider = config_provider
 
-    async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps):
+    async def open_for_accounts(self, filtered_accounts: list[dict], *, provider_tag, symbol, direction, entry_range, sl, tps) -> "MT5OpenResult":
+        """
+        Ejecuta open_complete_trade usando un subconjunto de cuentas (filtered_accounts)
+        en lugar de self.accounts. Evita crear una nueva instancia de MT5Executor por señal.
+        """
+        return await self.open_complete_trade(
+            provider_tag, symbol, direction, entry_range, sl, tps,
+            _accounts=filtered_accounts,
+        )
+
+    async def open_complete_trade(self, provider_tag, symbol, direction, entry_range, sl, tps, *, _accounts=None):
         tickets = {}
         errors = {}
 
+        # _accounts permite que open_for_accounts pase un subset sin crear nueva instancia
+        source_accounts = _accounts if _accounts is not None else self.accounts
+
         # Tomar snapshot de precio al inicio para referencia
-        ref_client = self._client_for(self.accounts[0])
+        ref_client = self._client_for(source_accounts[0])
         ref_price = ref_client.tick_price(symbol, direction)
         ref_time = time.time()
 
         # Construir accounts con direction correcto para cada cuenta activa
         accounts = []
-        for acct in self.accounts:
+        for acct in source_accounts:
             if acct.get("active"):
                 account = dict(acct)  # copia para no mutar el original
                 account["symbol"] = symbol
@@ -463,7 +475,14 @@ class MT5Executor:
                     log.warning(f"[SYMBOL] No symbol_info for {symbol} ({name}) after select. Symbol may not be available in MT5.")
                     self._notify_bg(name, f"⚠️ No symbol_info para {symbol} ({name}) después de select. El símbolo puede no estar disponible en MT5.")
 
-                # --- Lógica de entrada mejorada: sincronización y latencia ---
+                # --- Lógica de entrada optimizada para activos volátiles (XAUUSD) ---
+                # Para oro: ventana máxima 5s, polling cada 100ms.
+                # Para otros: usa entry_wait_seconds configurado (default 90s), polling entry_poll_ms.
+                # Razonamiento: el oro puede moverse 50 pips en segundos — esperar 60s es contraproducente.
+                is_gold = symbol.upper().startswith("XAU")
+                entry_wait_max = 5.0 if is_gold else float(self.entry_wait_seconds)
+                entry_poll = 0.1 if is_gold else (self.entry_poll_ms / 1000.0)
+
                 entry_lo = None
                 entry_hi = None
                 if entry_range and isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
@@ -471,79 +490,82 @@ class MT5Executor:
                     entry_hi = float(max(entry_range))
                 elif entry_range and isinstance(entry_range, (float, int)):
                     entry_lo = entry_hi = float(entry_range)
-                else:
-                    log.warning(f"[ENTRY] No entry_range provided for {symbol} ({name}), skipping price wait.")
-                    self._notify_bg(name, f"⚠️ No entry_range para {symbol} ({name}), se omite espera de precio.")
-                price = client.tick_price(symbol, direction)
-                # Obtener el tamaño de pip para el símbolo
+
+                # symbol_info cacheado — no genera round-trip extra si ya se consultó
                 symbol_info = client.symbol_info(symbol)
-                point = 0.1 if symbol.upper().startswith('XAU') else 0.00001
-                if symbol_info and getattr(symbol_info, 'point', None) is not None:
-                    point = float(getattr(symbol_info, 'point', point))
-                # Proteger acceso a config_provider
+                point = 0.1 if is_gold else 0.00001
+                if symbol_info and getattr(symbol_info, "point", None) is not None:
+                    point = float(getattr(symbol_info, "point", point))
+
                 if self.config_provider is not None:
-                    tolerance_pips = float(self.config_provider.get('TOLERANCE_PIPS', '30'))
+                    tolerance_pips = float(self.config_provider.get("TOLERANCE_PIPS", "30"))
                 else:
                     tolerance_pips = 30.0
-                pips_tolerance = tolerance_pips * 0.1
-                # Log de referencia de precio inicial
-                log.info(f"[ENTRY][SYNC] Precio de referencia inicial: {ref_price} (timestamp={ref_time}) para {symbol} ({name})")
-                # Si el precio de referencia ya está en rango, entrar inmediatamente
-                if entry_lo is not None and entry_hi is not None:
-                    if direction.upper() == "BUY":
-                        if ref_price > entry_hi + pips_tolerance:
-                            log.warning(f"[ENTRY][SYNC] Precio de referencia {ref_price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
-                            return
-                        if entry_lo <= ref_price <= entry_hi + pips_tolerance:
-                            log.info(f"[ENTRY][SYNC] Precio de referencia {ref_price} dentro de rango [{entry_lo}, {entry_hi}] o hasta +15 pips. Ejecutando entrada.")
-                            price = ref_price
-                        else:
-                            # Esperar a que el precio entre en el rango permitido
-                            log.info(f"[ENTRY][SYNC] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name})...")
-                            deadline = time.time() + self.entry_wait_seconds
-                            while time.time() <= deadline:
-                                price = client.tick_price(symbol, direction)
-                                if entry_lo <= price <= entry_hi + pips_tolerance:
-                                    log.info(f"[ENTRY][SYNC] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}), ejecutando entrada.")
-                                    break
-                                if price > entry_hi + pips_tolerance:
-                                    log.warning(f"[ENTRY][SYNC] Precio {price} está demasiado alejado a favor del rango superior ({entry_hi}) + {pips_tolerance}. No se ejecuta entrada.")
-                                    return
-                                await asyncio.sleep(self.entry_poll_ms / 1000.0)
-                            else:
-                                log.warning(f"[ENTRY][SYNC] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta +15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
-                                return
-                    else:
-                        if ref_price < entry_lo - pips_tolerance:
-                            log.warning(f"[ENTRY][SYNC] Precio de referencia {ref_price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
-                            return
-                        if entry_lo - pips_tolerance <= ref_price <= entry_hi:
-                            log.info(f"[ENTRY][SYNC] Precio de referencia {ref_price} dentro de rango [{entry_lo}, {entry_hi}] o hasta -15 pips. Ejecutando entrada.")
-                            price = ref_price
-                        else:
-                            # Esperar a que el precio entre en el rango permitido
-                            log.info(f"[ENTRY][SYNC] Esperando precio en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name})...")
-                            deadline = time.time() + self.entry_wait_seconds
-                            while time.time() <= deadline:
-                                price = client.tick_price(symbol, direction)
-                                if entry_lo - pips_tolerance <= price <= entry_hi:
-                                    log.info(f"[ENTRY][SYNC] Precio {price} entró en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}), ejecutando entrada.")
-                                    break
-                                if price < entry_lo - pips_tolerance:
-                                    log.warning(f"[ENTRY][SYNC] Precio {price} está demasiado alejado a favor del rango inferior ({entry_lo}) - {pips_tolerance}. No se ejecuta entrada.")
-                                    return
-                                await asyncio.sleep(self.entry_poll_ms / 1000.0)
-                            else:
-                                log.warning(f"[ENTRY][SYNC] No suitable price found en rango [{entry_lo}, {entry_hi}] o hasta -15 pips para {symbol} ({name}) durante ventana de espera. Skipping entry.")
-                                return
+                # Para oro: tolerancia en precio (0.1 point/pip × 30 pips = 3.0)
+                pips_tolerance = tolerance_pips * point
+
+                # Precio de referencia ya obtenido al inicio — reutilizar si está fresco (< 1s)
+                age_ref = time.time() - ref_time
+                if age_ref < 1.0 and ref_price and ref_price > 0:
+                    price = ref_price
+                    log.info("[ENTRY] Usando precio de referencia fresco: %s age=%.3fs (%s)", price, age_ref, name)
                 else:
                     price = client.tick_price(symbol, direction)
-                    if price is None or price == 0.0:
-                        log.error(f"[PRICE][ERROR] No se pudo obtener el precio actual de {symbol} ({name}) para la entrada. Abortando operación.")
+
+                if price is None or price == 0.0:
+                    log.error("[ENTRY][ERROR] No se pudo obtener precio para %s (%s). Abortando.", symbol, name)
+                    return
+
+                log.info("[ENTRY] %s %s price=%.5f range=[%s,%s] tol=%.5f wait_max=%.1fs poll=%.3fs",
+                         name, symbol, price, entry_lo, entry_hi, pips_tolerance, entry_wait_max, entry_poll)
+
+                if entry_lo is not None and entry_hi is not None:
+                    is_buy = direction.upper() == "BUY"
+
+                    def _price_in_range(p: float) -> bool:
+                        if is_buy:
+                            return entry_lo <= p <= entry_hi + pips_tolerance
+                        return entry_lo - pips_tolerance <= p <= entry_hi
+
+                    def _price_past_range(p: float) -> bool:
+                        """Precio ya pasó el rango en dirección favorable — no tiene sentido esperar."""
+                        if is_buy:
+                            return p > entry_hi + pips_tolerance
+                        return p < entry_lo - pips_tolerance
+
+                    if _price_in_range(price):
+                        log.info("[ENTRY] Precio %s en rango inmediato. Ejecutando %s.", price, name)
+                    elif _price_past_range(price):
+                        log.warning("[ENTRY] Precio %s ya pasó el rango para %s. Abortando.", price, name)
                         return
-                # Log de latencia de entrada
+                    else:
+                        # Esperar con ventana reducida para oro
+                        deadline = time.time() + entry_wait_max
+                        entered = False
+                        while time.time() <= deadline:
+                            await asyncio.sleep(entry_poll)
+                            price = client.tick_price(symbol, direction)
+                            if price is None or price == 0.0:
+                                continue
+                            if _price_in_range(price):
+                                log.info("[ENTRY] %s precio %s entró en rango. Ejecutando.", name, price)
+                                entered = True
+                                break
+                            if _price_past_range(price):
+                                log.warning("[ENTRY] %s precio %s pasó rango favorable. Abortando.", name, price)
+                                return
+                        if not entered:
+                            log.warning("[ENTRY] %s sin precio en rango tras %.1fs. Skipping.", name, entry_wait_max)
+                            return
+                else:
+                    # Sin entry_range: ejecutar a mercado inmediatamente
+                    price = client.tick_price(symbol, direction)
+                    if price is None or price == 0.0:
+                        log.error("[ENTRY][ERROR] No se pudo obtener precio de mercado para %s (%s).", symbol, name)
+                        return
+
                 entry_end = time.time()
-                log.info(f"[ENTRY][SYNC] Latencia de entrada para {name}: {entry_end-entry_start:.3f}s desde inicio de open_complete_trade")
+                log.info("[ENTRY] Latencia entrada %s: %.3fs", name, entry_end - entry_start)
                 order_type = 0 if direction == "BUY" else 1
 
 
@@ -567,21 +589,14 @@ class MT5Executor:
                     planned_sl_val = None
 
                 # --- Si el SL está demasiado cerca del precio actual, AJUSTAR al mínimo permitido ---
-                symbol_info = client.symbol_info(symbol)
-                available_attrs = dir(symbol_info) if symbol_info else []
-                log.info(f"[DEBUG] SymbolInfo attrs for {symbol}: {available_attrs}")
-                # Acceso robusto a stops_level, stop_level y fill_mode
+                # symbol_info ya está en caché del pool — sin round-trip extra
                 min_stop_raw = None
-                fill_mode = None
                 if symbol_info:
                     min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
-                    fill_mode = getattr(symbol_info, "trade_fill_mode", None)
-                    if fill_mode is None:
-                        fill_mode = getattr(symbol_info, "fill_mode", None)
                 else:
                     min_stop_raw = 0.0
-                min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-                log.info(f"[DEBUG] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
+                min_stop = float(min_stop_raw) * point if symbol_info else 0.0
+                log.debug("[SL] stops_level=%s point=%s min_stop=%s", min_stop_raw, point, min_stop)
                 if min_stop > 0 and abs(price - float(forced_sl)) < min_stop:
                     if direction.upper() == "BUY":
                         adjusted_sl = price - min_stop
@@ -611,23 +626,16 @@ class MT5Executor:
                         if acc_info and getattr(acc_info, "balance", None) is not None:
                             balance = float(acc_info.balance)
                     except Exception as e:
-                        log.warning(f"[LOTE] No se pudo obtener balance para {name}: {e}")
+                        log.warning("[LOTE] No se pudo obtener balance para %s: %s", name, e)
                     risk_money = balance * (risk_percent / 100.0)
                     sl_distance = abs(float(price) - float(forced_sl))
-                    try:
-                        symbol_info = client.symbol_info(symbol)
-                        tick_value = float(getattr(symbol_info, "tick_value", 0.0))
-                        tick_size = float(getattr(symbol_info, "tick_size", 0.0))
-                        lot_step = float(getattr(symbol_info, "volume_step", 0.01))
-                        min_lot = float(getattr(symbol_info, "volume_min", 0.03))
-                    except Exception as e:
-                        log.warning(f"[LOTE] No se pudo obtener info de símbolo para {name}: {e}")
-                        tick_value = 0.0
-                        tick_size = 0.0
-                        lot_step = 0.01
-                        min_lot = 0.03
+                    # symbol_info ya cacheado — reutilizar sin round-trip
+                    tick_value = float(getattr(symbol_info, "tick_value", 0.0)) if symbol_info else 0.0
+                    tick_size = float(getattr(symbol_info, "tick_size", 0.0)) if symbol_info else 0.0
+                    lot_step = float(getattr(symbol_info, "volume_step", 0.01)) if symbol_info else 0.01
+                    min_lot = float(getattr(symbol_info, "volume_min", 0.03)) if symbol_info else 0.03
                     lot = calcular_lotaje(balance, risk_money, sl_distance, tick_value, tick_size, lot_step, min_lot, fixed_lot)
-                    log.info(f"[LOTE][{name}] lotaje calculado={lot}")
+                    log.info("[LOTE][%s] lotaje calculado=%s", name, lot)
 
                 log.info(f"[ORDER_PREP] account={account} | lot={lot} | fixed_lot={account.get('fixed_lot')} | risk_percent={account.get('risk_percent')} | symbol={symbol} | direction={direction}")
                 log.info(f"[ORDER_PREP][SL-DEBUG] forced_sl={forced_sl} planned_sl_val={planned_sl_val}")

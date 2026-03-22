@@ -11,6 +11,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("telegram_ingestor")
 
 async def main():
+    from services.common.env_validator import validate_telegram_ingestor
+    validate_telegram_ingestor()
+
     last_msg = {"ts": None}
 
     async def watchdog():

@@ -4,8 +4,6 @@ Prevents processing the same signal twice within a time window.
 """
 
 import hashlib
-import time
-from typing import Optional
 from redis import Redis
 import logging
 
@@ -49,29 +47,28 @@ class SignalDeduplicator:
     
     async def is_duplicate(self, chat_id: str, parse_result) -> bool:
         """
-        Check if signal was already seen recently.
-        Returns True if duplicate, False if new signal.
+        Verifica si la señal ya fue procesada recientemente.
+        Usa SET NX (atómico) — elimina la race condition de la versión anterior
+        que usaba exists() + setex() en dos llamadas separadas.
+
+        SET NX devuelve True si la clave NO existía (señal nueva) y la crea con TTL.
+        Devuelve False si ya existía (señal duplicada).
+        Todo en una sola operación de red — 10-20ms en vez de 20-40ms.
         """
         sig = self._signature_from_parse_result(chat_id, parse_result)
         redis_key = f"{self.key_prefix}{sig}"
 
-        # Check if exists (async)
         try:
-            exists = await self.redis.exists(redis_key)
+            # SET key value EX ttl NX — atómico, sin race condition
+            created = await self.redis.set(redis_key, "1", ex=int(self.ttl_seconds), nx=True)
         except Exception as e:
-            log.warning("[DEDUP] exists check failed sig=%s err=%s", sig, e)
-            exists = 0
+            log.warning("[DEDUP] SET NX falló sig=%s err=%s — asumiendo nueva señal", sig, e)
+            return False  # En caso de error, dejar pasar (no bloquear trading)
 
-        if exists and int(exists) > 0:
-            log.debug("[DEDUP] duplicate chat=%s sig=%s", chat_id, sig)
-            return True  # Duplicate
-
-        # Mark as seen with TTL
-        try:
-            await self.redis.setex(redis_key, int(self.ttl_seconds), "1")
-        except Exception as e:
-            log.warning("[DEDUP] failed to setex sig=%s err=%s", sig, e)
-        return False  # New signal
+        if created:
+            return False  # Clave creada: señal nueva
+        log.debug("[DEDUP] duplicada chat=%s sig=%s", chat_id, sig)
+        return True  # Clave ya existía: duplicado
     
     def cleanup(self) -> int:
         """

@@ -1,4 +1,4 @@
-import os, asyncio, json, time, logging
+import os, asyncio, logging
 from common.config import Settings
 from common.redis_streams import redis_client, xadd
 
@@ -129,40 +129,47 @@ async def get_available_symbols(mt5, fallback_symbols=None):
 
 async def resolve_symbol_aliases(mt5, requested_symbols: list[str]) -> list[str]:
     """Resolve requested symbols to actual broker-exposed symbol names.
-    Tries exact match, then looks for best contains-match, and prefers symbols that
-    return a recent tick.
+    Descarga la lista de simbolos UNA sola vez y la reutiliza para todos los pedidos.
+    Intenta match exacto, luego contains-match, priorizando los que tienen tick reciente.
     """
     resolved = []
+    # Descarga la lista una sola vez — evita N llamadas a symbols_get()
     try:
         all_syms = [s.name for s in mt5.symbols_get()]
-    except Exception:
+    except Exception as e:
+        log.warning("No se pudo obtener lista de simbolos: %s", e)
         all_syms = []
 
+    all_syms_set = set(all_syms)
+
     for base in requested_symbols:
-        if base in all_syms:
+        if base in all_syms_set:
             resolved.append(base)
             continue
 
-        # find candidates that contain the base string
+        # Buscar candidatos que contengan el simbolo base
         candidates = [s for s in all_syms if base in s]
         chosen = None
-        for c in candidates:
+
+        # Priorizar el primer candidato con tick activo (maximo 5 candidatos para no saturar)
+        for c in candidates[:5]:
             try:
                 tick = mt5.symbol_info_tick(c)
-                if tick and getattr(tick, 'time', 0):
+                if tick and getattr(tick, "time", 0):
                     chosen = c
                     break
             except Exception:
                 continue
 
+        # Si ninguno tiene tick, usar el primero disponible
         if not chosen and candidates:
             chosen = candidates[0]
 
         if chosen:
-            log.info(f"Resolved {base} -> {chosen}")
+            log.info("Symbol resuelto: %s -> %s", base, chosen)
             resolved.append(chosen)
         else:
-            log.warning(f"Could not resolve symbol for {base}, keeping as-is")
+            log.warning("No se pudo resolver simbolo '%s', usando tal cual", base)
             resolved.append(base)
 
     return resolved

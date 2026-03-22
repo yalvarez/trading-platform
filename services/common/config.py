@@ -1,18 +1,20 @@
 # ConfigProvider abstraction
 from services.common.config_db import ConfigProvider
+from typing import Any
 import json
 
 config = ConfigProvider()
-FAST_UPDATE_WINDOW_SECONDS = float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30))
-CHANNELS_CONFIG_JSON = config.get("CHANNELS_CONFIG_JSON", "{}")
+FAST_UPDATE_WINDOW_SECONDS: float = float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30))
+CHANNELS_CONFIG_JSON: str = config.get("CHANNELS_CONFIG_JSON", "{}")
+
 
 class Settings:
     @staticmethod
-    def sl_max_pips():
+    def sl_max_pips() -> float:
         return float(config.get("SL_MAX_PIPS", 120.0))
 
     @staticmethod
-    def load():
+    def load() -> dict[str, Any]:
         return {
             "redis_url": config.get("REDIS_URL", "redis://redis:6379/0"),
             "log_level": config.get("LOG_LEVEL", "INFO"),
@@ -42,8 +44,7 @@ class Settings:
         }
 
     @staticmethod
-    def accounts():
-        # Load from DB if available, else fallback to env
+    def accounts() -> list[dict]:
         db_url = config.db_url
         try:
             import psycopg2
@@ -56,7 +57,7 @@ class Settings:
         return json.loads(config.get("ACCOUNTS_JSON", "[]"))
 
     @staticmethod
-    def signal_providers():
+    def signal_providers() -> list[dict]:
         db_url = config.db_url
         try:
             import psycopg2
@@ -66,11 +67,10 @@ class Settings:
                 return load_signal_providers(conn)
         except ImportError:
             pass
-        # fallback: parse from CHANNELS_CONFIG_JSON
         return []
 
     @staticmethod
-    def channel_providers():
+    def channel_providers() -> dict:
         db_url = config.db_url
         try:
             import psycopg2
@@ -80,5 +80,4 @@ class Settings:
                 return load_channel_providers(conn)
         except ImportError:
             pass
-        # fallback: parse from CHANNELS_CONFIG_JSON
         return {}

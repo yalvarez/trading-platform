@@ -1,61 +1,57 @@
 import rpyc
 import MetaTrader5 as mt5
 import sys
+import time
+import logging
 
-class Tee:
-    def __init__(self, *files):
-        self.files = files
-    def write(self, data):
-        for f in self.files:
-            f.write(data)
-            f.flush()
-    def flush(self):
-        for f in self.files:
-            f.flush()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [mt5_custom] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("/config/rpyc.log", mode="a"),
+    ],
+)
+log = logging.getLogger("mt5_custom.server_rpyc")
 
-# Redirigir stdout y stderr a archivo y consola
-logfile = open('/config/rpyc.log', 'a', buffering=1)
-sys.stdout = Tee(sys.stdout, logfile)
-sys.stderr = Tee(sys.stderr, logfile)
 
 class MT5Service(rpyc.Service):
-    def on_connect(self, conn):
-        pass
-    def on_disconnect(self, conn):
-        pass
     def exposed_symbol_select(self, symbol, enable=True):
         return mt5.symbol_select(symbol, enable)
+
     def exposed_symbol_info(self, symbol):
         return mt5.symbol_info(symbol)
+
     def exposed_positions_get(self):
         return mt5.positions_get()
+
     def exposed_order_send(self, req):
         return mt5.order_send(req)
+
     def exposed_symbol_info_tick(self, symbol):
         return mt5.symbol_info_tick(symbol)
+
 
 if __name__ == "__main__":
     import traceback
     try:
-        print("[server_rpyc] Iniciando MetaTrader5...")
-        import time
-        max_wait = 300  # segundos
-        interval = 5   # segundos
+        log.info("Iniciando MetaTrader5...")
+        max_wait = 300
+        interval = 5
         waited = 0
         while not mt5.initialize():
-            print(f"[server_rpyc] MT5 initialize() failed: {mt5.last_error()} (reintentando en {interval}s)")
+            log.warning("MT5 initialize() failed: %s (reintentando en %ds)", mt5.last_error(), interval)
             time.sleep(interval)
             waited += interval
             if waited >= max_wait:
-                print(f"[server_rpyc] MT5 no pudo inicializarse tras {max_wait} segundos. Abortando.")
-                exit(1)
-        print("[server_rpyc] MetaTrader5 inicializado correctamente.")
+                log.critical("MT5 no pudo inicializarse tras %ds. Abortando.", max_wait)
+                sys.exit(1)
+        log.info("MetaTrader5 inicializado correctamente.")
         from rpyc.utils.server import ThreadedServer
-        print("[server_rpyc] Iniciando servidor rpyc en puerto 8001...")
+        log.info("Iniciando servidor rpyc en puerto 8001...")
         server = ThreadedServer(MT5Service, port=8001, protocol_config={"sync_request_timeout": 30})
-        print("[server_rpyc] Servidor rpyc iniciado. Esperando conexiones...")
+        log.info("Servidor rpyc iniciado. Esperando conexiones...")
         server.start()
-    except Exception as e:
-        print("[server_rpyc] Excepción fatal:")
-        traceback.print_exc()
-        exit(1)
+    except Exception:
+        log.critical("Excepcion fatal:\n%s", traceback.format_exc())
+        sys.exit(1)

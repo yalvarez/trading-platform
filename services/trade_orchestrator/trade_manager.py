@@ -583,10 +583,22 @@ class TradeManager:
         """
         log.info("[RUN_FOREVER] TradeManager loop iniciado y activo.")
         
+        # Intervalo entre iteraciones del loop de gestión.
+        # 100ms es suficiente para detectar TPs en XAUUSD (precio cambia cada tick ~250ms)
+        # sin saturar la conexión MT5 con cientos de positions_get() por segundo.
+        LOOP_INTERVAL = 0.1
+
         while True:
+            loop_start = asyncio.get_event_loop().time()
             accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
             accounts = [a for a in accounts if a.get("active")]
-            await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
+            if accounts:
+                await asyncio.gather(*(self._tick_once_account(account) for account in accounts))
+            # Throttle: esperar el tiempo restante hasta el próximo intervalo
+            elapsed = asyncio.get_event_loop().time() - loop_start
+            remaining = LOOP_INTERVAL - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
     async def _tick_once_account(self, account):
         """

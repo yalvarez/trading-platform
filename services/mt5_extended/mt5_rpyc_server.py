@@ -2,15 +2,18 @@ import rpyc
 from rpyc.utils.server import ThreadedServer
 import MetaTrader5 as mt5
 import time
+import logging
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [mt5_extended] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("mt5_extended.server_rpyc")
+
 
 class MT5Service(rpyc.Service):
-    def on_connect(self, conn):
-        print("Client connected")
-
-    def on_disconnect(self, conn):
-        print("Client disconnected")
-
-    # Expose MT5 API
     def exposed_initialize(self):
         return mt5.initialize()
 
@@ -35,15 +38,15 @@ class MT5Service(rpyc.Service):
     def exposed_last_error(self):
         return mt5.last_error()
 
+
 if __name__ == "__main__":
-    print("Initializing MT5...")
+    log.info("Inicializando MT5...")
     mt5.initialize()
     time.sleep(2)
-
-    print("Starting RPyC server on port 18812...")
+    log.info("Iniciando servidor RPyC en puerto 18812...")
     server = ThreadedServer(
         MT5Service,
         port=18812,
-        protocol_config={"allow_public_attrs": True}
+        protocol_config={"allow_public_attrs": True},
     )
     server.start()
