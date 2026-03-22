@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock
 async def test_deduplication_cases():
     redis = AsyncMock()
     dedup = SignalDeduplicator(redis, ttl_seconds=120)
-    redis.exists.return_value = 0
+    # Primera señal: SET NX tiene éxito (clave creada) → no es duplicada
+    redis.set.return_value = True
     assert await dedup.is_duplicate('chat1', AsyncMock()) is False
-    redis.exists.return_value = 1
+    # Segunda señal idéntica: SET NX falla (clave ya existe) → es duplicada
+    redis.set.return_value = None
     assert await dedup.is_duplicate('chat1', AsyncMock()) is True

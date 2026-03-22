@@ -32,8 +32,10 @@ async def test_orchestrator_signal_flow(monkeypatch):
             return self._sim
     mt5 = DummyMT5(sim)
     manager = TradeManager(mt5, notifier=notifier)
-    # Simular señal de apertura
-    ticket = 1234
+    # Abrir el trade en el simulador para que exista en sim.positions
+    res_open = sim.order_send({'action': 1, 'symbol': 'XAUUSD', 'volume': 0.05,
+                               'type': 0, 'price': 2500.0, 'sl': 2490.0, 'tp': 2510.0})
+    ticket = res_open.order
     manager.register_trade('demo', ticket, 'XAUUSD', 'BUY', 'TEST', [2510.0], planned_sl=2490.0)
     assert ticket in manager.trades
     # Simular mensaje de gestión Hannah (cierre parcial + BE)
