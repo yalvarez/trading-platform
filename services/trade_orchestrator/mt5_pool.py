@@ -105,7 +105,7 @@ class PooledMT5Client:
     RECONNECT_DELAY = 0.5  # segundos
 
     def __init__(self, host: str, port: int):
-        from .mt5_client import MT5Client
+        from services.common.mt5_client import MT5Client
         self.host = host
         self.port = port
         self._client = MT5Client(host, port)
@@ -118,7 +118,7 @@ class PooledMT5Client:
 
     def _reconnect(self) -> bool:
         """Intenta reconectar si la conexion cayo."""
-        from .mt5_client import MT5Client
+        from services.common.mt5_client import MT5Client
         for attempt in range(1, self.MAX_RECONNECT_ATTEMPTS + 1):
             try:
                 log.warning("[PooledMT5Client] Reconectando %s:%s (intento %d/%d)",
