@@ -8,4 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends git gcc build-e
 RUN pip install --no-cache-dir -r services/trade_orchestrator/requirements.txt
 RUN pip install --no-cache-dir mt5linux==0.1.9
 
+EXPOSE 8200
+
 CMD ["python", "-m", "services.trade_orchestrator.app"]

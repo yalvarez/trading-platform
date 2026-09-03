@@ -1,0 +1,57 @@
+"""
+mgmt_api.py
+Endpoint HTTP /mgmt/action que recibe decisiones de gestion desde un
+flujo n8n/Ollama externo, para mensajes del canal que el parser de
+senales no reconoce (dual-TP spec seccion 5.2). Se monta junto al
+consumer de Redis Streams de trade_orchestrator, en el mismo proceso,
+porque necesita el TradeManager en memoria para resolver el grupo
+activo por simbolo.
+"""
+import os
+import logging
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
+
+log = logging.getLogger("trade_orchestrator.mgmt_api")
+
+_action_key_header = APIKeyHeader(name="X-N8N-Action-Key", auto_error=False)
+
+
+class Correction(BaseModel):
+    field: str
+    value: float
+
+
+class MgmtActionRequest(BaseModel):
+    action: str
+    symbol: str
+    raw_text: str
+    correction: Optional[Correction] = None
+
+
+def create_mgmt_app(trade_manager) -> FastAPI:
+    app = FastAPI(title="trade_orchestrator-mgmt")
+    action_api_key = os.getenv("N8N_ACTION_API_KEY", "")
+    if not action_api_key:
+        log.warning("[MGMT_API] N8N_ACTION_API_KEY no configurada - endpoint desprotegido")
+
+    def _check_key(api_key: str | None = Depends(_action_key_header)) -> None:
+        if action_api_key and api_key != action_api_key:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key invalida o ausente.")
+
+    @app.post("/mgmt/action", dependencies=[Depends(_check_key)])
+    async def mgmt_action(req: MgmtActionRequest) -> dict:
+        correction = req.correction.model_dump() if req.correction else None
+        result = await trade_manager.apply_mgmt_action(
+            action=req.action, symbol=req.symbol, raw_text=req.raw_text, correction=correction,
+        )
+        return result
+
+    @app.get("/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
+    return app

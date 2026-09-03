@@ -100,6 +100,14 @@ async def main():
     )
     tradeManager = TradeManager(tradeExecutor, notifier=notifier_adapter, config_provider=_config)
 
+    from .mgmt_api import create_mgmt_app
+    import uvicorn
+
+    mgmt_app = create_mgmt_app(tradeManager)
+    mgmt_port = int(_config.get("MGMT_API_PORT", 8200))
+    uvicorn_config = uvicorn.Config(mgmt_app, host="0.0.0.0", port=mgmt_port, log_level="warning")
+    uvicorn_server = uvicorn.Server(uvicorn_config)
+
     async def loop_signals():
         async for msg_id, fields in xread_loop(r, Streams.SIGNALS, last_id="$"):
             if not in_windows(parse_windows(s["trading_windows"])):
@@ -111,7 +119,7 @@ async def main():
                 log.exception("[SIGNAL] error procesando senal: %s", fields)
 
     asyncio.create_task(tradeManager.run_forever())
-    await loop_signals()
+    await asyncio.gather(loop_signals(), uvicorn_server.serve())
 
 
 if __name__ == "__main__":

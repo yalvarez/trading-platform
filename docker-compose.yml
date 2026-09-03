@@ -117,6 +117,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
+    ports:
+      - "8200:8200"
     healthcheck:
       test: ["CMD", "sh", "-c", "test -f /tmp/telegram_notifier.ready"]
       interval: 10s
