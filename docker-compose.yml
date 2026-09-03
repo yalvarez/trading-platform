@@ -1,31 +1,5 @@
 services:
   # =========================
-  postgres:
-    image: postgres:15
-    container_name: atp-postgres
-    restart: always
-    environment:
-      POSTGRES_DB: trading_config
-      POSTGRES_USER: trading_user
-      POSTGRES_PASSWORD: trading_pass
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-  # =========================
-  backend_admin:
-    build:
-      context: .
-      dockerfile: services/backend_admin/Dockerfile
-    container_name: atp-backend-admin
-    env_file:
-      - .env
-    ports:
-      - "5000:5000"
-    depends_on:
-      - postgres
-    restart: unless-stopped
-  # =========================
   redis:
     image: redis:7-alpine
     container_name: atp-redis
@@ -85,20 +59,6 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  market_data:
-    build:
-      context: .
-      dockerfile: services/market_data/Dockerfile
-    container_name: atp-market-data
-    env_file:
-      - .env
-    depends_on:
-      mt5_acct1:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
   trade_orchestrator:
     build:
       context: .
@@ -108,8 +68,6 @@ services:
       - .env
     depends_on:
       mt5_acct1:
-        condition: service_started
-      mt5_acct2:
         condition: service_started
       redis:
         condition: service_healthy
@@ -126,6 +84,5 @@ services:
       retries: 6
 
 volumes:
-  pgdata:
   redis_data:
   mt5_acct1_config:

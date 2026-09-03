@@ -100,30 +100,6 @@ def validate_router_parser() -> None:
     _report(errors, "router_parser")
 
 
-def validate_backend_admin() -> None:
-    """Valida variables requeridas por backend_admin."""
-    errors = []
-    for name in ("ADMIN_USER", "ADMIN_PASS", "CONFIG_DB_URL"):
-        try:
-            val = _require(name)
-            if name in ("ADMIN_USER", "ADMIN_PASS") and val.lower() in ("admin", "password", "admin123", "changeme"):
-                log.warning("[ENV] %s usa un valor inseguro por defecto. Cambiar en produccion.", name)
-        except EnvError as e:
-            errors.append(str(e))
-    _report(errors, "backend_admin")
-
-
-def validate_market_data() -> None:
-    """Valida variables requeridas por market_data."""
-    errors = []
-    for name in ("REDIS_URL",):
-        try:
-            _require(name)
-        except EnvError as e:
-            errors.append(str(e))
-    _report(errors, "market_data")
-
-
 def _report(errors: list[str], service: str) -> None:
     if errors:
         for e in errors:
