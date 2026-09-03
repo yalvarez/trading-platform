@@ -1,59 +1,106 @@
-Deployment notes
+# Deployment Notes
 
-- Remove the deprecated `version` key in `docker-compose.yml` (already done).
-
-Telegram session sharing
+## Telegram Session Sharing
 
 - The project stores the Telethon session at `services/telegram_ingestor/telegram_ingestor.session`.
 - `telegram_ingestor` mounts this file read-write so the session can be created from the host.
-- `trade_orchestrator` mounts it read-only so it can reuse the same Telethon session: container config in `docker-compose.yml` mounts the file to `/app/services/telegram_ingestor/telegram_ingestor.session`.
+- `trade_orchestrator` mounts it read-only for potential future use (currently not actively consumed).
 
-Environment variables
+## Environment Variables
 
-Ensure the following env vars exist in `.env` or are provided to the environment:
-- `TG_API_ID`
-- `TG_API_HASH`
-- `TG_SOURCE_CHATS` (comma separated list of chat ids)
-- `TG_NOTIFY_TARGET` (optional override for the first target chat)
+Ensure the following env vars exist in `.env`:
+- `TG_API_ID`: Telegram API ID
+- `TG_API_HASH`: Telegram API hash
+- `TG_PHONE`: Phone number tied to Telegram account
+- `REDIS_URL`: Redis connection URL (default: `redis://redis:6379/0`)
+- `N8N_ACTION_API_KEY`: REQUIRED for `/mgmt/action` endpoint (fail-closed)
+- `TRADE_API_KEY`: REQUIRED for trade_api (fail-closed)
+- `N8N_INBOUND_WEBHOOK_URL`: n8n webhook for unrecognized signal text
+- `N8N_WEBHOOK_URL`: (optional) n8n webhook for trade event notifications
 
-Quick commands
+## Quick Docker Commands
 
-Rebuild/restart services:
-
+**Rebuild and restart:**
 ```bash
 docker compose up -d --build
 ```
 
-View `trade_orchestrator` logs:
-
+**View trade_orchestrator logs:**
 ```bash
 docker compose logs -f trade_orchestrator
 ```
 
-Send a test notification from the host (interactive session required):
-
+**Check service status:**
 ```bash
-python services/trade_orchestrator/test_notify.py
+docker compose ps
 ```
 
-Send a test notification from inside the running `trade_orchestrator` container:
-
+**Access a container:**
 ```bash
-docker compose exec trade_orchestrator sh -c "python - <<'PY'
-import asyncio, os
-from telethon import TelegramClient
-from common.telegram_notifier import TelegramNotifier, NotificationConfig
-
-async def main():
-    api_id = int(os.getenv('TG_API_ID'))
-    api_hash = os.getenv('TG_API_HASH')
-    session_path = 'services/telegram_ingestor/telegram_ingestor'
-    async with TelegramClient(session_path, api_id, api_hash) as client:
-        configs = [NotificationConfig('ACCT1', int(os.getenv('TG_SOURCE_CHATS').split(',')[0]))]
-        notifier = TelegramNotifier(client, configs)
-        await notifier.notify_trade_opened('ACCT1', 99999, 'XAUUSD', 'BUY', 2500.5, 2490.0, [2515.0,2530.0], 0.1, 'CONTAINER_TEST')
-        print('sent')
-
-asyncio.run(main())
-PY"
+docker compose exec trade_orchestrator bash
 ```
+
+**Stop everything:**
+```bash
+docker compose down
+```
+
+## Management API Testing
+
+**Invoke /mgmt/action endpoint (from host):**
+```bash
+curl -X POST http://localhost:8200/mgmt/action \
+  -H "X-N8N-Action-Key: $N8N_ACTION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "close_now",
+    "symbol": "XAUUSD",
+    "group_id": 12345,
+    "notes": "manual close"
+  }'
+```
+
+## Trade API Testing
+
+**List all trades:**
+```bash
+curl -H "X-API-Key: $TRADE_API_KEY" http://localhost:8100/trades
+```
+
+**Get specific trade:**
+```bash
+curl -H "X-API-Key: $TRADE_API_KEY" http://localhost:8100/trades/12345
+```
+
+**Open a trade:**
+```bash
+curl -X POST http://localhost:8100/trades \
+  -H "X-API-Key: $TRADE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "XAUUSD",
+    "direction": "BUY",
+    "entry_price": 2500.50,
+    "sl_price": 2490.00,
+    "tp_prices": [2515.00, 2530.00],
+    "lot": 0.01
+  }'
+```
+
+**Close a trade:**
+```bash
+curl -X DELETE http://localhost:8100/trades/12345 \
+  -H "X-API-Key: $TRADE_API_KEY"
+```
+
+## Architecture Overview
+
+6 core services:
+1. **redis**: Pub/sub for signals and management
+2. **mt5_acct1**: MT5 terminal + RPyC server
+3. **telegram_ingestor**: Reads Telegram → Redis raw_messages
+4. **router_parser**: Parses signals (TradePulse only) → Redis signals or n8n webhook
+5. **trade_orchestrator**: Opens dual-TP positions, manages BE/trailing, receives /mgmt/action decisions
+6. **trade_api**: External REST API for trade control
+
+The mechanical dual-TP model is now the only trading behavior — no more configurable trading_mode system.
