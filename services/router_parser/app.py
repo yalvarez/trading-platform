@@ -2,16 +2,16 @@ import os, re, json, logging, uuid
 from services.common.config import Settings
 from services.common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
 from services.common.signal_dedup import SignalDeduplicator
-from gb_filters import looks_like_followup
+from tradepulse_filters import looks_like_followup
 from torofx_filters import looks_like_torofx_management
 from parsers_base import SignalParser, ParseResult
 
-from parsers_goldbro_fast import GoldBroFastParser
-from parsers_goldbro_long import GoldBroLongParser
-from parsers_goldbro_scalp import GoldBroScalpParser
-from parsers_torofx import ToroFxParser
-from parsers_daily_signal import DailySignalParser
-from parsers_hannah import HannahParser
+# from parsers_goldbro_fast import GoldBroFastParser
+# from parsers_goldbro_long import GoldBroLongParser
+# from parsers_goldbro_scalp import GoldBroScalpParser
+# from parsers_torofx import ToroFxParser
+# from parsers_daily_signal import DailySignalParser
+# from parsers_hannah import HannahParser
 from parsers_tradepulse import TradePulseParser
 
 
@@ -27,15 +27,8 @@ from services.common.config import FAST_UPDATE_WINDOW_SECONDS
 
 class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0, channels_config=None):
-        from parsers_limitless import LimitlessParser
+        from parsers_tradepulse import TradePulseParser
         self.parser_map = {
-            'hannah': HannahParser(),
-            'goldbro_long': GoldBroLongParser(),
-            'goldbro_fast': GoldBroFastParser(),
-            'goldbro_scalp': GoldBroScalpParser(),
-            'torofx': ToroFxParser(),
-            'daily_signal': DailySignalParser(),
-            'limitless': LimitlessParser(),
             'tradepulse': TradePulseParser(),
         }
         self.channels_config = channels_config or {}
@@ -45,52 +38,6 @@ class SignalRouter:
 
     def parse_signal(self, text, chat_id=None):
         norm = text.strip()
-        # --- 1. LIMITLESS si tiene 'Risk Price' ---
-        norm_lower = norm.lower()
-        if 'risk price' in norm_lower:
-            parser = self.parser_map['limitless']
-            try:
-                result = parser.parse(norm)
-                if result:
-                    if hasattr(result, 'entry_range') and result.entry_range is not None:
-                        try:
-                            entry_range = list(map(float, result.entry_range))
-                            result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
-                        except Exception as e:
-                            log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
-                            result = result.__class__(**{**result.__dict__, 'entry_range': None})
-                    # log.debug(f"[PARSE] {parser.format_tag} matched (LIMITLESS priority)")  # Reduce log noise
-                    return result
-            except Exception as e:
-                log.warning(f"[PARSE_ERROR] LimitlessParser: {e}")
-            return None
-        # --- 2. TOROFX si tiene 'Target: open' ---
-        if 'target: open' in norm_lower:
-            parser = self.parser_map['torofx']
-            try:
-                result = parser.parse(norm)
-                if result:
-                    if hasattr(result, 'entry_range') and result.entry_range is not None:
-                        try:
-                            entry_range = list(map(float, result.entry_range))
-                            result = result.__class__(**{**result.__dict__, 'entry_range': entry_range})
-                        except Exception as e:
-                            log.warning(f"[PARSE_ERROR] entry_range conversion: {e}")
-                            result = result.__class__(**{**result.__dict__, 'entry_range': None})
-                    # log.debug(f"[PARSE] {parser.format_tag} matched (TOROFX priority)")  # Reduce log noise
-                    return result
-            except Exception as e:
-                log.warning(f"[PARSE_ERROR] ToroFxParser: {e}")
-            return None
-        # --- 3. HANNAH si hace match (prioridad absoluta sobre cualquier otro parser) ---
-        hannah_parser = self.parser_map['hannah']
-        try:
-            result = hannah_parser.parse(norm)
-            if result:
-                # log.debug(f"[PARSE] {hannah_parser.format_tag} matched (HANNAH priority)")  # Reduce log noise
-                return result
-        except Exception as e:
-            log.warning(f"[PARSE_ERROR] HannahParser: {e}")
         # --- 4. Normal routing ---
         parsers = []
         if chat_id and str(chat_id) in self.channels_config:
@@ -192,62 +139,10 @@ async def main():
             async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
                 text = fields.get("text", "")
                 chat_id = fields.get("chat_id", "")
-                # log.debug("[RAW] chat=%s text=%s", chat_id, (text or "").strip()[:200])  # Reduce log noise
-
-                # Si el texto parece gestión TOROFX o contiene 'Stop Loss' y 'Target: open', priorizar ese parser
-                if looks_like_torofx_management(text) or ("stop loss" in text.lower() and "target: open" in text.lower()):
-                    sig = router.parser_map['torofx'].parse(text)
-                    if sig:
-                        trace_id = uuid.uuid4().hex[:8]
-                        sig_dict = {}
-                        # --- SERIALIZACIÓN ROBUSTA DE entry_range ---
-                        entry_range_val = sig.entry_range
-                        import json
-                        if entry_range_val is None:
-                            entry_range_json = json.dumps([])
-                        elif isinstance(entry_range_val, str):
-                            v_clean = entry_range_val.strip()
-                            if v_clean.startswith('(') and v_clean.endswith(')'):
-                                v_clean = v_clean[1:-1]
-                                parts = [float(x.strip()) for x in v_clean.split(',') if x.strip()]
-                                entry_range_json = json.dumps(parts)
-                            else:
-                                try:
-                                    val = json.loads(v_clean)
-                                    entry_range_json = json.dumps(val)
-                                except Exception:
-                                    entry_range_json = json.dumps([])
-                        elif isinstance(entry_range_val, (tuple, list)):
-                            entry_range_json = json.dumps(list(entry_range_val))
-                        else:
-                            entry_range_json = json.dumps([])
-                        for k, v in (sig.__dict__ if hasattr(sig, "__dict__") else sig).items():
-                            if k == "entry_range":
-                                sig_dict[k] = entry_range_json
-                            elif isinstance(v, bool):
-                                sig_dict[k] = str(v).lower()
-                            elif isinstance(v, (list, tuple)):
-                                sig_dict[k] = json.dumps(v)
-                            elif v is None:
-                                continue
-                            else:
-                                sig_dict[k] = v
-                        sig_dict["chat_id"] = chat_id
-                        sig_dict["raw_text"] = text
-                        sig_dict["trace"] = trace_id
-                        await xadd(r, Streams.SIGNALS, sig_dict)
-                        log.info(f"[SIGNAL] trace={trace_id} TOROFX {sig_dict.get('direction','')} {sig_dict.get('symbol','')}")
-                        await xack(r, Streams.RAW, group, msg_id)
-                        continue
-                    # Si no parsea, lo manda como gestión
-                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TOROFX"})
-                    log.info("[MGMT] TOROFX")
-                    await xack(r, Streams.RAW, group, msg_id)
-                    continue
 
                 if looks_like_followup(text):
-                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "GOLD_BROTHERS"})
-                    log.info("[MGMT] GB follow-up")
+                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TRADE_PULSE"})
+                    log.info("[MGMT] TRADE_PULSE follow-up")
                     await xack(r, Streams.RAW, group, msg_id)
                     continue
 

@@ -20,55 +20,12 @@ else:
         sys.path.insert(0, _svc_c)
 from services.common.telegram_notifier import RemoteTelegramNotifier
 from .notifications.telegram import TelegramNotifierAdapter
-from prometheus_client import start_http_server
-
 
 # Add container label to log format for Grafana filtering
 container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "trade_orchestrator"
 log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format=log_fmt)
 log = logging.getLogger("trade_orchestrator")
-
-class NotifierAdapter:
-    """
-    Adaptador que expone métodos async para notificaciones de TP, cierres parciales y mensajes generales.
-    Permite usar un notificador Telegram remoto de forma uniforme en toda la app.
-    """
-
-    def __init__(self, tg_notifier):
-        self._tg = tg_notifier
-
-    async def notify_tp_hit(self, account_name: str, ticket: int, symbol: str, tp_index: int, tp_price: float, current_price: float):
-        """
-        Notifica que se alcanzó un TP para una cuenta/ticket/símbolo.
-        """
-        return await self._tg.notify_tp_hit(
-            account_name=account_name,
-            ticket=ticket,
-            symbol=symbol,
-            tp_index=tp_index,
-            tp_price=tp_price,
-            current_price=current_price,
-        )
-
-    async def notify_partial_close(self, *args, **kwargs):
-        """
-        Notifica un cierre parcial si el notificador lo soporta.
-        """
-        if hasattr(self._tg, "notify_partial_close"):
-            return await self._tg.notify_partial_close(*args, **kwargs)
-
-    async def __call__(self, account_name: str, message: str):
-        """
-        Notificación genérica (llamada como función).
-        """
-        await self._tg.notify(account_name, message)
-
-    async def notify(self, account_name: str, message: str):
-        """
-        Notificación genérica (método explícito).
-        """
-        await self._tg.notify(account_name, message)
 
 async def main():
     """
@@ -82,13 +39,7 @@ async def main():
     from services.common.config import Settings
     config = ConfigProvider()
     s = Settings.load()
-    # start Prometheus metrics server
-    try:
-        metrics_port = int(os.getenv("METRICS_PORT", "8000"))
-        start_http_server(metrics_port)
-        log.info(f"Prometheus metrics server started on :{metrics_port}")
-    except Exception as e:
-        log.error(f"Failed to start Prometheus metrics server: {e}")
+
     r = await redis_client(s["redis_url"])
     accounts = config.get_accounts()
 
