@@ -18,8 +18,8 @@ else:
     _svc_c = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'services'))
     if os.path.isdir(_svc_c):
         sys.path.insert(0, _svc_c)
-from services.common.telegram_notifier import RemoteTelegramNotifier
-from .notifications.telegram import TelegramNotifierAdapter
+# from services.common.telegram_notifier import RemoteTelegramNotifier  # TODO: removed in Task 4
+# from .notifications.telegram import TelegramNotifierAdapter  # TODO: removed in Task 4
 
 # Add container label to log format for Grafana filtering
 container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "trade_orchestrator"
@@ -46,12 +46,13 @@ async def main():
     # Inicialización centralizada del notificador Telegram
     # Forzar habilitación de notificaciones
     notifier_adapter = None
-    try:
-        tg_notifier = RemoteTelegramNotifier(config.get("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
-        notifier_adapter = TelegramNotifierAdapter(tg_notifier)
-        log.info("TelegramNotifierAdapter initialized (forced enable)")
-    except Exception as e:
-        log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
+    # TODO: Telegram notifier removed in Task 4, will be replaced with N8nNotifierAdapter in Task 5-6
+    # try:
+    #     tg_notifier = RemoteTelegramNotifier(config.get("TELEGRAM_INGESTOR_URL", "http://telegram_ingestor:8000"))
+    #     notifier_adapter = TelegramNotifierAdapter(tg_notifier)
+    #     log.info("TelegramNotifierAdapter initialized (forced enable)")
+    # except Exception as e:
+    #     log.error(f"Failed to initialize TelegramNotifierAdapter: {e}")
 
     # # Enviar mensaje de prueba al iniciar
     # try:

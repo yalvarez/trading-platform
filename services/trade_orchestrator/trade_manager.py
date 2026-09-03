@@ -1,6 +1,6 @@
 from .trade_utils import pips_to_price, safe_comment, valor_pip, calcular_sl_por_pnl, calcular_volumen_parcial, calcular_trailing_retroceso, calcular_sl_default
 from .mt5_executor import MT5Executor
-from .notifications.telegram import TelegramNotifierAdapter
+# from .notifications.telegram import TelegramNotifierAdapter  # TODO: removed in Task 4, will be rewritten in Task 5-6
 import asyncio
 import time
 import re
@@ -502,7 +502,9 @@ class TradeManager:
     # ----------------------------
     def _notify_bg(self, account: dict, message: str):
         # Centraliza notificaciones Telegram usando chat_id
-         notifier = TelegramNotifierAdapter(self.notifier)
+        # TODO: rewritten in Task 5-6 to use N8nNotifierAdapter
+        pass
+        # notifier = TelegramNotifierAdapter(self.notifier)
         # import asyncio
         # chat_id = account.get("chat_id")
         # if chat_id:
@@ -513,8 +515,10 @@ class TradeManager:
         #     logging.getLogger("trade_orchestrator.trade_manager").warning(f"No chat_id for account {account_name}, notificación no enviada: {message}")
 
     async def notify_trade_event(self, event: str, **kwargs):
-        notifier = TelegramNotifierAdapter(self.notifier)
-        await notifier.notify_trade_event(event, **kwargs)
+        # TODO: rewritten in Task 5-6 to use N8nNotifierAdapter
+        # notifier = TelegramNotifierAdapter(self.notifier)
+        # await notifier.notify_trade_event(event, **kwargs)
+        pass
 
     def update_trade_signal(self, *, ticket: int, tps: list[float], planned_sl: Optional[float], provider_tag: Optional[str] = None):
         t = self.trades.get(int(ticket))

@@ -12,7 +12,7 @@ import logging
 log = logging.getLogger("trade_orchestrator.mt5_executor")
 
 from .trade_utils import safe_comment, pips_to_price, calcular_lotaje
-from .notifications.telegram import TelegramNotifierAdapter
+# from .notifications.telegram import TelegramNotifierAdapter  # TODO: removed in Task 4, will be cleaned up in Task 8
 
 @dataclass
 class MT5OpenResult:
