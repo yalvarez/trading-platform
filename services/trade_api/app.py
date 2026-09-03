@@ -6,6 +6,7 @@ memoria de trade_orchestrator: opera MT5 directamente via MT5Client.
 Ver docs/superpowers/specs/2026-09-03-tradepulse-only-simplification-design.md
 seccion 6.
 """
+import hmac
 import logging
 import os
 
@@ -23,14 +24,19 @@ app = FastAPI(title="trade_api")
 
 TRADE_API_KEY = os.getenv("TRADE_API_KEY", "")
 if not TRADE_API_KEY:
-    log.warning("[TRADE_API] TRADE_API_KEY no configurada - endpoints desprotegidos")
+    # Fail closed: this service can open/close/modify real MT5 positions, so it
+    # must never silently run unauthenticated because an env var was forgotten.
+    raise RuntimeError(
+        "TRADE_API_KEY debe estar configurada para iniciar trade_api "
+        "(generar con: openssl rand -hex 32)."
+    )
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 MAGIC = 987654
 
 
 def _check_api_key(api_key: str | None = Depends(_api_key_header)) -> None:
-    if TRADE_API_KEY and api_key != TRADE_API_KEY:
+    if not hmac.compare_digest(api_key or "", TRADE_API_KEY):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key invalida o ausente. Incluir header X-API-Key.")
 
 
