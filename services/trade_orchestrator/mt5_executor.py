@@ -12,7 +12,7 @@ import logging
 log = logging.getLogger("trade_orchestrator.mt5_executor")
 
 from .trade_utils import safe_comment, pips_to_price, calcular_lotaje
-# from .notifications.telegram import TelegramNotifierAdapter  # TODO: removed in Task 4, will be cleaned up in Task 8
+from .notifications.n8n import N8nNotifierAdapter
 
 @dataclass
 class MT5OpenResult:
@@ -20,126 +20,6 @@ class MT5OpenResult:
     errors_by_account: dict[str, str]
 
 class MT5Executor:
-    async def open_runner_trade(self, account: dict, symbol: str, direction: str, volume: float, sl: float, tp: float, provider_tag: str = None):
-        """
-        Abre una posición runner con los parámetros dados (usado en modalidad reentry).
-        Igualada la lógica a open_complete_trade: ajuste de SL, logs de atributos, validación de fill_mode.
-        """
-        client = self._client_for(account)
-        client.symbol_select(symbol, True)
-        name = account.get('name')
-        order_type = 0 if direction.upper() == 'BUY' else 1
-        price = float(client.tick_price(symbol, direction))
-        from services.common.config import Settings
-        from .trade_utils import calcular_sl_respetando_maximo
-        point = float(getattr(client.symbol_info(symbol), "point", 0.0))
-        forced_sl = calcular_sl_respetando_maximo(symbol, price, direction, float(sl), point, Settings.sl_max_pips())
-        # --- Validar y ajustar SL si está demasiado cerca del precio actual ---
-        symbol_info = client.symbol_info(symbol)
-        available_attrs = dir(symbol_info) if symbol_info else []
-        log.debug(f"[RUNNER] SymbolInfo attrs for {symbol}: {available_attrs}")
-        min_stop_raw = None
-        # Robust fill mode detection: try trade_fill_mode, then fill_mode, else None, and never raise
-        fill_mode = None
-        if symbol_info:
-            min_stop_raw = getattr(symbol_info, "stops_level", getattr(symbol_info, "stop_level", 0.0))
-            fill_mode = getattr(symbol_info, "trade_fill_mode", None)
-            if fill_mode is None:
-                fill_mode = getattr(symbol_info, "fill_mode", None)
-        else:
-            min_stop_raw = 0.0
-        min_stop = float(min_stop_raw) * float(getattr(symbol_info, "point", 0.0)) if symbol_info else 0.0
-        log.debug(f"[RUNNER] stops_level={getattr(symbol_info, 'stops_level', None) if symbol_info else None}, stop_level={getattr(symbol_info, 'stop_level', None) if symbol_info else None}, fill_mode={fill_mode}")
-        if min_stop > 0 and abs(price - forced_sl) < min_stop:
-            if direction.upper() == "BUY":
-                adjusted_sl = price - min_stop
-            else:
-                adjusted_sl = price + min_stop
-            log.info(f"[RUNNER][SL-ADJUST] SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
-            self._notify_bg(name, f"⚠️ SL demasiado cerca del precio actual para {name}: SL={forced_sl} price={price} min_stop={min_stop}. Ajustando SL a {adjusted_sl}")
-            forced_sl = round(adjusted_sl, 2 if symbol.upper().startswith("XAU") else 5)
-
-        # --- REFORZAR: No abrir runner si SL es None o 0.0 ---
-        if forced_sl is None or forced_sl == 0.0:
-            log.error(f"[RUNNER] Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol} en cuenta {name}. No se abrirá la operación.")
-            self._notify_bg(name, f"❌ Operación runner ABORTADA: SL inválido (None o 0.0) para {symbol}. No se abrirá la operación.")
-            return None
-        # --- Preparar y loguear la orden ---
-        req = {
-            "action": 1,  # TRADE_ACTION_DEAL
-            "symbol": symbol,
-            "volume": float(volume),
-            "type": order_type,
-            "price": price,
-            "sl": forced_sl,
-            "tp": float(tp),
-            "deviation": int(getattr(self, 'default_deviation', 20)),
-            "magic": int(self.magic),
-            "comment": self._safe_comment(f"{provider_tag or ''}-REENTRY"),
-            "type_time": 0,
-        }
-        log.debug(f"[RUNNER][ORDER_PREP] account={account} | req={req}")
-        res = await self._best_filling_order_send(client, symbol, req, name)
-        if res and getattr(res, "retcode", None) in (10009, 10008):
-            self._notify_bg(name, f"✅ Runner abierto correctamente | Symbol: {symbol} | Vol: {volume} | SL: {forced_sl} | TP: {tp}")
-            return res
-        else:
-            self._notify_bg(name, f"❌ Error al abrir runner | Symbol: {symbol} | Vol: {volume} | SL: {forced_sl} | TP: {tp} | retcode={getattr(res,'retcode',None)}")
-            return res
-    async def early_partial_close(
-        self,
-        account: dict,
-        ticket: int,
-        percent: float = 0.5,
-        provider_tag: str = None,
-        reason: str = ""
-    ) -> bool:
-        """
-        Cierra un porcentaje de la posición indicada y mueve el SL a break-even (BE).
-        percent: fracción a cerrar (0.5 = mitad, 0.25 = 25%, etc)
-        Pensado para señales especiales (ej: Hannah) donde se requiere proteger capital antes de TP1.
-        """
-        client = self._client_for(account)
-        pos_list = client.positions_get(ticket=int(ticket))
-        if not pos_list:
-            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | No se encontró la posición")
-            return False
-        pos = pos_list[0]
-        symbol = pos.symbol
-        volume = float(getattr(pos, "volume", 0.0))
-        if volume <= 0.0:
-            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | Volumen inválido: {volume}")
-            return False
-        close_volume = round(volume * percent, 2 if symbol.upper().startswith("XAU") else 2)
-        if close_volume < 0.01:
-            self._notify_bg(account["name"], f"❌ early_partial_close falló | Ticket: {int(ticket)} | Volumen a cerrar demasiado pequeño: {close_volume}")
-            return False
-        # 1. Cerrar el porcentaje de la posición usando la misma lógica de fill mode que apertura
-        req_close = {
-            "action": 1,  # TRADE_ACTION_DEAL
-            "position": int(ticket),
-            "symbol": symbol,
-            "volume": close_volume,
-            "type": 1 if int(getattr(pos, "type", 0)) == 0 else 0,  # Si es buy, vender; si es sell, comprar
-            "price": float(getattr(pos, "price_current", 0.0)),
-            "deviation": int(self.default_deviation),
-            "magic": int(self.magic),
-            "comment": self._safe_comment(f"{provider_tag or ''}-PARTBE-{reason}"),
-            "type_time": 0,
-        }
-        res_close = await self._best_filling_order_send(client, symbol, req_close, account.get('name'))
-        ok_close = bool(res_close and getattr(res_close, "retcode", None) in (10009, 10008))
-        if not ok_close:
-            self._notify_bg(account["name"], f"❌ early_partial_close: cierre parcial falló | Ticket: {int(ticket)} | retcode={getattr(res_close,'retcode',None)} {getattr(res_close,'comment',None)}")
-            return False
-        # 2. Mover SL a BE
-        ok_be = await self._apply_be(account, ticket, reason=f"PARTBE-{reason}")
-        if ok_be:
-            self._notify_bg(account["name"], f"✅ early_partial_close: {percent*100:.0f}% cerrado y SL movido a BE | Ticket: {int(ticket)}")
-            return True
-        else:
-            self._notify_bg(account["name"], f"⚠️ early_partial_close: {percent*100:.0f}% cerrado pero SL no pudo moverse a BE | Ticket: {int(ticket)}")
-            return False
     def _notify_bg(self, account_name, message):
         # Notifica por Telegram si el adaptador está disponible
         try:
@@ -230,75 +110,6 @@ class MT5Executor:
         """
         from .mt5_pool import MT5ClientPool
         return MT5ClientPool.get_for_account(account)
-
-    async def _apply_be(self, account: dict, ticket: int, be_offset_pips: Optional[float] = None, reason: str = "") -> bool:
-        """
-        Aplica break-even (BE) modificando el SL de la posición indicada.
-        Loguea el SL actual antes y después, el SL propuesto y el stop_level del símbolo.
-        """
-        import logging
-        client = self._client_for(account)
-        pos_list = client.positions_get(ticket=int(ticket))
-        if not pos_list:
-            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)} | No se encontró la posición")
-            return False
-        pos = pos_list[0]
-        symbol = pos.symbol
-        info = client.symbol_info(symbol)
-        if not info:
-            self._notify_bg(account["name"], f"❌ BE falló | Ticket: {int(ticket)} | No se encontró info de símbolo")
-            return False
-        point = float(getattr(info, "point", 0.0))
-        entry = float(getattr(pos, "price_open", 0.0))
-        is_buy = (int(getattr(pos, "type", 0)) == 0)
-        sl_actual = float(getattr(pos, "sl", 0.0))
-        stop_level = float(getattr(info, "stops_level", 0.0)) * point
-        # Offset en pips
-        off_pips = float(getattr(self, "be_offset_pips", 0.0) if be_offset_pips is None else be_offset_pips)
-        from .trade_utils import calcular_be_price
-        be_sl = calcular_be_price(entry, "BUY" if is_buy else "SELL", off_pips, point, symbol)
-        logging.debug(f"[BE] account={account['name']} ticket={ticket} symbol={symbol} SL actual={sl_actual} SL BE propuesto={be_sl} stop_level={stop_level} entry={entry} is_buy={is_buy}")
-        # Validar que el nuevo SL cumple con el mínimo stop level
-        price_current = float(getattr(pos, "price_current", 0.0))
-        if is_buy:
-            min_sl = price_current - stop_level
-            if be_sl > min_sl:
-                logging.info(f"[BE] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), mínimo permitido: {min_sl}. Ajustando SL a {min_sl}")
-                be_sl = round(min_sl, 2 if symbol.upper().startswith("XAU") else 5)
-        else:
-            max_sl = price_current + stop_level
-            if be_sl < max_sl:
-                logging.info(f"[BE] SL BE ({be_sl}) está demasiado cerca del precio actual ({price_current}), máximo permitido: {max_sl}. Ajustando SL a {max_sl}")
-                be_sl = round(max_sl, 2 if symbol.upper().startswith("XAU") else 5)
-
-        req = {
-            "action": 6,  # TRADE_ACTION_SLTP
-            "position": int(ticket),
-            "sl": float(be_sl),
-        }
-
-    def find_recent_fast_trade(trades, symbol, account_name, direction, max_age_seconds=60):
-            """
-            Busca el trade FAST más reciente para symbol, cuenta y dirección, dentro de la ventana de tiempo.
-            Ignora SL, TP y provider_tag.
-            """
-            from datetime import datetime
-            now = datetime.utcnow()
-            candidates = []
-            for t in trades:
-                if (
-                    t.get('symbol') == symbol
-                    and t.get('account_name') == account_name
-                    and t.get('direction') == direction
-                ):
-                    opened_at = t.get('opened_at')
-                    if opened_at:
-                        age = (now - opened_at).total_seconds()
-                        if age <= max_age_seconds:
-                            candidates.append((age, t))
-            if not candidates:
-                return None
-            return sorted(candidates, key=lambda x: x[0])[0][1]
 
     async def _best_filling_order_send(self, client, symbol, req: dict, account_name: str = None):
         """
