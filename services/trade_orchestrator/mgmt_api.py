@@ -7,6 +7,7 @@ consumer de Redis Streams de trade_orchestrator, en el mismo proceso,
 porque necesita el TradeManager en memoria para resolver el grupo
 activo por simbolo.
 """
+import hmac
 import os
 import logging
 from typing import Optional
@@ -36,10 +37,16 @@ def create_mgmt_app(trade_manager) -> FastAPI:
     app = FastAPI(title="trade_orchestrator-mgmt")
     action_api_key = os.getenv("N8N_ACTION_API_KEY", "")
     if not action_api_key:
-        log.warning("[MGMT_API] N8N_ACTION_API_KEY no configurada - endpoint desprotegido")
+        # Fail closed: an unauthenticated management-action endpoint can open/close
+        # real MT5 positions, so refuse to start rather than silently serving
+        # unprotected. Set N8N_ACTION_API_KEY (openssl rand -hex 32) before deploying.
+        raise RuntimeError(
+            "N8N_ACTION_API_KEY debe estar configurada para iniciar trade_orchestrator "
+            "(el endpoint /mgmt/action nunca debe correr sin autenticacion)."
+        )
 
     def _check_key(api_key: str | None = Depends(_action_key_header)) -> None:
-        if action_api_key and api_key != action_api_key:
+        if not hmac.compare_digest(api_key or "", action_api_key):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key invalida o ausente.")
 
     @app.post("/mgmt/action", dependencies=[Depends(_check_key)])
