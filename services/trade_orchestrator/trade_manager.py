@@ -194,3 +194,89 @@ class TradeManager:
             return None
         newest = max(candidates, key=lambda t: t.opened_ts)
         return newest.group_id
+
+    async def run_forever(self) -> None:
+        LOOP_INTERVAL = 0.1
+        log.info("[TM] run_forever iniciado")
+        while True:
+            loop_start = asyncio.get_event_loop().time()
+            accounts = self.config_provider.get_accounts() if self.config_provider else self.mt5.accounts
+            accounts = [a for a in accounts if a.get("active")]
+            if accounts:
+                await asyncio.gather(*(self._tick_once_account(a) for a in accounts))
+            elapsed = asyncio.get_event_loop().time() - loop_start
+            remaining = LOOP_INTERVAL - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+    async def _tick_once_account(self, account) -> None:
+        account = self._ensure_account_dict(account)
+        if not account:
+            return
+        try:
+            client = self.mt5._client_for(account)
+            positions = client.positions_get() or []
+            pos_by_ticket = {p.ticket: p for p in positions}
+
+            # Detect closed tickets for this account (TP1 hit, SL hit, or manual close)
+            for ticket in [t for t, mt in self.trades.items() if mt.account_name == account["name"]]:
+                if ticket in pos_by_ticket:
+                    continue
+                closed_trade = self.trades.pop(ticket)
+                if closed_trade.leg == "tp1":
+                    await self._on_tp1_leg_closed(account, client, closed_trade)
+                else:
+                    await self._notify("runner_closed", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol)
+
+            ACTIVE_TRADES.set(len(self.trades))
+
+            for ticket, t in [(tk, mt) for tk, mt in self.trades.items() if mt.account_name == account["name"]]:
+                pos = pos_by_ticket.get(ticket)
+                if not pos or t.leg != "runner" or not t.be_applied:
+                    continue
+                await self._apply_trailing(account, client, t, pos)
+
+        except Exception as e:
+            log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)
+
+    async def _on_tp1_leg_closed(self, account, client, tp1_leg: ManagedTrade) -> None:
+        """TP1 hit -> mueve el runner del mismo group_id a BE (dual-TP spec seccion 4)."""
+        TP1_HITS.inc()
+        runner = next((t for t in self.trades.values() if t.group_id == tp1_leg.group_id and t.leg == "runner"), None)
+        if not runner:
+            return
+        await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
+        runner.be_applied = True
+        await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
+
+    async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str) -> bool:
+        req = {"action": 6, "position": runner.ticket, "sl": float(new_sl)}
+        res = client.order_send(req)
+        ok = bool(res and getattr(res, "retcode", None) == 10009)
+        if not ok:
+            log.error("[TM] fallo moviendo SL runner=%s reason=%s", runner.ticket, reason)
+        return ok
+
+    async def _apply_trailing(self, account, client, runner: ManagedTrade, pos) -> None:
+        """
+        Trailing proporcional sin techo (dual-TP spec seccion 4):
+        unit = tp2_price - tp1_price (constante); peak = maximo multiplo de unit
+        alcanzado desde tp1_price (nunca decrece); SL = tp1_price + (peak*unit)/3.
+        """
+        if runner.tp1_price is None or runner.tp2_price is None:
+            return
+        is_buy = runner.direction == "BUY"
+        unit = (runner.tp2_price - runner.tp1_price) if is_buy else (runner.tp1_price - runner.tp2_price)
+        if unit <= 0:
+            return
+        current = float(pos.price_current)
+        advance = (current - runner.tp1_price) if is_buy else (runner.tp1_price - current)
+        multiple = advance / unit
+        if multiple <= runner.peak_multiple:
+            return  # never decreases
+        runner.peak_multiple = multiple
+        sl_offset = (multiple * unit) / 3.0
+        new_sl = runner.tp1_price + sl_offset if is_buy else runner.tp1_price - sl_offset
+        ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
+        if ok:
+            await self._notify("trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl)

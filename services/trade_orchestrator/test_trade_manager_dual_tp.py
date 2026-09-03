@@ -116,3 +116,91 @@ async def test_find_active_group_for_symbol_returns_most_recent():
 
     found_none = tm.find_active_group_for_symbol("EURUSD")
     assert found_none is None
+
+
+@pytest.mark.asyncio
+async def test_tick_moves_runner_sl_to_be_when_tp1_leg_closes():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    # Simulate TP1 leg having closed (no longer in MT5 positions)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    del sim.positions[tp1_leg.ticket]
+
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6  # moved to entry price (BE)
+    assert tm.trades[runner_leg.ticket].be_applied is True
+    assert tp1_leg.ticket not in tm.trades
+
+
+@pytest.mark.asyncio
+async def test_trailing_raises_runner_sl_proportionally_to_peak():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+
+    # unit = tp2 - tp1 = 20. Move price to 60% of unit past tp1 = 2510 + 12 = 2522
+    sim.positions[runner_leg.ticket]["price_current"] = 2522.0
+    sim.price = 2522.0
+    await tm._tick_once_account(ACCOUNT)
+
+    # peak_multiple = 0.6, SL = tp1 + (0.6 * 20)/3 = 2510 + 4 = 2514
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2514.0) < 1e-6
+    assert abs(tm.trades[runner_leg.ticket].peak_multiple - 0.6) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_trailing_sl_never_decreases_on_price_pullback():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2522.0  # peak 60%
+    sim.price = 2522.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_at_peak = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2515.0  # pulls back to 25%
+    sim.price = 2515.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_after_pullback = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+
+    assert sl_after_pullback == sl_at_peak  # never decreases
+    assert tm.trades[runner_leg.ticket].peak_multiple == 0.6  # peak retained
+
+
+@pytest.mark.asyncio
+async def test_trailing_extrapolates_unit_beyond_tp2():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    # price at 150% of unit past tp1 = 2510 + 30 = 2540 (beyond tp2=2530)
+    sim.positions[runner_leg.ticket]["price_current"] = 2540.0
+    sim.price = 2540.0
+    await tm._tick_once_account(ACCOUNT)
+
+    # SL = tp1 + (1.5 * 20)/3 = 2510 + 10 = 2520
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2520.0) < 1e-6
