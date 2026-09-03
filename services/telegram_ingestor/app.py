@@ -24,20 +24,12 @@ async def main():
                 log.warning(f"[WATCHDOG] ⚠️ No se reciben mensajes desde hace {int(now-last)}s. Posible desconexión o bloqueo.")
             await asyncio.sleep(600)  # Solo cada 10 minutos
 
-    import json
-    from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s["redis_url"])
 
     api_id = int(s["TG_API_ID"])
     api_hash = s["TG_API_HASH"]
     phone = s["TG_PHONE"]
-    try:
-        channels_config = json.loads(CHANNELS_CONFIG_JSON)
-        chats = list(channels_config.keys())
-    except Exception as e:
-        log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
-        chats = []
 
     client = TelegramClient("telegram_ingestor", api_id, api_hash)
 
@@ -48,9 +40,6 @@ async def main():
             chat_id = str(event.chat_id)
             text = (event.raw_text or "").strip()
             log.debug(f"[HANDLER][RAW] Recibido: chat_id={chat_id} id={event.id} tipo={type(event.message).__name__} texto='{text[:80]}...'")
-            if chats and chat_id not in chats:
-                log.warning(f"[CHAT_FILTER] Ignorado chat_id={chat_id} (no está en chats). Lista de chats permitidos: {chats}")
-                return
             if not text:
                 log.warning(f"[HANDLER] Mensaje vacío ignorado: chat_id={chat_id} id={event.id}")
                 return
