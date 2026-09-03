@@ -166,23 +166,41 @@ Response: {"status": "closed", "group_id": 12345}
 
 ## 📱 **Trade Notifications**
 
-If `N8N_WEBHOOK_URL` is configured, all trade events are POSTed as JSON:
+If `N8N_WEBHOOK_URL` is configured, trade lifecycle events are POSTed as JSON. The payload shape
+varies by `event`; the fields shown below are the exact kwargs each call site sends (source:
+`services/trade_orchestrator/trade_manager.py`, `_notify()` call sites) — there is no single
+fixed schema across all events.
 
+**`group_opened`** (a signal opened the tp1/runner leg pair):
 ```json
 {
-  "event": "trade_opened",
-  "account_name": "My MT5 Account",
-  "symbol": "XAUUSD",
-  "ticket": 12345,
+  "event": "group_opened",
   "group_id": 12345,
+  "symbol": "XAUUSD",
   "direction": "BUY",
-  "entry_price": 2500.50,
-  "sl_price": 2490.00,
-  "tp_prices": [2515.00, 2530.00],
-  "lot": 0.01,
-  "timestamp": "2026-09-03T15:30:45Z"
+  "tp1_ticket": 100001,
+  "runner_ticket": 100002,
+  "sl": 2490.0,
+  "tp1": 2515.0,
+  "tp2": 2530.0
 }
 ```
+
+**`tp1_hit`** (tp1 leg closed, runner moved to BE):
+```json
+{"event": "tp1_hit", "group_id": 12345, "symbol": "XAUUSD", "runner_ticket": 100002}
+```
+
+**`trailing_updated`** (runner's SL advanced):
+```json
+{"event": "trailing_updated", "group_id": 12345, "ticket": 100002, "peak_multiple": 1.5, "new_sl": 2520.0}
+```
+
+Other events use the same pattern (an `event` name plus whatever fields are relevant to that
+event — `group_updated`, `runner_closed`, `open_aborted`, `open_failed`,
+`mgmt_close_now`/`mgmt_move_sl_be_applied`/`mgmt_move_sl_be_already_satisfied`/`mgmt_note_sl_hit`).
+There is no `trade_opened` event and no fixed `entry_price`/`sl_price`/`tp_prices`/`lot` schema —
+read `_notify(...)` call sites in `trade_manager.py` for the authoritative field list per event.
 
 Optional token: `N8N_WEBHOOK_TOKEN` in Authorization header.
 
