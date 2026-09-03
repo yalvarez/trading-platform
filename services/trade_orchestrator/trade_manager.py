@@ -280,3 +280,62 @@ class TradeManager:
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
             await self._notify("trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl)
+
+    async def apply_mgmt_action(self, *, action: str, symbol: str, raw_text: str, correction: Optional[dict]) -> dict:
+        """
+        Ejecuta una decision de /mgmt/action (dual-TP spec seccion 5.2).
+        Resuelve el grupo activo mas reciente para `symbol` y aplica la accion.
+        """
+        group_id = self.find_active_group_for_symbol(symbol)
+        if group_id is None:
+            log.info("[TM][MGMT] no_active_trade symbol=%s action=%s text=%r", symbol, action, raw_text[:80])
+            return {"status": "no_active_trade"}
+
+        legs = [t for t in self.trades.values() if t.group_id == group_id]
+        account = self._ensure_account_dict(legs[0].account_name)
+        client = self.mt5._client_for(account)
+
+        if action == "close_now":
+            for t in list(legs):
+                client.partial_close(account, t.ticket, 100)
+                self.trades.pop(t.ticket, None)
+            await self._notify("mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text)
+            return {"status": "closed", "group_id": group_id}
+
+        if action == "move_sl_be_now":
+            runner = next((t for t in legs if t.leg == "runner"), None)
+            if not runner:
+                return {"status": "no_active_trade"}
+            pos_list = client.positions_get(ticket=runner.ticket)
+            current_sl = float(pos_list[0].sl) if pos_list else None
+            be_price = runner.entry_price
+            is_buy = runner.direction == "BUY"
+            worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
+            if not worse_than_be:
+                await self._notify("mgmt_move_sl_be_already_satisfied", group_id=group_id, symbol=symbol)
+                return {"status": "already_satisfied", "group_id": group_id}
+            ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
+            if ok:
+                runner.be_applied = True
+                await self._notify("mgmt_move_sl_be_applied", group_id=group_id, symbol=symbol, raw_text=raw_text)
+                return {"status": "applied", "group_id": group_id}
+            return {"status": "failed", "group_id": group_id}
+
+        if action == "note_sl_hit":
+            await self._notify("mgmt_note_sl_hit", group_id=group_id, symbol=symbol, raw_text=raw_text)
+            return {"status": "noted", "group_id": group_id}
+
+        if action == "signal_correction":
+            if not correction or correction.get("field") not in ("sl", "tp1", "tp2"):
+                return {"status": "invalid_correction"}
+            field = correction["field"]
+            value = float(correction["value"])
+            kwargs = {"sl": None, "tp1": None, "tp2": None}
+            kwargs[field] = value
+            await self.update_group_signal(group_id, **kwargs)
+            return {"status": "applied", "group_id": group_id}
+
+        if action == "ignore":
+            return {"status": "ignored"}
+
+        return {"status": "unknown_action"}

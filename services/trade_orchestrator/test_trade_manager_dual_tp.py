@@ -204,3 +204,111 @@ async def test_trailing_extrapolates_unit_beyond_tp2():
     # SL = tp1 + (1.5 * 20)/3 = 2510 + 10 = 2520
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
     assert abs(runner_pos.sl - 2520.0) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_closes_both_legs_before_tp1():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="Close now", correction=None)
+
+    assert result["status"] == "closed"
+    remaining = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_no_active_trade_returns_no_active_trade():
+    sim = SimuladorMT5()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    result = await tm.apply_mgmt_action(action="close_now", symbol="EURUSD", raw_text="Close now", correction=None)
+
+    assert result["status"] == "no_active_trade"
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_forces_be_when_worse():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    # SL still at original 2490 (TP1 not hit yet) — worse than BE (2500 entry)
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="adjust sl to entry", correction=None)
+
+    assert result["status"] == "applied"
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_noop_when_already_better():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
+    sim.positions[runner_leg.ticket]["price_current"] = 2522.0
+    sim.price = 2522.0
+    await tm._tick_once_account(ACCOUNT)  # trailing raises SL above BE
+    sl_before = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_before > 2500.0
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="secure be", correction=None)
+
+    assert result["status"] == "already_satisfied"
+    sl_after = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_after == sl_before  # unchanged, never reduced
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_note_sl_hit_does_not_touch_mt5():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    legs_before = {t.ticket: (sim.positions_get(ticket=t.ticket)[0].sl) for t in tm.trades.values() if t.group_id == group_id}
+
+    result = await tm.apply_mgmt_action(action="note_sl_hit", symbol="XAUUSD", raw_text="HIT SL, recovery incoming", correction=None)
+
+    assert result["status"] == "noted"
+    for ticket, sl_before in legs_before.items():
+        assert sim.positions_get(ticket=ticket)[0].sl == sl_before
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_signal_correction_updates_tp1_on_mt5_and_tp2_reference_only():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="signal_correction", symbol="XAUUSD", raw_text="TP 2 IS 4687 Correction", correction={"field": "tp2", "value": 4687.0})
+
+    assert result["status"] == "applied"
+    assert tm.trades[runner_leg.ticket].tp2_price == 4687.0
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.tp != 4687.0  # never sent to MT5 for the runner leg
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_ignore_is_a_noop():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    result = await tm.apply_mgmt_action(action="ignore", symbol="XAUUSD", raw_text="spam your feedbacks", correction=None)
+
+    assert result["status"] == "ignored"
