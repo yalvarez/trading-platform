@@ -161,6 +161,24 @@ class TradeManager:
         client = self.mt5._client_for(account)
 
         for t in legs:
+            # Rescale peak_multiple to the new unit BEFORE overwriting tp1/tp2_price,
+            # so a runner already trailing/BE'd doesn't get its progress stranded when
+            # tp1/tp2 change (unit = tp2_price - tp1_price changes underneath it).
+            if t.leg == "runner" and (tp1 is not None or tp2 is not None) and t.peak_multiple > 0 \
+                    and t.tp1_price is not None and t.tp2_price is not None:
+                is_buy = t.direction == "BUY"
+                old_unit = (t.tp2_price - t.tp1_price) if is_buy else (t.tp1_price - t.tp2_price)
+                new_tp1 = float(tp1) if tp1 is not None else t.tp1_price
+                new_tp2 = float(tp2) if tp2 is not None else t.tp2_price
+                new_unit = (new_tp2 - new_tp1) if is_buy else (new_tp1 - new_tp2)
+                if old_unit > 0 and new_unit > 0:
+                    # Absolute price distance from the OLD tp1 at the old peak, re-based
+                    # onto the new tp1, then re-expressed as a multiple of the new unit.
+                    old_peak_distance = t.peak_multiple * old_unit
+                    tp1_shift = new_tp1 - t.tp1_price
+                    new_peak_distance = old_peak_distance - (tp1_shift if is_buy else -tp1_shift)
+                    t.peak_multiple = max(0.0, new_peak_distance / new_unit)
+
             if sl is not None:
                 t.planned_sl = float(sl)
             if tp1 is not None:
@@ -170,6 +188,21 @@ class TradeManager:
 
             new_sl = t.planned_sl
             new_tp = t.tp1_price if (t.leg == "tp1" and t.tp1_price is not None) else 0.0
+
+            # Never regress a live SL that's already better than the new planned_sl
+            # (e.g. BE-applied or trailed forward) — only write an improvement, or
+            # keep the current live SL when the leg has data and it's not an
+            # improvement (still send tp updates for the tp1 leg unaffected).
+            is_buy = t.direction == "BUY"
+            pos_list = client.positions_get(ticket=t.ticket)
+            current_sl = float(pos_list[0].sl) if pos_list else None
+            if current_sl is not None:
+                new_is_better = (new_sl > current_sl) if is_buy else (new_sl < current_sl)
+                if not new_is_better:
+                    log.info("[TM][UPDATE] SL no mejora, se conserva el SL actual | ticket=%s leg=%s current_sl=%s new_sl=%s",
+                              t.ticket, t.leg, current_sl, new_sl)
+                    new_sl = current_sl
+
             req = {
                 "action": 6,
                 "position": t.ticket,
@@ -192,7 +225,11 @@ class TradeManager:
         candidates = [t for t in self.trades.values() if t.symbol == symbol]
         if not candidates:
             return None
-        newest = max(candidates, key=lambda t: t.opened_ts)
+        # Tie-break on group_id (an incrementing counter) since time.time() has
+        # coarse resolution on some platforms (e.g. ~15.6ms on Windows) and two
+        # groups opened back-to-back can share an opened_ts — max() would
+        # otherwise return the first (older) tied element.
+        newest = max(candidates, key=lambda t: (t.opened_ts, t.group_id))
         return newest.group_id
 
     async def run_forever(self) -> None:
@@ -244,6 +281,10 @@ class TradeManager:
         TP1_HITS.inc()
         runner = next((t for t in self.trades.values() if t.group_id == tp1_leg.group_id and t.leg == "runner"), None)
         if not runner:
+            return
+        if runner.entry_price is None:
+            log.error("[TM] no se puede aplicar BE: runner=%s no tiene entry_price registrado (group_id=%s)",
+                      runner.ticket, tp1_leg.group_id)
             return
         await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
         runner.be_applied = True
@@ -306,6 +347,10 @@ class TradeManager:
             runner = next((t for t in legs if t.leg == "runner"), None)
             if not runner:
                 return {"status": "no_active_trade"}
+            if runner.entry_price is None:
+                log.error("[TM][MGMT] move_sl_be_now: runner=%s no tiene entry_price registrado (group_id=%s)",
+                          runner.ticket, group_id)
+                return {"status": "failed", "group_id": group_id, "reason": "no_entry_price"}
             pos_list = client.positions_get(ticket=runner.ticket)
             current_sl = float(pos_list[0].sl) if pos_list else None
             be_price = runner.entry_price

@@ -312,3 +312,119 @@ async def test_apply_mgmt_action_ignore_is_a_noop():
     result = await tm.apply_mgmt_action(action="ignore", symbol="XAUUSD", raw_text="spam your feedbacks", correction=None)
 
     assert result["status"] == "ignored"
+
+
+# --- Review fix 1: update_group_signal must not regress a trailed/BE'd SL ---
+
+@pytest.mark.asyncio
+async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing_still_progresses():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
+
+    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = 2510 + 10 = 2520
+    sim.positions[runner_leg.ticket]["price_current"] = 2540.0
+    sim.price = 2540.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_after_trailing = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert abs(sl_after_trailing - 2520.0) < 1e-6
+
+    # A signal_correction that only touches tp2 must NOT regress the live SL
+    # back down to the original planned_sl (2490).
+    result = await tm.apply_mgmt_action(
+        action="signal_correction", symbol="XAUUSD", raw_text="TP2 correction",
+        correction={"field": "tp2", "value": 4687.0},
+    )
+    assert result["status"] == "applied"
+    sl_after_correction = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_after_correction == sl_after_trailing  # unchanged, never regressed
+    assert sl_after_correction >= 2500.0  # still at/above BE, not stranded below entry
+
+    # Trailing must still be able to progress afterward with a further price move.
+    # unit is now huge (tp2=4687, tp1=2510), so even a further advance keeps the
+    # multiple tiny — but peak_multiple must have been rescaled (not stuck at the
+    # old 1.5), so a genuine further advance still raises SL further.
+    sim.positions[runner_leg.ticket]["price_current"] = 2600.0
+    sim.price = 2600.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_after_further_move = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_after_further_move >= sl_after_correction  # trailing not dead/frozen
+
+
+@pytest.mark.asyncio
+async def test_update_group_signal_skips_sl_write_when_current_is_already_better():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500 (better than planned_sl=2490)
+
+    # Directly call update_group_signal with the (unchanged) original sl=2490 —
+    # this must not regress the runner's live SL of 2500 back down.
+    await tm.update_group_signal(group_id, sl=2490.0, tp1=None, tp2=None)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+
+
+# --- Review fix 2: find_active_group_for_symbol must tie-break on group_id ---
+
+@pytest.mark.asyncio
+async def test_find_active_group_for_symbol_tie_breaks_on_group_id_when_opened_ts_equal():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    assert g2 > g1
+
+    # Force an identical opened_ts on every trade in both groups, simulating
+    # coarse timer resolution (e.g. ~15.6ms on Windows) causing a tie.
+    same_ts = 12345.0
+    for t in tm.trades.values():
+        t.opened_ts = same_ts
+
+    found = tm.find_active_group_for_symbol("XAUUSD")
+    assert found == g2  # the higher group_id (the actually-newer group) wins
+
+
+# --- Review fix 3: entry_price=None must not raise ---
+
+@pytest.mark.asyncio
+async def test_move_sl_be_now_with_missing_entry_price_returns_failed_not_raise():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    runner_leg.entry_price = None
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="be now", correction=None)
+
+    assert result["status"] == "failed"
+    assert result.get("reason") == "no_entry_price"
+
+
+@pytest.mark.asyncio
+async def test_on_tp1_leg_closed_with_missing_entry_price_does_not_raise():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    runner_leg.entry_price = None
+    del sim.positions[tp1_leg.ticket]
+
+    # Must not raise even though runner.entry_price is None.
+    await tm._tick_once_account(ACCOUNT)
+
+    assert tm.trades[runner_leg.ticket].be_applied is False  # BE was skipped, not crashed through
