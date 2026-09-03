@@ -51,6 +51,24 @@ class SimuladorMT5:
             'volume_min': 0.01,
         })()
 
+    def symbol_select(self, symbol, enable=True):
+        return True
+
+    def tick_price(self, symbol, direction):
+        """Devuelve el precio simulado actual (ask/bid no se distinguen en este simulador)."""
+        return float(self.price)
+
+    def partial_close(self, account, ticket, percent):
+        """Cierra (parcial o totalmente) una posicion simulada. Si percent>=100, elimina la posicion."""
+        pos = self.positions.get(ticket)
+        if not pos:
+            return False
+        if percent >= 100:
+            del self.positions[ticket]
+        else:
+            pos['volume'] = max(0.0, float(pos.get('volume', 0.0)) * (1 - percent / 100.0))
+        return True
+
 # Ejemplo de test de gestión con el simulador
 
 def test_be_aplicado():
