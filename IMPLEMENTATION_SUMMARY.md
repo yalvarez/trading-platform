@@ -71,29 +71,34 @@ Every signal entry opens exactly **2 MT5 positions**:
 ```
 Signal: XAUUSD BUY, Entry 2500, SL 2490, TP1 2515, TP2 2530, Lot 0.01
   ↓
-Position 1 (ticket=12345): tp1_leg=true, lot=0.01
-  - Sell 70% at TP1 (2515)
-  - Remainder: BE to 2500 + 1pip, then trail by 15 pips
-  - Expected close: at TP1 or via trailing
+Position 1 (ticket=12345): leg="tp1", lot=0.01
+  - Closes volume at TP1 (2515) — no manual action needed
+  - When TP1 closes, triggers BE on the runner leg
 
-Position 2 (ticket=12346): tp1_leg=false, lot=0.01, group_id=12345
+Position 2 (ticket=12346): leg="runner", lot=0.01, group_id=12345
   - No fixed TP close
-  - Trail from entry with proportional drawdown (50% of peak gain)
-  - Expected close: via trailing when price retraces significantly
+  - After BE is applied, follows proportional trailing formula
+  - Expected close: via trailing as price advances and retraces
 ```
 
 **Group ID:** Both positions share the first ticket's ID for coordinated management.
 
-**Breakeven Logic (TP1 leg only):**
-- Triggered when TP1 is hit and 70% volume has closed
-- SL moves to entry_price + BREAKEVEN_OFFSET_PIPS
-- Mechanical, non-configurable per-account
+**Breakeven Logic (runner leg only):**
+- Triggered when the **TP1 leg closes** (TP1 is hit and the TP1 position fully closes at TP1 price)
+- Runner leg's SL moves to **exactly** `entry_price` (no offset, no percentage)
+- This happens once per group, automatically
+- After BE, the trailing formula takes over
 
-**Trailing Logic (mechanical loop, both legs):**
-- Runner leg: trail = entry_price + (peak_price - entry_price) * 0.5 - trailing_pips
-- TP1 remainder: trail = peak_price - trailing_pips
-- Cooldown: minimum 2 seconds between updates
-- Fail-silent on MT5 connection/price errors
+**Trailing Logic (mechanical loop, runner leg only, after BE is applied):**
+- Runs continuously every 2+ seconds (fail-silent on MT5 connection/price errors)
+- **Formula:**
+  - `unit = tp2_price - tp1_price` (BUY); reversed for SELL
+  - `current_advance = current_price - tp1_price` (BUY); reversed for SELL
+  - `multiple = current_advance / unit` (ratio of how many "units" past tp1 the price has moved)
+  - `peak_multiple = max(peak_multiple, multiple)` (only increases, never decreases)
+  - **New SL:** `new_sl = tp1_price + (peak_multiple * unit) / 3`
+- Example: if tp1=2515, tp2=2530 (unit=15), and price hits 2545 (multiple=2.0), then SL trails at 2515 + (2.0 * 15) / 3 = 2525 pips
+- **No cap:** If price runs far past tp2, peak_multiple can exceed 1.0 and the SL keeps trailing proportionally
 
 ---
 
@@ -135,20 +140,27 @@ n8n/Ollama Flow (external)
   ↓ (receives unrecognized text via N8N_INBOUND_WEBHOOK_URL)
   ↓ (processes via LLM, determines action)
   ↓ POST to /mgmt/action with:
-    - action: close_now | move_sl_be_now | note_sl_hit | signal_correction | ignore
-    - symbol: XAUUSD
-    - group_id: 12345
-    - notes: optional context
+    {
+      "action": "close_now" | "move_sl_be_now" | "note_sl_hit" | "signal_correction" | "ignore",
+      "symbol": "XAUUSD",
+      "raw_text": "the original channel message text",
+      "correction": {"field": "sl" | "tp1" | "tp2", "value": 2495.0}  // only for signal_correction
+    }
   ↓
 [trade_orchestrator]
-  ↓ (validates auth X-N8N-Action-Key)
-  ↓ (looks up group in memory)
-  ↓ (applies action: close all, move SL, etc)
+  ↓ (validates auth X-N8N-Action-Key header)
+  ↓ (resolves active group for symbol server-side — caller does NOT supply group_id)
+  ↓ (applies action: close all positions, move SL, adjust TP, etc)
   ↓
-Response: {"status": "ok", "message": "..."}
+Response: {"status": "closed", "group_id": 12345}
 ```
 
 **Auth is fail-closed:** Service refuses to start if `N8N_ACTION_API_KEY` is unset.
+
+**Key differences from naive API:**
+- `group_id` is **resolved server-side** by looking up the most recent active group for the symbol
+- `raw_text` is **required** on every request (audit trail for external decisions)
+- Only `signal_correction` action has a `correction` object; other actions ignore it
 
 ---
 
@@ -181,35 +193,57 @@ Optional token: `N8N_WEBHOOK_TOKEN` in Authorization header.
 **Base:** `http://trade_api:8100`
 **Auth:** `X-API-Key: <TRADE_API_KEY>` (fail-closed)
 
+### List All Trades
 ```bash
-# List all trades
 GET /trades
+```
+Response: `[{ticket, symbol, direction, volume, sl, tp}, ...]`
 
-# Get specific trade
+### Get Specific Trade
+```bash
 GET /trades/{ticket}
+```
+Response: `{ticket, symbol, direction, volume, sl, tp}`
 
-# Open trade
+### Open Trade
+```bash
 POST /trades
 {
   "symbol": "XAUUSD",
   "direction": "BUY",
-  "entry_price": 2500.50,
-  "sl_price": 2490.00,
-  "tp_prices": [2515.00, 2530.00],
-  "lot": 0.01,
-  "group_id": "sig_123"
+  "volume": 0.01,
+  "sl": 2490.0,
+  "tp": 2515.0
 }
+```
+Response: `{ticket, symbol, direction, volume, sl, tp}`
 
-# Update trade (SL/TP)
+**Notes:**
+- `entry_price` is NOT supplied by caller — computed from live MT5 tick price
+- `tp` is a single optional float, NOT an array
+- `volume` is the lot size (NOT `lot`)
+- `sl` and `tp` are single prices (NOT `sl_price`, `tp_prices`)
+- `group_id` is NOT used — trade_api operates independently of trade_orchestrator's group state
+
+### Update Trade (Modify SL/TP)
+```bash
 PATCH /trades/{ticket}
 {
-  "sl_price": 2492.00,
-  "tp_prices": [2520.00, 2535.00]
+  "sl": 2492.0,
+  "tp": 2520.0
 }
+```
+Response: `{ticket, symbol, direction, volume, sl, tp}`
 
-# Close trade
+**Notes:**
+- Both `sl` and `tp` are optional; include only what you want to change
+- Single float values (NOT arrays)
+
+### Close Trade
+```bash
 DELETE /trades/{ticket}
 ```
+Response: `{"status": "closed", "ticket": ticket}`
 
 ---
 

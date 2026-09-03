@@ -47,7 +47,7 @@ docker compose down
 
 ## Management API Testing
 
-**Invoke /mgmt/action endpoint (from host):**
+**Invoke /mgmt/action endpoint for close_now (from host):**
 ```bash
 curl -X POST http://localhost:8200/mgmt/action \
   -H "X-N8N-Action-Key: $N8N_ACTION_API_KEY" \
@@ -55,8 +55,23 @@ curl -X POST http://localhost:8200/mgmt/action \
   -d '{
     "action": "close_now",
     "symbol": "XAUUSD",
-    "group_id": 12345,
-    "notes": "manual close"
+    "raw_text": "manual close from external n8n flow"
+  }'
+```
+
+**Invoke /mgmt/action endpoint for signal_correction (with SL adjustment):**
+```bash
+curl -X POST http://localhost:8200/mgmt/action \
+  -H "X-N8N-Action-Key: $N8N_ACTION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "signal_correction",
+    "symbol": "XAUUSD",
+    "raw_text": "false signal, adjust stop loss",
+    "correction": {
+      "field": "sl",
+      "value": 2495.0
+    }
   }'
 ```
 
@@ -80,10 +95,20 @@ curl -X POST http://localhost:8100/trades \
   -d '{
     "symbol": "XAUUSD",
     "direction": "BUY",
-    "entry_price": 2500.50,
-    "sl_price": 2490.00,
-    "tp_prices": [2515.00, 2530.00],
-    "lot": 0.01
+    "volume": 0.01,
+    "sl": 2490.0,
+    "tp": 2515.0
+  }'
+```
+
+**Update trade (modify SL and TP):**
+```bash
+curl -X PATCH http://localhost:8100/trades/12345 \
+  -H "X-API-Key: $TRADE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sl": 2492.0,
+    "tp": 2520.0
   }'
 ```
 

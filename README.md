@@ -93,16 +93,21 @@ Trade Events (opened, TP hit, etc)
 
 Every entry signal opens **two MT5 positions** with the same group_id:
 
-- **TP1 leg** (tp1_leg=true): closes volume at TP1 price; BE+trailing on remainder
-- **Runner leg** (tp1_leg=false): no fixed TP close; proportional trailing from entry
+- **TP1 leg**: closes volume at TP1 price; the remaining open portion becomes subject to mechanical management
+- **Runner leg**: no fixed TP close; remains open and follows the mechanical trailing rules
 
-**Breakeven Logic (TP1 leg only):**
-- When TP1 is hit and 70% closed: move SL to entry + BREAKEVEN_OFFSET_PIPS (mechanical, no configurability per-account)
+**Breakeven Logic:**
+- Triggered when the **TP1 leg closes** (TP1 price is hit and volume closes at that level)
+- The runner leg's SL is moved to **exactly** the entry_price (no offset, no configurability)
+- After BE is applied, trailing logic engages on the runner
 
-**Trailing Logic (both legs, mechanical loop):**
-- Runner leg: trail from entry with proportional drawdown (50% of peak gain)
-- TP1 remainder: trail from peak price with fixed pips retrace (configurable via env)
-- Updates every 2+ seconds, fail-silent on price/volume errors
+**Trailing Logic (mechanical loop, runner leg only):**
+- Runs continuously every 2+ seconds (fail-silent on price/volume errors)
+- **Formula:** `unit = tp2_price - tp1_price` (computed once per group; for SELL, reversed)
+- `peak_multiple` tracks the highest ratio ever observed: `(current_price - tp1_price) / unit` (only increases, never decreases)
+- **SL recomputation:** `new_sl = tp1_price + (peak_multiple * unit) / 3`
+- This formula has **no cap** — if price runs far past tp2, peak_multiple can exceed 1.0 and the SL keeps trailing proportionally
+- Example: if unit=50 pips and peak_multiple reaches 2.0, the SL trails at tp1 + (2.0 * 50) / 3 = tp1 + 33.3 pips
 
 No more `general` / `be_pips` / `be_pnl` / `reentry` trading_mode system — dual-TP is the **only** behavior.
 
@@ -173,28 +178,42 @@ ACCOUNTS_JSON=[
 
 **Authentication:** Header `X-N8N-Action-Key: <N8N_ACTION_API_KEY>`
 
-**Request body:**
+**Request body (all actions except `signal_correction`):**
 ```json
 {
-  "action": "close_now|move_sl_be_now|note_sl_hit|signal_correction|ignore",
+  "action": "close_now",
   "symbol": "XAUUSD",
-  "group_id": 12345,
-  "notes": "optional notes"
+  "raw_text": "manual close from external flow"
+}
+```
+
+**Request body for `signal_correction` action (with correction):**
+```json
+{
+  "action": "signal_correction",
+  "symbol": "XAUUSD",
+  "raw_text": "false signal detected, adjust SL",
+  "correction": {
+    "field": "sl",
+    "value": 2495.0
+  }
 }
 ```
 
 **Actions:**
-- `close_now`: close all positions in this group immediately
-- `move_sl_be_now`: move SL to breakeven immediately
-- `note_sl_hit`: record that SL was hit (for external tracking)
-- `signal_correction`: mark signal as false alarm (don't trade again)
+- `close_now`: close all positions in the active group for this symbol immediately
+- `move_sl_be_now`: move the runner leg's SL to breakeven (entry price)
+- `note_sl_hit`: record that SL was hit (for external tracking; no position changes)
+- `signal_correction`: apply correction to active group (e.g., adjust SL/TP); requires `correction` object with `field` ("sl", "tp1", or "tp2") and `value` (float)
 - `ignore`: acknowledge but take no action
+
+**Note:** `group_id` is **not** supplied by the caller — the endpoint resolves the active group for `symbol` server-side. `raw_text` is **required** on all requests.
 
 **Response:**
 ```json
 {
-  "status": "ok|error",
-  "message": "..."
+  "status": "closed",
+  "group_id": 12345
 }
 ```
 
@@ -209,9 +228,35 @@ ACCOUNTS_JSON=[
 curl -H "X-API-Key: YOUR_KEY" http://localhost:8100/trades
 ```
 
+Response:
+```json
+[
+  {
+    "ticket": 12345,
+    "symbol": "XAUUSD",
+    "direction": "BUY",
+    "volume": 0.01,
+    "sl": 2490.0,
+    "tp": 2515.0
+  }
+]
+```
+
 #### Get Trade by Ticket
 ```bash
 curl -H "X-API-Key: YOUR_KEY" http://localhost:8100/trades/12345
+```
+
+Response:
+```json
+{
+  "ticket": 12345,
+  "symbol": "XAUUSD",
+  "direction": "BUY",
+  "volume": 0.01,
+  "sl": 2490.0,
+  "tp": 2515.0
+}
 ```
 
 #### Open Trade
@@ -222,12 +267,22 @@ curl -X POST http://localhost:8100/trades \
   -d '{
     "symbol": "XAUUSD",
     "direction": "BUY",
-    "entry_price": 2500.50,
-    "sl_price": 2490.00,
-    "tp_prices": [2515.00, 2530.00],
-    "lot": 0.01,
-    "group_id": "sig_123"
+    "volume": 0.01,
+    "sl": 2490.0,
+    "tp": 2515.0
   }'
+```
+
+Response:
+```json
+{
+  "ticket": 12345,
+  "symbol": "XAUUSD",
+  "direction": "BUY",
+  "volume": 0.01,
+  "sl": 2490.0,
+  "tp": 2515.0
+}
 ```
 
 #### Update Trade (SL/TP)
@@ -235,13 +290,23 @@ curl -X POST http://localhost:8100/trades \
 curl -X PATCH http://localhost:8100/trades/12345 \
   -H "X-API-Key: YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"sl_price": 2492.00, "tp_prices": [2520.00, 2535.00]}'
+  -d '{"sl": 2492.0, "tp": 2520.0}'
 ```
+
+Note: Both `sl` and `tp` are optional; include only the fields you want to update.
 
 #### Close Trade
 ```bash
 curl -X DELETE http://localhost:8100/trades/12345 \
   -H "X-API-Key: YOUR_KEY"
+```
+
+Response:
+```json
+{
+  "status": "closed",
+  "ticket": 12345
+}
 ```
 
 ## Signal Parsing
