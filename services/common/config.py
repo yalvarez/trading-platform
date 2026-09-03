@@ -5,7 +5,6 @@ import json
 
 config = ConfigProvider()
 FAST_UPDATE_WINDOW_SECONDS: float = float(config.get("FAST_UPDATE_WINDOW_SECONDS", 30))
-CHANNELS_CONFIG_JSON: str = config.get("CHANNELS_CONFIG_JSON", "{}")
 
 
 class Settings:
@@ -45,39 +44,12 @@ class Settings:
 
     @staticmethod
     def accounts() -> list[dict]:
-        db_url = config.db_url
-        try:
-            import psycopg2
-            if db_url:
-                conn = psycopg2.connect(db_url)
-                from services.common.config_db_loader import load_accounts
-                return load_accounts(conn)
-        except ImportError:
-            pass
         return json.loads(config.get("ACCOUNTS_JSON", "[]"))
 
     @staticmethod
     def signal_providers() -> list[dict]:
-        db_url = config.db_url
-        try:
-            import psycopg2
-            if db_url:
-                conn = psycopg2.connect(db_url)
-                from services.common.config_db_loader import load_signal_providers
-                return load_signal_providers(conn)
-        except ImportError:
-            pass
         return []
 
     @staticmethod
     def channel_providers() -> dict:
-        db_url = config.db_url
-        try:
-            import psycopg2
-            if db_url:
-                conn = psycopg2.connect(db_url)
-                from services.common.config_db_loader import load_channel_providers
-                return load_channel_providers(conn)
-        except ImportError:
-            pass
         return {}
