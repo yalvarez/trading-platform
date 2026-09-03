@@ -1,9 +1,9 @@
 import os, re, json, logging, uuid
+import datetime
+import httpx
 from services.common.config import Settings
 from services.common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
 from services.common.signal_dedup import SignalDeduplicator
-from tradepulse_filters import looks_like_followup
-from torofx_filters import looks_like_torofx_management
 from parsers_base import SignalParser, ParseResult
 
 # from parsers_goldbro_fast import GoldBroFastParser
@@ -25,27 +25,41 @@ log = logging.getLogger("router_parser")
 
 from services.common.config import FAST_UPDATE_WINDOW_SECONDS
 
+
+async def forward_to_n8n(text: str, chat_id: str, webhook_url: str) -> None:
+    """
+    Reenvia texto que el parser de senales no reconocio a un webhook n8n
+    de entrada, para que un flujo n8n/Ollama externo decida si es una
+    excepcion de gestion accionable (ver dual-TP spec seccion 5.1).
+    Nunca levanta: un fallo de red no debe tumbar el loop principal.
+    """
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(webhook_url, json=payload, timeout=10.0)
+        if not (200 <= resp.status_code < 300):
+            log.warning("[N8N_FORWARD] webhook respondio status=%s chat_id=%s", resp.status_code, chat_id)
+    except Exception as e:
+        log.warning("[N8N_FORWARD] error reenviando a n8n: %s", e)
+
+
 class SignalRouter:
-    def __init__(self, redis_client, dedup_ttl=120.0, channels_config=None):
+    def __init__(self, redis_client, dedup_ttl=120.0):
         from parsers_tradepulse import TradePulseParser
         self.parser_map = {
             'tradepulse': TradePulseParser(),
         }
-        self.channels_config = channels_config or {}
         self.deduplicator = SignalDeduplicator(redis_client, ttl_seconds=dedup_ttl)
         self.fast_update_window = FAST_UPDATE_WINDOW_SECONDS
         self.redis = redis_client
 
     def parse_signal(self, text, chat_id=None):
         norm = text.strip()
-        # --- 4. Normal routing ---
-        parsers = []
-        if chat_id and str(chat_id) in self.channels_config:
-            parser_names = self.channels_config[str(chat_id)]
-            parsers = [self.parser_map[name] for name in parser_names if name in self.parser_map]
-        if not parsers:
-            parsers = list(self.parser_map.values())
-        for parser in parsers:
+        for parser in self.parser_map.values():
             try:
                 result = parser.parse(norm)
                 if result:
@@ -116,21 +130,17 @@ class SignalRouter:
         }
 
 async def main():
-    import json
     from services.common.env_validator import validate_router_parser
     validate_router_parser()
 
-    from services.common.config import CHANNELS_CONFIG_JSON
     s = Settings.load()
     r = await redis_client(s["redis_url"])
-    try:
-        channels_config = json.loads(CHANNELS_CONFIG_JSON)
-    except Exception as e:
-        log.warning(f"CHANNELS_CONFIG_JSON parse error: {e}")
-        channels_config = {}
-    router = SignalRouter(r, dedup_ttl=s["dedup_ttl_seconds"], channels_config=channels_config)
+    router = SignalRouter(r, dedup_ttl=s["dedup_ttl_seconds"])
     group = "router_group"
     consumer = f"consumer_{os.getpid()}"
+
+    from services.common.config import config as _config
+    n8n_webhook_url = _config.get("N8N_INBOUND_WEBHOOK_URL", "")
 
     # Bucle robusto: reintenta creación de grupo si ocurre NOGROUP
     import asyncio
@@ -139,12 +149,6 @@ async def main():
             async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
                 text = fields.get("text", "")
                 chat_id = fields.get("chat_id", "")
-
-                if looks_like_followup(text):
-                    await xadd(r, Streams.MGMT, {"chat_id": chat_id, "text": text, "provider_hint": "TRADE_PULSE"})
-                    log.info("[MGMT] TRADE_PULSE follow-up")
-                    await xack(r, Streams.RAW, group, msg_id)
-                    continue
 
                 try:
                     sig = await router.process_raw_signal(chat_id, text)
@@ -155,8 +159,11 @@ async def main():
                         sig["trace"] = trace_id
                         await xadd(r, Streams.SIGNALS, sig)
                         log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
-                    else:
-                        pass  # log.debug("[DROP] chat=%s parsed=None", chat_id)  # Reduce log noise
+                    elif text.strip():
+                        if n8n_webhook_url:
+                            await forward_to_n8n(text, chat_id, n8n_webhook_url)
+                        else:
+                            log.warning("[N8N_FORWARD] N8N_INBOUND_WEBHOOK_URL no configurada — mensaje descartado: %r", text[:80])
                 finally:
                     await xack(r, Streams.RAW, group, msg_id)
         except Exception as e:
