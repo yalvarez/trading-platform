@@ -83,6 +83,20 @@ services:
       timeout: 5s
       retries: 6
 
+  trade_api:
+    build:
+      context: .
+      dockerfile: services/trade_api/Dockerfile
+    container_name: atp-trade-api
+    env_file:
+      - .env
+    ports:
+      - "8100:8100"
+    depends_on:
+      mt5_acct1:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:
   mt5_acct1_config:
