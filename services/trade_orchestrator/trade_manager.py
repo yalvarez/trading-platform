@@ -142,3 +142,55 @@ class TradeManager:
         await self._notify("group_opened", group_id=group_id, symbol=symbol, direction=direction,
                             tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2)
         return group_id
+
+    async def update_group_signal(self, group_id: int, *, sl: Optional[float], tp1: Optional[float], tp2: Optional[float]) -> None:
+        """
+        Aplica valores nuevos de SL/TP1/TP2 a ambas piernas de un grupo existente.
+        Usado tanto para el update fast->full (dual-TP spec seccion 3) como para
+        signal_correction via /mgmt/action (dual-TP spec seccion 5.2) — una
+        correccion de tp2 solo actualiza la referencia usada por el trailing,
+        nunca toca MT5 directamente para la pierna runner.
+        """
+        legs = [t for t in self.trades.values() if t.group_id == group_id]
+        if not legs:
+            log.warning("[TM][UPDATE] group_id=%s no tiene piernas activas", group_id)
+            return
+        account = self._ensure_account_dict(legs[0].account_name)
+        if not account:
+            return
+        client = self.mt5._client_for(account)
+
+        for t in legs:
+            if sl is not None:
+                t.planned_sl = float(sl)
+            if tp1 is not None:
+                t.tp1_price = float(tp1)
+            if tp2 is not None:
+                t.tp2_price = float(tp2)
+
+            new_sl = t.planned_sl
+            new_tp = t.tp1_price if (t.leg == "tp1" and t.tp1_price is not None) else 0.0
+            req = {
+                "action": 6,
+                "position": t.ticket,
+                "sl": float(new_sl),
+                "tp": float(new_tp),
+            }
+            res = client.order_send(req)
+            ok = bool(res and getattr(res, "retcode", None) == 10009)
+            if not ok:
+                log.error("[TM][UPDATE] fallo actualizando ticket=%s leg=%s", t.ticket, t.leg)
+
+        log.info("[TM] group %s actualizado: sl=%s tp1=%s tp2=%s", group_id, sl, tp1, tp2)
+        await self._notify("group_updated", group_id=group_id, sl=sl, tp1=tp1, tp2=tp2)
+
+    def find_active_group_for_symbol(self, symbol: str) -> Optional[int]:
+        """
+        Devuelve el group_id mas reciente con al menos una pierna abierta para
+        `symbol`, o None (dual-TP spec seccion 5.2 — respuesta 'no_active_trade').
+        """
+        candidates = [t for t in self.trades.values() if t.symbol == symbol]
+        if not candidates:
+            return None
+        newest = max(candidates, key=lambda t: t.opened_ts)
+        return newest.group_id
