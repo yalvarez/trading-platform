@@ -33,10 +33,11 @@ class ManagedTrade:
 
 
 class TradeManager:
-    def __init__(self, mt5_executor, *, notifier=None, config_provider=None):
+    def __init__(self, mt5_executor, *, notifier=None, config_provider=None, state_store=None):
         self.mt5 = mt5_executor
         self.notifier = notifier
         self.config_provider = config_provider
+        self.state_store = state_store
         self.trades: dict[int, ManagedTrade] = {}
         self._next_group_id = 1
 
@@ -57,6 +58,49 @@ class TradeManager:
             await self.notifier.notify_trade_event(event, **kwargs)
         except Exception as e:
             log.warning("[TM] notify failed for event=%s: %s", event, e)
+
+    def _group_doc(self, group_id: int) -> Optional[dict]:
+        """
+        Construye el documento persistible para group_id a partir del estado
+        actual en self.trades. None si el grupo no tiene piernas activas.
+        """
+        legs = [t for t in self.trades.values() if t.group_id == group_id]
+        if not legs:
+            return None
+        first = legs[0]
+        doc = {
+            "group_id": group_id,
+            "account_name": first.account_name,
+            "symbol": first.symbol,
+            "direction": first.direction,
+            "tp1_price": first.tp1_price,
+            "tp2_price": first.tp2_price,
+            "legs": {},
+            "updated_ts": time.time(),
+        }
+        for t in legs:
+            doc["legs"][t.leg] = {
+                "ticket": t.ticket,
+                "planned_sl": t.planned_sl,
+                "entry_price": t.entry_price,
+                "be_applied": t.be_applied,
+                "peak_multiple": t.peak_multiple,
+            }
+        return doc
+
+    async def _persist_group(self, group_id: int) -> None:
+        """Guarda el estado actual de group_id en el store, si hay uno configurado."""
+        if not self.state_store:
+            return
+        doc = self._group_doc(group_id)
+        if doc is None:
+            return
+        await self.state_store.save_group(doc)
+
+    async def _close_group_in_store(self, group_id: int) -> None:
+        if not self.state_store:
+            return
+        await self.state_store.close_group(group_id)
 
     DEFAULT_MT5_CALL_TIMEOUT_SECONDS = 20.0
 
@@ -289,6 +333,7 @@ class TradeManager:
                   group_id, tickets["tp1"], tickets["runner"], symbol, direction, sl, tp1, tp2)
         await self._notify("group_opened", group_id=group_id, symbol=symbol, direction=direction,
                             tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2)
+        await self._persist_group(group_id)
         return group_id
 
     async def update_group_signal(self, group_id: int, *, sl: Optional[float], tp1: Optional[float], tp2: Optional[float]) -> None:
@@ -364,6 +409,7 @@ class TradeManager:
 
         log.info("[TM] group %s actualizado: sl=%s tp1=%s tp2=%s", group_id, sl, tp1, tp2)
         await self._notify("group_updated", group_id=group_id, sl=sl, tp1=tp1, tp2=tp2)
+        await self._persist_group(group_id)
 
     def find_active_group_for_symbol(self, symbol: str) -> Optional[int]:
         """
@@ -425,6 +471,9 @@ class TradeManager:
                     await self._on_tp1_leg_closed(account, client, closed_trade)
                 else:
                     await self._notify("runner_closed", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol)
+                remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
+                if not remaining:
+                    await self._close_group_in_store(closed_trade.group_id)
 
             ACTIVE_TRADES.set(len(self.trades))
 
@@ -465,6 +514,7 @@ class TradeManager:
         if ok:
             runner.be_applied = True
             await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
+            await self._persist_group(tp1_leg.group_id)
         else:
             log.error("[TM] BE no se pudo aplicar tras 3 intentos, runner=%s group_id=%s queda con SL original",
                       runner.ticket, tp1_leg.group_id)
@@ -508,6 +558,7 @@ class TradeManager:
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
             await self._notify("trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl)
+            await self._persist_group(runner.group_id)
 
     async def apply_mgmt_action(self, *, action: str, symbol: str, raw_text: str, correction: Optional[dict]) -> dict:
         """
@@ -531,6 +582,7 @@ class TradeManager:
                 await self._call(client.partial_close, account, t.ticket, 100)
                 self.trades.pop(t.ticket, None)
             await self._notify("mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text)
+            await self._close_group_in_store(group_id)
             return {"status": "closed", "group_id": group_id}
 
         if action == "move_sl_be_now":
@@ -553,6 +605,7 @@ class TradeManager:
             if ok:
                 runner.be_applied = True
                 await self._notify("mgmt_move_sl_be_applied", group_id=group_id, symbol=symbol, raw_text=raw_text)
+                await self._persist_group(group_id)
                 return {"status": "applied", "group_id": group_id}
             return {"status": "failed", "group_id": group_id}
 

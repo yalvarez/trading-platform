@@ -651,3 +651,139 @@ async def test_call_falls_back_to_default_timeout_when_env_var_invalid(monkeypat
 
     assert result == "ok"
     assert "invalido" in caplog.text
+
+
+# --- Task 3: TradeStateStore write-point wiring ---
+
+class RecordingStore:
+    """Test double for TradeStateStore — records every save/close call."""
+    def __init__(self):
+        self.saved: list[dict] = []
+        self.closed: list[int] = []
+
+    async def save_group(self, doc):
+        self.saved.append(doc)
+
+    async def close_group(self, group_id):
+        self.closed.append(group_id)
+
+
+@pytest.mark.asyncio
+async def test_open_group_persists_the_new_group():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert len(store.saved) == 1
+    doc = store.saved[-1]
+    assert doc["group_id"] == group_id
+    assert doc["symbol"] == "XAUUSD"
+    assert doc["direction"] == "BUY"
+    assert doc["tp1_price"] == 2510.0
+    assert doc["tp2_price"] == 2530.0
+    tp1_ticket = next(t.ticket for t in tm.trades.values() if t.leg == "tp1")
+    runner_ticket = next(t.ticket for t in tm.trades.values() if t.leg == "runner")
+    assert doc["legs"]["tp1"]["ticket"] == tp1_ticket
+    assert doc["legs"]["runner"]["ticket"] == runner_ticket
+
+
+@pytest.mark.asyncio
+async def test_update_group_signal_persists_new_tp_values():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2470.0, tp1=None, tp2=None)
+    store.saved.clear()
+
+    await tm.update_group_signal(group_id, sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert len(store.saved) == 1
+    assert store.saved[-1]["tp1_price"] == 2510.0
+    assert store.saved[-1]["tp2_price"] == 2530.0
+
+
+@pytest.mark.asyncio
+async def test_tp1_leg_closing_persists_be_applied():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    store.saved.clear()
+    del sim.positions[tp1_leg.ticket]
+
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_docs = [d for d in store.saved if d["group_id"] == group_id]
+    assert len(runner_docs) == 1
+    assert runner_docs[-1]["legs"]["runner"]["be_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_trailing_update_persists_peak_multiple():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+    store.saved.clear()
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    sim.price = 2522.0  # 60% of unit=20 past tp1=2510
+    sim.positions[runner_leg.ticket]['price_current'] = sim.price
+
+    await tm._tick_once_account(ACCOUNT)
+
+    assert len(store.saved) == 1
+    assert store.saved[-1]["legs"]["runner"]["peak_multiple"] == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
+async def test_both_legs_closing_closes_the_group_in_the_store():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # tp1 closes, BE applied to runner
+    del sim.positions[runner_leg.ticket]
+
+    await tm._tick_once_account(ACCOUNT)  # runner closes too
+
+    assert group_id in store.closed
+
+
+@pytest.mark.asyncio
+async def test_mgmt_close_now_closes_the_group_in_the_store():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="close it", correction=None)
+
+    assert result["status"] == "closed"
+    assert group_id in store.closed
+
+
+@pytest.mark.asyncio
+async def test_no_state_store_is_a_safe_default():
+    """TradeManager() without state_store (existing callers, all prior tests) must keep working unchanged."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())  # no state_store kwarg
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is not None  # did not raise despite no store configured
