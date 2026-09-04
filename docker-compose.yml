@@ -30,6 +30,30 @@ services:
       interval: 5s
       timeout: 2s
       retries: 10
+    # NOTA: la imagen instala la version mas reciente de mt5linux (Linux side)
+    # sin fijar version, y mt5linux>=1.1.0 usa sintaxis de f-string (PEP 701)
+    # que rompe con el Python 3.11 de esta imagen (SyntaxError: unterminated
+    # string literal en metatrader5.py, mt5.copy_rates_from). Ademas,
+    # mt5linux>=1.1.0 arrastra rpyc>=6.0, que no es compatible en protocolo
+    # con el rpyc que usan los clientes (trade_orchestrator/trade_api,
+    # via mt5linux==0.1.9) — un desajuste de rpyc entre cliente y servidor
+    # rompe el handshake RPyC incluso si solo se arregla mt5linux de un lado
+    # (sintomas: ValueError en brine.load, o TimeoutError: result expired,
+    # en vez de un error de conexion claro).
+    #
+    # Se corrigio manualmente instalando, en AMBOS lados del contenedor
+    # (Linux y Wine/Windows — el arranque de la imagen instala mt5linux por
+    # separado en cada uno), las mismas versiones que usan
+    # trade_orchestrator/trade_api:
+    #   mt5linux==0.1.9
+    #   rpyc==5.0.1
+    # dentro del volumen persistente mt5_acct1_config. El script de arranque
+    # de la imagen NUNCA reinstala si detecta que mt5linux ya esta instalado
+    # (cualquier version), asi que este fix sobrevive reinicios normales del
+    # contenedor. Si el volumen mt5_acct1_config se borra o se recrea desde
+    # cero (docker compose down -v, o un volumen nuevo), hay que re-aplicar
+    # el fix una vez — ver scripts/fix-mt5-linux-version.sh, que automatiza
+    # ambos lados (Linux + Wine) y ambos paquetes (mt5linux + rpyc).
 
   telegram_ingestor:
     build:
