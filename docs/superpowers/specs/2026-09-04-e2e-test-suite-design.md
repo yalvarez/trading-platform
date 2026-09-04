@@ -109,6 +109,17 @@ No se publica ningún puerto nuevo al host. `redis` y `mt5_acct1:8001` siguen
 siendo accesibles solo dentro de la red interna de Docker, tal como hoy.
 Ejecución: `docker compose --profile e2e run --rm e2e_runner --scenario fast_signal`.
 
+**Excepción explícita — socket de Docker:** para que `vps_observer` pueda
+leer logs de otros contenedores (`docker logs <servicio>`, spec §3.1), el
+servicio `e2e_runner` monta `/var/run/docker.sock` de solo lectura. Esto es
+más acceso del que "solo red interna, sin puertos nuevos" sugiere por sí
+solo — el contenedor puede leer logs de *cualquier* contenedor del host, no
+solo los de este `docker-compose.yml`. Aceptado como decisión explícita del
+operador (no una omisión): el riesgo es acotado (solo lectura, VPS ya de
+confianza) y es más simple que la alternativa (correr el runner fuera de
+compose, en el host, lo que a su vez requeriría exponer Redis/RPyC al host
+igual que la opción de "correr localmente" ya descartada en la sección 4).
+
 ## 4. Fuentes de verdad / entorno
 
 - **Precio:** MT5 vía RPyC (`mt5_acct1`), no una API externa — es la misma
