@@ -34,6 +34,13 @@ gestión en memoria). No afecta `router_parser`, `telegram_ingestor`, ni
 `trade_api` (que ya opera sin estado propio, directo contra MT5 en cada
 llamada).
 
+Verificado: existe una sola instancia de `TradeManager` por proceso
+(`app.py:main()`), compartida entre todas las cuentas activas de
+`ACCOUNTS_JSON` — `self.trades` y `self._next_group_id` son un único
+namespace de proceso, no uno por cuenta. `group_id` es por tanto único
+globalmente sin importar cuántas cuentas haya, y no hay riesgo de colisión
+entre cuentas en las keys de Redis/archivo.
+
 ## Arquitectura
 
 Un componente nuevo, `TradeStateStore` (`services/trade_orchestrator/trade_state_store.py`),
@@ -124,6 +131,16 @@ piernas conceptualmente, aunque `ManagedTrade` los duplica hoy por pierna).
 `be_applied`/`peak_multiple` solo tienen sentido para la pierna `runner`
 (`tp1_leg` no los usa) pero se guardan bajo su leg por si el modelo cambia.
 
+`updated_ts` no se usa para resolver conflictos de orden — no hace falta:
+`_tick_once_account` primero remueve de `self.trades` los tickets ya
+cerrados (y dispara su borrado en el store) y solo *después* itera lo que
+queda para el trailing, dentro del mismo tick; y todo el proceso es
+single-threaded (los `await` a MT5 ceden control pero cada tick corre
+completo antes del siguiente), así que es imposible escribir una
+actualización de trailing para un grupo después de haber escrito su cierre.
+El campo queda solo como metadato de diagnóstico (para inspección manual del
+archivo/Redis).
+
 ### Redis
 
 Key: `trade_groups:{group_id}` → `SET` con el JSON completo como string (no
@@ -150,6 +167,21 @@ línea para un `group_id` es un cierre, ese grupo se considera cerrado y no se
 reconstruye aunque MT5 tuviera (por error) una posición residual con ese
 comment.
 
+El directorio `data/` no existe todavía en el repo — el plan de
+implementación debe crearlo, agregarlo a `.gitignore` (contenido operativo,
+no versionado — mismo tratamiento que `.env`/`*.session`), y declarar el
+bind-mount `./data/trade_state.jsonl:/app/data/trade_state.jsonl:rw` en el
+servicio `trade_orchestrator` de `docker-compose.yml`. A diferencia del
+`.session` de Telegram, este archivo puede empezar vacío/inexistente sin
+causar el bug de "Docker crea un directorio en su lugar" que afectó al
+`.session` — porque aquí el archivo se crea desde dentro del propio
+`TradeStateStore` en su primer arranque (con `open(path, "a")`, que crea el
+archivo si no existe) en vez de depender de que exista de antemano en el
+host; aun así, el plan debe crear un `data/trade_state.jsonl` vacío (o al
+menos el directorio `data/`) en el host antes del primer `docker compose up`,
+para evitar exactamente ese mismo bug si el mount ocurre antes que el primer
+`open()` del proceso.
+
 **Compactación**: al final de una reconciliación exitosa de arranque, el
 archivo se reescribe (operación atómica: escribir a `.tmp`, luego `rename`)
 conservando solo la última entrada de cada `group_id` que sigue activo tras
@@ -161,7 +193,10 @@ completo de actualizaciones de trailing.
 Todos ya identificados en el código actual de `trade_manager.py`:
 
 - `open_group`: al crear ambos `ManagedTrade` — escribe el documento completo
-  del grupo nuevo.
+  del grupo nuevo. Si el `order_send` de alguna pierna falla a mitad de
+  apertura (código ya existente: revierte lo abierto vía `partial_close` y
+  retorna `None`), no se llega a este punto — no hay nada que persistir
+  porque no queda nada abierto en MT5 tampoco, consistente por construcción.
 - `update_group_signal`: al actualizar `tp1_price`/`tp2_price`/`planned_sl`
   (señal completa llega, o `signal_correction` vía `/mgmt/action`) —
   reescribe el documento.
@@ -172,10 +207,18 @@ Todos ya identificados en el código actual de `trade_manager.py`:
   el append-only del archivo lo hace barato.
 - `apply_mgmt_action` (`move_sl_be_now`): al aplicar BE exitosamente vía
   gestión manual — igual que `_on_tp1_leg_closed`.
-- **Borrado**: en `_tick_once_account`, cuando se detecta que la segunda
-  pierna de un grupo (la última que quedaba en `self.trades`) ya no está en
-  MT5 — se hace `DEL` en Redis y se escribe la entrada de cierre
+- **Borrado (pasivo)**: en `_tick_once_account`, cuando se detecta que la
+  segunda pierna de un grupo (la última que quedaba en `self.trades`) ya no
+  está en MT5 — se hace `DEL` en Redis y se escribe la entrada de cierre
   `{"group_id": N, "closed": true}` en el archivo.
+- **Borrado (activo)**: en `apply_mgmt_action` con `action == "close_now"`,
+  justo después del `partial_close` de ambas piernas y su remoción de
+  `self.trades` — mismo `DEL`/entrada de cierre que el borrado pasivo. Sin
+  esto, un cierre por gestión manual dejaría el documento del grupo "vivo" en
+  Redis/archivo indefinidamente (nunca se limpiaría, porque la reconciliación
+  solo agrupa posiciones que sí siguen abiertas en MT5 — el documento
+  huérfano no causaría un bug activo, pero sí basura permanente,
+  contradiciendo el propósito de la compactación).
 
 Todas estas escrituras son "fire and forget" respecto al flujo principal: un
 fallo al escribir en Redis o el archivo se loguea como warning pero **nunca**
@@ -185,8 +228,13 @@ capa de seguridad adicional, no una dependencia dura del camino crítico.
 ## Reconciliación al arranque
 
 Nuevo método `TradeManager.reconcile_from_mt5()`, llamado una vez en
-`main()` (`app.py`) después de construir `TradeManager` y antes de lanzar
-`asyncio.create_task(tradeManager.run_forever())`:
+`main()` (`app.py`), entre la construcción de `tradeManager` (línea que hoy
+es `tradeManager = TradeManager(...)`) y el `asyncio.create_task(tradeManager.run_forever())`
+que sigue más abajo — el `notifier_adapter` ya existe en ese punto (se
+construye antes que `tradeManager`), así que las notificaciones de
+reconciliación pueden dispararse sin problema. `await`eado directamente en
+`main()` (no como task en background) para que `run_forever()` nunca arranque
+sobre un `self.trades` a medio reconciliar:
 
 1. Para cada cuenta activa, `positions_get()` filtrado por `magic=MAGIC`.
 2. Agrupar las posiciones encontradas por el `group_id` parseado de su
@@ -197,12 +245,30 @@ Nuevo método `TradeManager.reconcile_from_mt5()`, llamado una vez en
      respaldo (última entrada no-cierre para ese `group_id`).
    - Si se encuentra en cualquiera de los dos: reconstruir `ManagedTrade`
      para cada pierna presente en MT5, usando los datos del documento
-     encontrado. Si el documento menciona una pierna que ya no está abierta
-     en MT5 (cerró mientras el sistema estaba caído), esa pierna
-     simplemente no se reconstruye — se procesará como cierre normal en el
-     primer tick de `_tick_once_account` si el grupo sigue teniendo la otra
-     pierna activa y el estado dice que la que falta era `tp1` (dispara BE)
-     o se ignora si era `runner` (ya no hay nada que hacer con ella).
+     encontrado.
+     - **Si el documento menciona una pierna que ya no está abierta en MT5**
+       (cerró mientras el sistema estaba caído) **y la que falta es
+       `runner`**: no hay nada que hacer con ella (ya cerró, no queda nada
+       que gestionar de esa pierna) — simplemente no se reconstruye.
+     - **Si la que falta es `tp1` y `runner` sigue abierto**: este es el
+       caso que motivó todo el diseño (TP1 cerró durante el downtime, el
+       runner quedó sin su BE). El mecanismo normal de detección de cierre
+       (`_tick_once_account` comparando `self.trades` contra
+       `positions_get()`) **nunca lo vería** — compara lo que YA está en
+       `self.trades`, y `tp1` nunca llegó a insertarse ahí en esta
+       reconciliación porque ya no existe en MT5. Por eso
+       `reconcile_from_mt5()` reconstruye el `runner` primero y entonces
+       invoca el mismo camino que usa `_tick_once_account` en producción
+       (`_on_tp1_leg_closed`, con sus reintentos y su notificación
+       `tp1_hit`/`tp1_hit_be_failed` normales) **inline, como parte de la
+       reconciliación misma** — antes de que `run_forever()` arranque, no
+       delegado a un tick futuro que nunca lo detectaría. Se aclara en el
+       evento notificado que el TP1 se detectó cerrado durante una
+       reconciliación de arranque, no en tiempo real.
+     - **Si ambas piernas del documento ya no están en MT5**: el grupo
+       cerró por completo durante el downtime — se descarta sin
+       reconstruir nada, y se limpia del store (mismo `DEL`/entrada de
+       cierre que un borrado pasivo normal).
    - Si no se encuentra en ninguno: reconstrucción mínima directamente desde
      los campos de la posición MT5 — modo degradado.
 4. Reescribir en Redis cualquier grupo reconstruido en modo degradado o
@@ -218,6 +284,19 @@ Este método es puramente de lectura sobre MT5 (nunca envía `order_send`) —
 la única escritura que hace es repoblar `self.trades` en memoria y
 Redis/archivo si estaban desincronizados.
 
+**`_next_group_id` debe reconciliarse también.** Hoy arranca en `1` en cada
+proceso nuevo — sin corregirlo, un reinicio con grupos ya en `group_id >= 1`
+generaría colisiones: una apertura nueva podría reusar un `group_id` que
+todavía aparece en un comment de MT5 (una posición vieja cerrada hace tiempo
+pero cuyo comment nunca se borra de MT5) o en una entrada no compactada del
+archivo. Al final del paso 3 de la reconciliación (antes del paso 4),
+`reconcile_from_mt5()` debe fijar `self._next_group_id` al máximo `group_id`
+visto entre: las posiciones abiertas en MT5 (parseadas, incluidas las
+huérfanas — un comment con formato válido aunque no se gestione cuenta para
+este cálculo), los documentos en Redis, y los documentos en el archivo
+(cerrados o no) — más uno. Si no hay ningún grupo conocido en ninguna fuente,
+se queda en `1` (comportamiento actual, arranque limpio real).
+
 ## Testing
 
 - `TradeStateStore` se prueba de forma aislada (sin `TradeManager`): escribir
@@ -230,6 +309,18 @@ Redis/archivo si estaban desincronizados.
   con comment no parseable) y se verifica que `self.trades` termina en el
   estado esperado para cada caso, y que las notificaciones correctas se
   disparan.
+- Caso específico: el documento persistido de un grupo menciona `tp1_leg`,
+  pero `SimuladorMT5` solo tiene la posición del `runner` (simula que `tp1`
+  cerró durante el downtime). Verificar que la reconciliación aplica BE al
+  runner de forma síncrona (no delegada a un tick futuro) y dispara la
+  notificación correspondiente — sin este test, el hueco de diseño que
+  motivó ese fix pasaría desapercibido de nuevo.
+- Caso específico: `_next_group_id` tras reconciliar debe quedar por encima
+  del `group_id` más alto visto en MT5/Redis/archivo (probar con IDs
+  desalineados entre las tres fuentes — p.ej. MT5 solo tiene hasta el grupo
+  3 abierto, pero el archivo tiene una entrada de cierre para el grupo 5) y
+  una apertura inmediatamente después no debe colisionar con ningún
+  `group_id` ya usado en ninguna fuente.
 - Un test de integración de extremo a extremo: abrir un grupo con
   `open_group` (persistiéndolo), simular la pérdida completa de
   `self.trades` (nuevo `TradeManager`, mismo store), reconciliar, y
@@ -241,10 +332,16 @@ Redis/archivo si estaban desincronizados.
 - No se persiste nada de `trade_api` ni `router_parser` — no tienen estado de
   gestión propio.
 - No se implementa un mecanismo de reconciliación periódica en caliente
-  (mientras el proceso corre) — la reconciliación es solo al arranque. Una
-  desincronización mientras el proceso está vivo y corriendo normalmente no
-  debería ocurrir salvo intervención manual externa en MT5, que queda fuera
-  de este diseño.
+  (mientras el proceso corre) — la reconciliación es solo al arranque. El
+  incidente que motivó `MT5_CALL_TIMEOUT_SECONDS` (el proceso vivo pero con
+  el loop mecánico congelado) es precisamente un caso donde SÍ puede haber
+  desincronización en caliente sin ningún reinicio de por medio — pero ese
+  escenario ya se mitiga por separado (el timeout evita el cuelgue
+  indefinido; si aun así el proceso queda en un estado raro, la forma de
+  recuperarlo sigue siendo reiniciarlo, momento en el que esta
+  reconciliación de arranque sí se ejecuta). Añadir reconciliación periódica
+  en caliente sería una capa adicional de complejidad para un caso que ya
+  tiene una salida razonable (reiniciar), y queda fuera de este diseño.
 - No se resuelve la limitación ya documentada de `MT5_CALL_TIMEOUT_SECONDS`
   (un hilo colgado puede seguir reteniendo el lock de `PooledMT5Client`) —
   ese es un problema distinto, ya mitigado por separado.
