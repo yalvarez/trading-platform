@@ -57,6 +57,8 @@ class TradeManager:
         except Exception as e:
             log.warning("[TM] notify failed for event=%s: %s", event, e)
 
+    MT5_CALL_TIMEOUT_SECONDS = 20.0
+
     @staticmethod
     async def _call(fn, *args, **kwargs):
         """
@@ -66,8 +68,26 @@ class TradeManager:
         senales, el loop de gestion mecanica (run_forever) y el endpoint /mgmt/action
         cuando MT5 tarda, se cuelga, o esta reconectando (PooledMT5Client puede
         bloquear hasta 1.5s en un intento de reconexion con un lock tomado).
+
+        Envuelto en asyncio.wait_for: RPyC ya trae su propio sync_request_timeout
+        (30s por defecto), pero ese timeout vive dentro de AsyncResult.wait(), que
+        sigue sirviendo el canal en un loop y puede no cortar de forma confiable si
+        el socket sigue "vivo" a nivel TCP sin que el lado Wine/MT5 responda nunca
+        (visto en produccion: un fallo de order_send fue seguido por un cuelgue que
+        paralizo run_forever por completo, sin ningun log de error ni timeout
+        durante minutos). asyncio.wait_for es la garantia dura: si el hilo de
+        fondo sigue colgado tras el timeout no hay forma de matarlo (Python no
+        puede cancelar un hilo a la fuerza), y seguira reteniendo el
+        threading.Lock de PooledMT5Client para ese host:port especifico — pero
+        el resto del sistema (otras cuentas, el loop de senales, /mgmt/action)
+        deja de esperar indefinidamente por esta unica llamada.
         """
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=TradeManager.MT5_CALL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            log.error("[TM] MT5 call %s colgada tras %.0fs (timeout) — abortando esta operacion, el hilo puede seguir vivo en 2do plano",
+                       getattr(fn, "__name__", fn), TradeManager.MT5_CALL_TIMEOUT_SECONDS)
+            raise
 
     async def _get_price_with_retry(self, client, symbol: str, direction: str, attempts: int = 3, delay_seconds: float = 0.15) -> float:
         """
@@ -402,9 +422,31 @@ class TradeManager:
             log.error("[TM] no se puede aplicar BE: runner=%s no tiene entry_price registrado (group_id=%s)",
                       runner.ticket, tp1_leg.group_id)
             return
-        await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
-        runner.be_applied = True
-        await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
+        # be_applied SOLO se marca True si el order_send realmente tuvo exito.
+        # Bug real de produccion: marcarlo incondicionalmente dejaba el runner en
+        # un estado inconsistente cuando el BE fallaba — el guard de _apply_trailing
+        # (que exige be_applied) dejaba de bloquearlo, y el trailing intentaba
+        # correr sobre un SL que en realidad nunca se movio a breakeven. Reintenta
+        # unas pocas veces (mismo patron que _get_price_with_retry) antes de darse
+        # por vencido: este es el unico momento en que se dispara el BE — si se
+        # pierde aqui sin reintentar, el runner queda huerfano de BE para siempre.
+        ok = False
+        for attempt in range(1, 4):
+            ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
+            if ok:
+                break
+            if attempt < 3:
+                await asyncio.sleep(0.2)
+        if ok:
+            runner.be_applied = True
+            await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
+        else:
+            log.error("[TM] BE no se pudo aplicar tras 3 intentos, runner=%s group_id=%s queda con SL original",
+                      runner.ticket, tp1_leg.group_id)
+            await self._notify(
+                "tp1_hit_be_failed", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
+                message=f"TP1 de {tp1_leg.symbol} (group {tp1_leg.group_id}) se cerro, pero el runner (ticket {runner.ticket}) NO pudo moverse a breakeven tras 3 intentos. Requiere revision manual — sigue con su SL original.",
+            )
 
     async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str) -> bool:
         # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida

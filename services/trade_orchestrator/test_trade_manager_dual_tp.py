@@ -1,3 +1,4 @@
+import asyncio
 import time
 import pytest
 
@@ -136,6 +137,52 @@ async def test_tick_moves_runner_sl_to_be_when_tp1_leg_closes():
     assert abs(runner_pos.sl - 2500.0) < 1e-6  # moved to entry price (BE)
     assert tm.trades[runner_leg.ticket].be_applied is True
     assert tp1_leg.ticket not in tm.trades
+
+
+@pytest.mark.asyncio
+async def test_be_not_marked_applied_when_order_send_fails_after_all_retries():
+    """
+    Real production bug: be_applied was set True unconditionally after
+    attempting the BE move, even when order_send failed. That left the
+    runner in an inconsistent state where _apply_trailing's guard (which
+    only checks be_applied) stopped blocking it, so trailing started
+    computing a new SL relative to a runner that was never actually moved
+    to breakeven in MT5. It must retry a few times, and only mark
+    be_applied True if one of those attempts actually succeeds; otherwise
+    the runner keeps its original SL and a failure notification fires.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    original_sl = sim.positions[runner_leg.ticket]['sl']
+
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    del sim.positions[tp1_leg.ticket]
+
+    # Every order_send for this ticket (the BE move) fails; sim.order_send is
+    # monkeypatched to reject action=6 requests targeting the runner specifically.
+    real_order_send = sim.order_send
+
+    def failing_order_send(req):
+        if req.get("action") == 6 and req.get("position") == runner_leg.ticket:
+            return type('OrderSendResult', (), {'retcode': 10016, 'order': 0, 'deal': 0, 'comment': 'Invalid stops'})()
+        return real_order_send(req)
+
+    sim.order_send = failing_order_send
+
+    await tm._tick_once_account(ACCOUNT)
+
+    assert tm.trades[runner_leg.ticket].be_applied is False
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.sl == original_sl  # untouched — BE never actually landed
+
+    failed_events = [kwargs for event, kwargs in notifier.events if event == "tp1_hit_be_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["runner_ticket"] == runner_leg.ticket
+    assert "revision manual" in failed_events[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -568,3 +615,26 @@ async def test_open_group_aborts_after_exhausting_price_retries():
 
     assert group_id is None
     assert len(tm.trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_call_times_out_instead_of_hanging_forever_on_a_stuck_mt5_socket(monkeypatch):
+    """
+    Real production incident: an MT5/RPyC call hung with no exception and no
+    timeout for 4+ minutes (and counting), freezing run_forever entirely --
+    no other account/group could be managed, and _tick_once_account's own
+    try/except never even ran because the hang was inside the awaited call
+    itself. RPyC's own sync_request_timeout (30s) did not reliably cut this
+    off (it lives inside AsyncResult.wait()'s serve loop, not a hard
+    deadline). TradeManager._call must impose its own asyncio.wait_for so a
+    stuck call fails fast instead of blocking the entire mechanical loop
+    (and, transitively, PooledMT5Client's threading.Lock) indefinitely.
+    """
+    monkeypatch.setattr(TradeManager, "MT5_CALL_TIMEOUT_SECONDS", 0.05)
+
+    def hangs_forever(*args, **kwargs):
+        time.sleep(0.3)  # longer than the patched timeout, short enough to keep the suite fast
+        return "should never get here"
+
+    with pytest.raises(asyncio.TimeoutError):
+        await TradeManager._call(hangs_forever)
