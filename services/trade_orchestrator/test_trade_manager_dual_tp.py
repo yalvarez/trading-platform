@@ -870,7 +870,14 @@ async def test_reconcile_reports_orphan_for_unparseable_comment():
     sim = SimuladorMT5()
     sim.price = 2500.0
     store = RecordingStore()
-    store.compact = lambda active_group_ids: None
+
+    # Async, matching the real TradeStateStore.compact contract — a sync
+    # override here would raise TypeError inside reconcile_from_mt5's
+    # try/except and be masked as a mere warning, so compaction would
+    # silently never run and this test would still pass.
+    async def _compact(active_group_ids):
+        return None
+    store.compact = _compact
 
     ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="some-old-format")
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
@@ -917,7 +924,14 @@ async def test_reconcile_sets_next_group_id_above_the_highest_seen():
     sim = SimuladorMT5()
     sim.price = 2500.0
     store = RecordingStore()  # empty docs -- load_group naturally returns (None, "none")
-    store.load_all_group_ids = lambda: {5}  # group 5 known only from a closed entry in the file
+
+    # group 5 known only from a closed entry in the file. Async, matching the
+    # real TradeStateStore.load_all_group_ids contract — a sync override here
+    # would raise TypeError inside reconcile_from_mt5's try/except, silently
+    # dropping group 5 and leaving _next_group_id at 4 instead of 6.
+    async def _load_all_group_ids():
+        return {5}
+    store.load_all_group_ids = _load_all_group_ids
 
     _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP3-tp1")
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)

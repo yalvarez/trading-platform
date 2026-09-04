@@ -657,7 +657,13 @@ class TradeManager:
         usa en produccion, invocado aqui de forma sincrona porque el tick
         loop normal nunca detectaria ese cierre por si solo).
         """
-        summary = {"recovered_from_redis": 0, "recovered_from_file": 0, "degraded": 0, "orphaned": []}
+        # store_errors cuenta cada fallo silenciado de una llamada al store. Los
+        # try/except de este metodo existen para que un store roto nunca tumbe el
+        # arranque, pero sin este contador esa degradacion solo aparece en los logs
+        # — incluirlo en el summary lo sube a la notificacion de n8n, donde una
+        # persona puede verlo.
+        summary = {"recovered_from_redis": 0, "recovered_from_file": 0, "degraded": 0,
+                   "orphaned": [], "store_errors": 0}
         all_positions_by_group: dict[int, dict[str, object]] = {}
         highest_group_id_seen = 0
 
@@ -690,6 +696,7 @@ class TradeManager:
                 if store_group_ids:
                     highest_group_id_seen = max(highest_group_id_seen, max(store_group_ids))
             except Exception as e:
+                summary["store_errors"] += 1
                 log.warning("[TM][RECONCILE] fallo listando group_ids del store: %s", e)
 
         for group_id, entry in all_positions_by_group.items():
@@ -704,6 +711,7 @@ class TradeManager:
                 try:
                     doc, source = await self._maybe_await(self.state_store.load_group(group_id))
                 except Exception as e:
+                    summary["store_errors"] += 1
                     log.warning("[TM][RECONCILE] fallo leyendo group_id=%s del store: %s", group_id, e)
 
             if doc is not None:
@@ -738,15 +746,23 @@ class TradeManager:
             if doc is not None and mt5_tp1 is None and mt5_runner is None:
                 # Both legs of a known group are gone -- closed during downtime, clean up.
                 if self.state_store:
-                    await self._close_group_in_store(group_id)
+                    try:
+                        await self._close_group_in_store(group_id)
+                    except Exception as e:
+                        summary["store_errors"] += 1
+                        log.warning("[TM][RECONCILE] fallo cerrando group_id=%s en el store: %s", group_id, e)
 
             # Re-persist to Redis anything that wasn't already there (recovered from the
             # file backup, or reconstructed in degraded mode) — so a subsequent restart
             # that keeps Redis intact recovers fully from layer 1 next time.
-            if source != "redis" and self.state_store and self.trades:
+            if source != "redis" and self.state_store:
                 group_still_has_legs = any(t.group_id == group_id for t in self.trades.values())
                 if group_still_has_legs:
-                    await self._persist_group(group_id)
+                    try:
+                        await self._persist_group(group_id)
+                    except Exception as e:
+                        summary["store_errors"] += 1
+                        log.warning("[TM][RECONCILE] fallo re-persistiendo group_id=%s en el store: %s", group_id, e)
 
         self._next_group_id = highest_group_id_seen + 1
         ACTIVE_TRADES.set(len(self.trades))
@@ -756,10 +772,12 @@ class TradeManager:
                 active_ids = {t.group_id for t in self.trades.values()}
                 await self._maybe_await(self.state_store.compact(active_ids))
             except Exception as e:
+                summary["store_errors"] += 1
                 log.warning("[TM][RECONCILE] fallo compactando el store: %s", e)
 
-        log.info("[TM][RECONCILE] completado: recuperados_redis=%s degradados=%s huerfanos=%s",
-                  summary["recovered_from_redis"], summary["degraded"], len(summary["orphaned"]))
+        log.info("[TM][RECONCILE] completado: recuperados_redis=%s recuperados_archivo=%s degradados=%s huerfanos=%s errores_store=%s",
+                  summary["recovered_from_redis"], summary["recovered_from_file"], summary["degraded"],
+                  len(summary["orphaned"]), summary["store_errors"])
         await self._notify("reconciliation_summary", **summary)
         return summary
 
