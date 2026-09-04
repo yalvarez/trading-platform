@@ -69,6 +69,32 @@ class TradeManager:
         """
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _get_price_with_retry(self, client, symbol: str, direction: str, attempts: int = 3, delay_seconds: float = 0.15) -> float:
+        """
+        Pide tick_price con reintentos cortos. mt5linux abre una conexion RPyC
+        nueva por cada llamada (sin sesion persistente), asi que un
+        symbol_select seguido de inmediato por tick_price puede correr contra
+        el terminal MT5 (bajo Wine) antes de que este propague el estado del
+        simbolo recien seleccionado — tick_price entonces devuelve 0.0 sin
+        lanzar excepcion (no hay nada que _call pueda reintentar). Vimos esto
+        en produccion: una senal real se aborto por "sin precio" pese a que
+        el simbolo y el broker estaban perfectamente disponibles un segundo
+        despues. Reintentar aqui, en vez de abortar a la primera, absorbe ese
+        glitch transitorio sin enmascarar una falla real (broker cerrado,
+        simbolo inexistente) — tras `attempts` intentos vacios, se rinde igual.
+        """
+        for attempt in range(1, attempts + 1):
+            price = await self._call(client.tick_price, symbol, direction)
+            if price:
+                return price
+            if attempt < attempts:
+                log.warning(
+                    "[TM][OPEN] tick_price vacio para %s (intento %d/%d), reintentando",
+                    symbol, attempt, attempts,
+                )
+                await asyncio.sleep(delay_seconds)
+        return 0.0
+
     async def _wait_for_entry_range(self, client, symbol: str, direction: str, initial_price: float, entry_range: tuple) -> Optional[float]:
         """
         Espera a que el precio entre en [min(entry_range), max(entry_range)] antes de
@@ -157,7 +183,7 @@ class TradeManager:
 
         client = self.mt5._client_for(account)
         await self._call(client.symbol_select, symbol, True)
-        price = await self._call(client.tick_price, symbol, direction.upper())
+        price = await self._get_price_with_retry(client, symbol, direction.upper())
         if not price:
             log.error("[TM][OPEN] Abortado: sin precio para %s", symbol)
             await self._notify("open_aborted", symbol=symbol, reason="no_price")

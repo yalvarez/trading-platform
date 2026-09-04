@@ -512,3 +512,51 @@ async def test_open_group_aborts_when_price_never_enters_entry_range_within_wait
 
     assert group_id is None
     assert len(tm.trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_open_group_recovers_from_transient_empty_tick_on_first_price_read():
+    """
+    Reproduces a real production incident: mt5linux opens a fresh RPyC
+    connection per call (no persistent session), so symbol_select immediately
+    followed by tick_price can race the MT5 terminal's own state propagation
+    under Wine -- tick_price then returns 0.0 with no exception raised (so
+    PooledMT5Client's reconnect-on-exception logic never triggers). A real
+    TradePulse signal was silently dropped by this exact sequence. open_group
+    must retry the initial price read instead of aborting on the first empty tick.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    calls = {"n": 0}
+    real_tick_price = sim.tick_price
+
+    def flaky_tick_price(symbol, direction):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 0.0  # simulates the transient empty tick seen in production
+        return real_tick_price(symbol, direction)
+
+    sim.tick_price = flaky_tick_price
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2480.0, tp2=2460.0)
+
+    assert group_id is not None
+    assert calls["n"] == 2
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+
+
+@pytest.mark.asyncio
+async def test_open_group_aborts_after_exhausting_price_retries():
+    """If tick_price stays empty across every retry, open_group still aborts
+    cleanly (no positions opened) rather than retrying forever."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    sim.tick_price = lambda symbol, direction: 0.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2480.0, tp2=2460.0)
+
+    assert group_id is None
+    assert len(tm.trades) == 0
