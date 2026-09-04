@@ -57,12 +57,32 @@ tres capas (logs de Docker, streams de Redis, posiciones en MT5).
   dentro del entry-range gate) y para verificar el precio de apertura
   registrado.
 - **`telegram_sender.py`** — cliente Telethon con una sesión de prueba
-  separada de la del bot, que manda mensajes a `TG_TEST_CHAT_ID` (ya
-  definido en `.env.example`).
+  separada de la del bot, que manda mensajes a `TG_TEST_CHAT_ID`. **Precondición
+  de entorno** (no de código): `telegram_ingestor` filtra por
+  `allowed_channels` de `ACCOUNTS_JSON`
+  (`services/telegram_ingestor/app.py::build_channel_filter`), no por
+  `TG_TEST_CHAT_ID` — ese env var no está conectado a ningún filtro por sí
+  mismo. Para que los mensajes de prueba lleguen al pipeline, `TG_TEST_CHAT_ID`
+  debe ser el `chat_id` de un **grupo/canal de Telegram dedicado a
+  pruebas** (no el canal real de TradePulse — evita mezclar mensajes de
+  prueba, incluyendo cierres forzados y spam simulado, con el tráfico real
+  visible a otros miembros), agregado explícitamente a `allowed_channels`
+  en el `ACCOUNTS_JSON` del VPS de pruebas. Este canal de pruebas y su alta
+  en `ACCOUNTS_JSON` son un prerrequisito de setup, no parte del código de
+  la suite (ver §4).
 - **`vps_observer.py`** — agrega tres fuentes de verificación:
   - logs de `docker compose logs <servicio>` (subprocess local al VPS),
-  - lectura de streams de Redis (`XRANGE raw_messages`, `signals`,
-    management) para confirmar que un mensaje avanzó por el pipeline,
+  - lectura de streams de Redis: `XRANGE raw_messages` y
+    `XRANGE parsed_signals` (nombres reales, `services/common/redis_streams.py::Streams`)
+    para confirmar que una señal avanzó por el pipeline de apertura. **No
+    existe un stream de Redis para mensajes de gestión** — la ruta de
+    familia B es Telegram → `router_parser` (no reconocido como señal) →
+    POST a `N8N_INBOUND_WEBHOOK_URL` → n8n/Ollama clasifica → n8n hace
+    `POST /mgmt/action` (HTTP, con header `X-N8N-Action-Key`) sobre
+    `trade_orchestrator:8200`. Para familia B, `vps_observer` verifica por
+    logs de `trade_orchestrator` (líneas `[TM][MGMT]`, ver
+    `trade_manager.py::apply_mgmt_action`) y por el estado resultante de
+    la posición en MT5, no por un stream de Redis,
   - estado de posiciones en MT5 vía el mismo pool RPyC que `price_reader`.
 - **`scenarios/`** — un archivo por escenario, cada uno una función
   `async def run(ctx) -> ScenarioResult` con arrange/act/assert explícitos
@@ -99,28 +119,57 @@ Ejecución: `docker compose --profile e2e run --rm e2e_runner --scenario fast_si
 - **Canal de entrada:** `TG_TEST_CHAT_ID`, enviado por script (Telethon), no
   a mano — permite repetir la suite sin intervención manual.
 - **n8n/Ollama:** instancia real de pruebas (no mock) — ver §7 para cómo se
-  reporta una falla causada por esa dependencia externa.
+  reporta una falla causada por esa dependencia externa. **Precondición de
+  setup:** ese n8n debe tener su flujo de `N8N_INBOUND_WEBHOOK_URL`
+  apuntando al `router_parser` de este mismo VPS de pruebas, y su callback
+  de decisión apuntando a `POST http://<este-vps>:8200/mgmt/action` (con
+  el `N8N_ACTION_API_KEY` de este `.env`) — no al entorno de producción.
+  Si n8n está apuntando al `trade_orchestrator` equivocado, familia B
+  parece fallar por timeout (dependencia externa) cuando en realidad es un
+  error de configuración cruzada; confirmar esta configuración es parte
+  del checklist de pre-vuelo del runner (ver §7).
+- **Canal de Telegram de pruebas:** un grupo/canal dedicado, agregado a
+  `allowed_channels` en el `ACCOUNTS_JSON` de este VPS — ver §3.1
+  (`telegram_sender.py`) para el porqué.
 
 ## 5. Escenarios
 
 ### Familia A — Ciclo de vida de la señal (apertura + gestión completa)
 
+**Nota sobre determinismo:** el precio real de XAUUSD no se puede forzar a
+moverse; con el SL/TP por defecto (30 pips de TP) o el de un `SIGNAL ALERT`
+típico del canal (decenas de pips), alcanzar TP1 puede tardar minutos, horas,
+o no ocurrir en la ventana de la prueba. Para que A1/A2/A4 sean deterministas
+y rápidos, el mensaje de prueba se construye con un **TP1 muy cercano al
+precio leído por `price_reader`** (pocos pips — suficiente para no chocar
+con el spread/slippage típico, pero alcanzable en segundos a minutos dado el
+movimiento normal de XAUUSD) en vez de replicar los pips típicos de una señal
+real. Cada escenario define un timeout explícito (p. ej. 10 minutos) tras el
+cual, si TP1 no se alcanzó, el escenario se reporta como **inconcluso**
+(ni pass ni fail) en vez de fallar — distinción explícita en el reporte del
+runner (§7) para no confundir "el mercado no se movió" con "el bot falló".
+La fase de apertura + valores registrados (SL/TP/entry) se verifica siempre,
+incluso si la fase de cierre por TP1 queda inconclusa.
+
 - **A1. Fast solo** — `"XAUUSD BUY NOW"`, sin full después. Abre con SL/TP
   por defecto (`DEFAULT_SL_XAUUSD_PIPS`/`DEFAULT_TP_XAUUSD_PIPS`). Gestiona
   ciclo completo (BE al cerrar tp1_leg, trailing en runner, cierre) solo con
-  esos valores.
-- **A2. Fast → Full temprano** — full llega antes de que tp1_leg cierre.
-  `update_group_signal` reemplaza SL/TP1/TP2 sobre el grupo ya abierto (no
-  abre un segundo grupo). Assert: SL/TP en MT5 reflejan los del full, no los
-  default. Ciclo completo con los valores actualizados.
+  esos valores; ver nota de determinismo arriba para el timeout de TP1.
+- **A2. Fast → Full temprano** — full llega antes de que tp1_leg cierre, con
+  TP1 cercano al precio leído (ver nota de determinismo). `update_group_signal`
+  reemplaza SL/TP1/TP2 sobre el grupo ya abierto (no abre un segundo grupo).
+  Assert: SL/TP en MT5 reflejan los del full, no los default. Ciclo completo
+  con los valores actualizados.
 - **A3. Fast → Full tardío (borde)** — full llega después de que tp1_leg ya
-  cerró (BE aplicado) o con trailing ya activo en el runner. Assert basado
-  en comportamiento explícito ya presente en `trade_manager.py`
+  cerró (BE aplicado) o con trailing ya activo en el runner — esto requiere
+  que A3 fuerce TP1 muy cerca del precio de apertura para llegar a ese estado
+  rápido y confiablemente antes de mandar el full. Assert basado en
+  comportamiento explícito ya presente en `trade_manager.py`
   (`update_group_signal`, líneas ~312-352): el SL nunca retrocede respecto
   al ya mejorado por BE/trailing, y `peak_multiple` del runner se re-escala
   al nuevo `tp1`/`tp2` sin perder el progreso acumulado.
 - **A4. Full solo, sin fast previo** — abre directo con los valores del
-  full (no default). Ciclo completo normal.
+  full (no default), TP1 cercano al precio leído. Ciclo completo normal.
 
 ### Familia B — Gestión vía mensajes de management (lenguaje libre → n8n/Ollama)
 
@@ -142,8 +191,11 @@ Mensajes tomados del corpus real analizado en la memoria de proyecto
 - **B6. Progreso/milestone — no debe generar acción** — *"+240 PIPS
   SKYROCKETING"*, *"TP 1 DONE"*, *"Road to TP ONE"*. Assert: ninguna acción
   de mgmt disparada (falso positivo = fallo).
-- **B7. SL hit / recovery — no debe generar acción** — *"HIT SL ❌. GET
-  READY FOR RECOVERY 🤝"*. Sin acción implícita.
+- **B7. SL hit / recovery** — *"HIT SL ❌. GET READY FOR RECOVERY 🤝"* →
+  acción `note_sl_hit` (`trade_manager.py::apply_mgmt_action`, líneas
+  ~546-548): registra el evento y notifica, pero no modifica SL/TP ni
+  cierra la posición. Assert: la posición queda sin cambios en MT5 (no
+  "ninguna acción de mgmt", sino "ninguna acción que mute la posición").
 - **B8. Spam promocional — no debe generar acción ni trade** — mensaje tipo
   VIP/Pool Trading upsell. Cero efectos observables en Redis/MT5.
 
@@ -173,8 +225,8 @@ corridas.
 
 El runner imprime, por escenario, un resumen con lo observado en cada capa:
 línea de log relevante, entrada de stream de Redis (`raw_messages`,
-`signals`, management), y estado final de la posición en MT5. Un fallo se
-clasifica en una de dos categorías:
+`parsed_signals`), y estado final de la posición en MT5. Un resultado se
+clasifica en una de tres categorías:
 
 - **Fallo del bot** — el pipeline propio (ingestor/parser/orchestrator) no
   se comportó como se esperaba.
@@ -183,6 +235,18 @@ clasifica en una de dos categorías:
   esperado. El runner detecta esto por timeout en la acción de mgmt
   correspondiente sin señal de error propia, y lo reporta explícitamente
   como tal para no confundirlo con un bug del bot.
+- **Inconcluso** — exclusivo de familia A: la fase de apertura se verificó
+  correctamente, pero el precio real no alcanzó TP1 dentro del timeout del
+  escenario (ver nota de determinismo en §5, Familia A). No cuenta como
+  fallo del bot.
+
+**Checklist de pre-vuelo** (antes de correr `--all`, el runner valida y
+reporta si falta):
+- `TG_TEST_CHAT_ID` está en `allowed_channels` de `ACCOUNTS_JSON`.
+- El flujo n8n de pruebas responde en `N8N_INBOUND_WEBHOOK_URL` y su
+  callback apunta a este `trade_orchestrator:8200/mgmt/action` (ver §4) —
+  un chequeo básico (p. ej. un ping/health check si n8n lo expone, o
+  advertencia explícita si no se puede verificar automáticamente).
 
 ## 8. Testing de la propia suite
 
