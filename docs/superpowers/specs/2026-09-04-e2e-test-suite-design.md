@@ -23,8 +23,10 @@ tres capas (logs de Docker, streams de Redis, posiciones en MT5).
 
 **Dentro de alcance:**
 - Paquete `tests/e2e/` con helpers reutilizables (lectura de precio vía MT5,
-  envío de mensajes vía Telethon, observación de logs/Redis/MT5) y 15
-  escenarios organizados en 3 familias (ver §5).
+  envío de mensajes vía Telethon, observación de logs/Redis/MT5) y 17
+  escenarios organizados en 4 familias (ver §5): A (ciclo de vida de señal),
+  B (gestión vía n8n/Ollama), C (robustez del pipeline, incluyendo dedup y
+  reapertura tras cooldown), D (persistencia y reconciliación al reiniciar).
 - Un servicio nuevo `e2e_runner` en `docker-compose.yml`, bajo `profile: e2e`
   (no arranca con `docker compose up` normal), que comparte la red interna
   de Docker con Redis y `mt5_acct1` sin publicar ningún puerto nuevo.
@@ -55,7 +57,14 @@ tres capas (logs de Docker, streams de Redis, posiciones en MT5).
   `tick_price`/`symbol_info_tick`). Es la fuente de verdad para construir
   mensajes de señal con precios realistas (ej. un ENTRY PRICE que sí caiga
   dentro del entry-range gate) y para verificar el precio de apertura
-  registrado.
+  registrado. **Requisito de versión:** el cliente RPyC de este módulo debe
+  usar `rpyc==5.0.1` — `mt5_acct1` corre pinned a esa versión exacta
+  (commit `c043309`: `mt5linux>=1.1.0` arrastra `rpyc>=6.0`, que no es
+  compatible en protocolo con el servidor RPyC que corre dentro de
+  `mt5_acct1`, y produce síntomas confusos — `ValueError` en `brine.load`,
+  `TimeoutError: result expired` — en vez de un error de conexión claro).
+  Cualquier versión de `rpyc` distinta de `5.0.1` en `tests/e2e/` rompe el
+  handshake contra el mismo VPS que la suite prueba.
 - **`telegram_sender.py`** — cliente Telethon con una sesión de prueba
   separada de la del bot, que manda mensajes a `TG_TEST_CHAT_ID`. **Precondición
   de entorno** (no de código): `telegram_ingestor` filtra por
@@ -230,8 +239,26 @@ Mensajes tomados del corpus real analizado en la memoria de proyecto
 
 ### Familia C — Robustez del pipeline
 
-- **C1. Deduplicación** — mismo fast signal mandado 2 veces seguidas.
-  Assert: la segunda es descartada, no se abre un segundo grupo.
+- **C1. Deduplicación dentro del cooldown** — mismo fast signal mandado 2
+  veces seguidas, con menos de `REOPEN_COOLDOWN_SECONDS` (300s por defecto)
+  entre envíos. Assert: la segunda es descartada, no se abre un segundo
+  grupo. **Corrección respecto a la versión anterior de este escenario:**
+  el descarte ya no es incondicional — `TradeManager.group_age_seconds`
+  (commit `afbeb18`) hace que `handle_signal_fields` (`app.py`) solo trate
+  la señal repetida como duplicado si el grupo activo es **más joven** que
+  `REOPEN_COOLDOWN_SECONDS`; este escenario debe enviar ambos mensajes
+  claramente dentro de esa ventana (segundos, no minutos) para seguir
+  siendo una prueba válida de dedup.
+- **C1b. Reapertura legítima tras el cooldown** — mismo fast signal mandado
+  2 veces, con más de `REOPEN_COOLDOWN_SECONDS` entre envíos. Assert: la
+  segunda señal **sí** abre un segundo grupo independiente (no se descarta
+  como duplicado indefinidamente). Este es el propio bug de producción que
+  motivó `REOPEN_COOLDOWN_SECONDS` (commit `afbeb18`: dos señales fast
+  reales, ~7 minutos aparte, quedaron descartadas para siempre antes del
+  fix) — sin este caso, una regresión que vuelva a bloquear reaperturas
+  legítimas pasaría desapercibida. Dado que `REOPEN_COOLDOWN_SECONDS` es
+  300s por defecto, este escenario es más lento que el resto de la suite;
+  se acepta ese costo porque es el caso que reproduce el incidente real.
 - **C2. Texto no reconocido → n8n inbound** — texto que no es señal ni
   gestión reconocible. Assert: POST a `N8N_INBOUND_WEBHOOK_URL`, sin trade
   ni acción de mgmt.
@@ -239,6 +266,40 @@ Mensajes tomados del corpus real analizado en la memoria de proyecto
   de entry (`"4600- 4590"`, `"4325 - 4335"`), tal como aparece en mensajes
   reales del canal. Assert: el parser lo acepta igual (regresión sobre la
   variance ya documentada en la memoria de proyecto).
+
+### Familia D — Persistencia y reconciliación al reiniciar
+
+Agregada tras revisar el subsistema `TradeStateStore`/`TradeManager.reconcile_from_mt5`
+(ver `docs/superpowers/specs/2026-09-04-trade-state-persistence-design.md`),
+que nace de un incidente real de producción: un reinicio de
+`trade_orchestrator` dejó un grupo con ambas piernas abiertas en MT5 sin
+ningún tracking, sin BE ni trailing. Ese spec solo tiene tests unitarios
+contra `SimuladorMT5` — ningún test confirma el comportamiento contra un
+reinicio real de contenedor en el VPS. Este es el escenario más importante
+que faltaba en esta suite.
+
+**Nota de mecánica:** a diferencia de toda la Familia A-C, D1 reinicia
+deliberadamente el contenedor `trade_orchestrator`
+(`docker restart atp-trade-orchestrator` o `docker compose restart
+trade_orchestrator`) a mitad del escenario — algo que ningún otro escenario
+hace. Esto es intencional: es la única forma de ejercer
+`reconcile_from_mt5` de verdad. El escenario debe tolerar el tiempo de
+arranque normal del contenedor (reconexión a Redis, a `mt5_acct1`, montaje
+de rutas) antes de empezar a verificar el resultado.
+
+- **D1. Reinicio con grupo abierto y BE ya aplicado** — abre un grupo (fast
+  signal), espera a que TP1 cierre y BE se aplique al runner (mismo camino
+  que A1, o fuerza BE vía B1's `move_sl_be_now` si el precio no coopera
+  dentro de un timeout corto — evita depender de dos condiciones de mercado
+  no deterministas en cadena). Reinicia `trade_orchestrator`. Tras el
+  reinicio: assert que (a) el runner sigue existiendo bajo gestión (no
+  huérfano — reaparece en la lista de grupos gestionados, verificable por
+  el log de reconciliación `[RECONCILE] al arranque: ...` que `app.py` ya
+  emite), (b) su SL en MT5 sigue siendo el de BE aplicado (no se resetea ni
+  se pierde), (c) no se crea un grupo duplicado para el mismo símbolo, y
+  (d) el resumen de reconciliación logueado reporta el grupo como
+  recuperado desde Redis o archivo (no como reconstrucción degradada —
+  ambas fuentes de persistencia deberían tener el documento reciente).
 
 ## 6. Limpieza
 
