@@ -43,12 +43,21 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
             return
         sl = float(sl_raw) if sl_raw else None
         # Senal fast: si la señal completa (con TP1/TP2 reales) nunca llega, el
-        # grupo quedaria dependiendo solo del SL, sin ningun objetivo de salida.
-        # tp1_leg recibe un TP temporal de proteccion aqui; runner_leg se queda
-        # sin TP (tp1=None mas abajo en open_group), tal como ya era el diseño —
-        # esta pierna esta pensada para correr, no para cerrarse a un TP fijo.
+        # grupo quedaria dependiendo solo del SL, sin ningun objetivo de salida,
+        # Y el runner nunca haria trailing (_apply_trailing exige tp1_price y
+        # tp2_price no-None). tp1_leg recibe un TP temporal de proteccion aqui;
+        # runner_leg NO recibe TP real en MT5 (open_group solo pone tp en la
+        # pierna tp1, ver mas abajo) — eso no cambia, sigue siendo la pierna
+        # disenada para correr. Pero SI necesita tp1_price/tp2_price poblados
+        # en memoria para que el trailing se active. tp2_temp es sintetico
+        # (1 punto mas alla de tp1_temp, misma direccion) unicamente para
+        # definir un "unit" > 0: en la formula SL = tp1 + (peak*unit)/3 con
+        # peak = avance/unit, el unit se cancela algebraicamente — cualquier
+        # unit > 0 produce el mismo SL para el mismo avance de precio. No es
+        # un techo, es solo la unidad de medida del trailing.
         # Si la señal completa llega despues, update_group_signal sobreescribe
-        # este TP temporal con el TP1 real (ver trade_manager.py).
+        # ambos con los valores reales (ver trade_manager.py), y el trailing
+        # sigue desde donde iba (peak_multiple se reescala, no se resetea).
         client = tradeManager.mt5._client_for(account)
         price = client.tick_price(symbol, direction)
         from services.common.config import config as _config
@@ -59,7 +68,10 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
             sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
         default_tp_pips = float(_config.get("DEFAULT_TP_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_TP_PIPS", 100))
         default_tp1 = calcular_tp_default(symbol, direction, price, point, default_tp_pips) if default_tp_pips > 0 else None
-        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=None)
+        default_tp2 = None
+        if default_tp1 is not None:
+            default_tp2 = default_tp1 + point if direction.upper() == "BUY" else default_tp1 - point
+        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2)
         return
 
     sl = float(sl_raw) if sl_raw else None

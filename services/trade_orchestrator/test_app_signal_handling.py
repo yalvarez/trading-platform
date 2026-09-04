@@ -94,6 +94,51 @@ async def test_fast_signal_tp1_leg_keeps_temporary_tp_when_full_signal_never_arr
 
 
 @pytest.mark.asyncio
+async def test_fast_signal_runner_still_gets_be_and_trailing_when_full_signal_never_arrives():
+    """
+    The user's actual question: if the full signal never arrives, does the
+    runner still get the same BE + proportional trailing behavior as with a
+    full signal? Yes — tp1_leg's temporary TP and a synthetic tp2 (1 point
+    past it, same direction) give the runner a valid unit > 0 from the start.
+    The unit is purely a scaling constant in SL = tp1 + (peak*unit)/3 with
+    peak = advance/unit — it cancels out algebraically, so any unit > 0
+    yields the same SL for the same price advance. This test asserts the SL
+    value directly to prove that, independent of which internal unit was used.
+    """
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+
+    by_leg = {t.leg: t for t in tm.trades.values()}
+    tp1_leg, runner_leg = by_leg["tp1"], by_leg["runner"]
+    assert runner_leg.tp1_price is not None and runner_leg.tp2_price is not None
+
+    # tp1_leg closes on its temporary TP (simulated: removed from MT5 positions)
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNTS[0])
+    assert runner_leg.be_applied is True
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - runner_leg.entry_price) < 1e-6  # moved to BE
+
+    # Price advances well past tp1_price -- trailing must kick in exactly like
+    # the full-signal path (same SL = tp1 + advance/3 formula), not stay frozen at BE.
+    advance = 30.0
+    sim.price = runner_leg.tp1_price + advance
+    sim.positions[runner_leg.ticket]['price_current'] = sim.price
+    await tm._tick_once_account(ACCOUNTS[0])
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    expected_sl = runner_leg.tp1_price + advance / 3.0
+    assert abs(runner_pos.sl - expected_sl) < 1e-6
+    assert runner_pos.sl > runner_leg.entry_price  # progressed beyond BE
+
+
+@pytest.mark.asyncio
 async def test_full_signal_without_prior_fast_opens_group_directly():
     from services.trade_orchestrator.app import handle_signal_fields
 
