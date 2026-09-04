@@ -22,7 +22,7 @@ services:
       - PASSWORD=${MT5_WEB_PASS}
     ports:
       - "3001:3000"
-      - "9081:9081"
+      - "9081:8001"
     volumes:
       - mt5_acct1_config:/config
     healthcheck:
