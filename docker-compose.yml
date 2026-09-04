@@ -26,7 +26,7 @@ services:
     volumes:
       - mt5_acct1_config:/config
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9081"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8001"]
       interval: 5s
       timeout: 2s
       retries: 10
