@@ -142,6 +142,25 @@ def safe_comment(tag: str, comment_prefix: str = "TM") -> str:
     base = re.sub(r"[^A-Za-z0-9\-_.]", "", base)
     return base[:31]
 
+_GROUP_COMMENT_RE = re.compile(r"^TM-GRP(\d+)-(tp1|runner)$")
+
+
+def parse_group_comment(comment: Optional[str]) -> Optional[tuple[int, str]]:
+    """
+    Parsea el comment de una posicion MT5 abierta por este sistema
+    (formato TM-GRP{group_id}-{leg}, ver safe_comment). Retorna
+    (group_id, leg) si matchea exactamente, None si no matchea en absoluto
+    (comment de otra version del sistema, corrupto, o de otro origen) —
+    usado por TradeManager.reconcile_from_mt5() para distinguir posiciones
+    propias reconstruibles de posiciones huerfanas a solo notificar.
+    """
+    if not comment:
+        return None
+    m = _GROUP_COMMENT_RE.match(comment)
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2)
+
 def valor_pip(symbol: str, volume: float) -> float:
     """
     Estima el valor de un pip para el símbolo y volumen dados.

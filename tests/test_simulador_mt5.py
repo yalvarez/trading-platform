@@ -23,6 +23,8 @@ class SimuladorMT5:
                 'tp': req.get('tp', 0.0),
                 'price_current': self.price,
                 'type': req.get('type', 0),
+                'comment': req.get('comment', ''),
+                'magic': req.get('magic', 0),
             }
             return type('OrderSendResult', (), {'retcode': 10009, 'order': ticket, 'deal': ticket, 'comment': 'Request executed'})()
         elif action == 6:  # SL/TP update
