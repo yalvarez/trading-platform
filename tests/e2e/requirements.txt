@@ -1,0 +1,10 @@
+telethon>=1.36,<2
+redis>=5,<6
+httpx>=0.27,<1
+# Pinned exactly, not a range: mt5_acct1 runs pinned to rpyc==5.0.1 (commit
+# c043309, see docker-compose.yml's mt5_acct1 notes and
+# scripts/fix-mt5-linux-version.sh). rpyc>=6.0 is not wire-protocol
+# compatible with it and fails with confusing symptoms (ValueError in
+# brine.load, TimeoutError: result expired) instead of a clear connection
+# error — this must match trade_orchestrator/trade_api's own pinned version.
+rpyc==5.0.1
