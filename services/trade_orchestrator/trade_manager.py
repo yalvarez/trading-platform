@@ -1,5 +1,6 @@
 from .trade_utils import safe_comment
 import asyncio
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -57,7 +58,7 @@ class TradeManager:
         except Exception as e:
             log.warning("[TM] notify failed for event=%s: %s", event, e)
 
-    MT5_CALL_TIMEOUT_SECONDS = 20.0
+    DEFAULT_MT5_CALL_TIMEOUT_SECONDS = 20.0
 
     @staticmethod
     async def _call(fn, *args, **kwargs):
@@ -81,12 +82,23 @@ class TradeManager:
         threading.Lock de PooledMT5Client para ese host:port especifico — pero
         el resto del sistema (otras cuentas, el loop de senales, /mgmt/action)
         deja de esperar indefinidamente por esta unica llamada.
+
+        Timeout configurable via MT5_CALL_TIMEOUT_SECONDS (leido en cada llamada,
+        no cacheado, para que un valor invalido en .env no tumbe el arranque).
         """
+        timeout = TradeManager.DEFAULT_MT5_CALL_TIMEOUT_SECONDS
+        raw_timeout = os.getenv("MT5_CALL_TIMEOUT_SECONDS", "")
+        if raw_timeout:
+            try:
+                timeout = float(raw_timeout)
+            except ValueError:
+                log.warning("[TM] MT5_CALL_TIMEOUT_SECONDS='%s' invalido, usando default %.0fs",
+                            raw_timeout, TradeManager.DEFAULT_MT5_CALL_TIMEOUT_SECONDS)
         try:
-            return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=TradeManager.MT5_CALL_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout)
         except asyncio.TimeoutError:
             log.error("[TM] MT5 call %s colgada tras %.0fs (timeout) — abortando esta operacion, el hilo puede seguir vivo en 2do plano",
-                       getattr(fn, "__name__", fn), TradeManager.MT5_CALL_TIMEOUT_SECONDS)
+                       getattr(fn, "__name__", fn), timeout)
             raise
 
     async def _get_price_with_retry(self, client, symbol: str, direction: str, attempts: int = 3, delay_seconds: float = 0.15) -> float:

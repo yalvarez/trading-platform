@@ -630,7 +630,7 @@ async def test_call_times_out_instead_of_hanging_forever_on_a_stuck_mt5_socket(m
     stuck call fails fast instead of blocking the entire mechanical loop
     (and, transitively, PooledMT5Client's threading.Lock) indefinitely.
     """
-    monkeypatch.setattr(TradeManager, "MT5_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
 
     def hangs_forever(*args, **kwargs):
         time.sleep(0.3)  # longer than the patched timeout, short enough to keep the suite fast
@@ -638,3 +638,16 @@ async def test_call_times_out_instead_of_hanging_forever_on_a_stuck_mt5_socket(m
 
     with pytest.raises(asyncio.TimeoutError):
         await TradeManager._call(hangs_forever)
+
+
+@pytest.mark.asyncio
+async def test_call_falls_back_to_default_timeout_when_env_var_invalid(monkeypatch, caplog):
+    """An invalid MT5_CALL_TIMEOUT_SECONDS (unparseable) must not crash the
+    call — it falls back to the default and logs a warning, since a typo in
+    .env should never take down the whole service."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "not-a-number")
+
+    result = await TradeManager._call(lambda: "ok")
+
+    assert result == "ok"
+    assert "invalido" in caplog.text
