@@ -5,7 +5,7 @@
 **Goal:** Build a `tests/e2e/` suite that sends real Telegram messages to a
 dedicated test channel and verifies the full pipeline (Telegram →
 `telegram_ingestor` → Redis → `router_parser` → `trade_orchestrator` → MT5
-demo account) behaves correctly, across 15 scenarios in 3 families, runnable
+demo account) behaves correctly, across 17 scenarios in 4 families, runnable
 on the VPS via `docker compose --profile e2e run --rm e2e_runner`.
 
 **Architecture:** Four reusable async helpers (`price_reader`,
@@ -49,6 +49,24 @@ here (no new HTTP endpoint — the suite is a client, not a server).
   (`Streams.SIGNALS`) — there is no "management" stream (spec §3.1).
 - Every scenario that opens a position must close it — via its own assertion
   flow or an emergency cleanup keyed by `group_id` (spec §6).
+- `tests/e2e/requirements.txt` MUST pin `rpyc==5.0.1` exactly — `mt5_acct1`
+  runs pinned to that version (commit `c043309`); `rpyc>=6.0` breaks the
+  RPyC wire protocol against it with confusing symptoms (`ValueError` in
+  `brine.load`, `TimeoutError: result expired`), not a clear connection
+  error (spec §3.1).
+- Repeating the same fast signal is only discarded as a duplicate while the
+  active group is younger than `REOPEN_COOLDOWN_SECONDS` (300s default,
+  `TradeManager.group_age_seconds`) — past that window, the same signal
+  legitimately opens a second, independent group. C1 must send both
+  messages well within that window; C1b (new) explicitly covers sending
+  past it (spec §5, Familia C).
+- A container restart of `trade_orchestrator` must not lose management of
+  an open group — `TradeManager.reconcile_from_mt5`, wired in `main()`,
+  rebuilds `self.trades` from MT5 + `TradeStateStore` (Redis primary, JSONL
+  file backup) before `run_forever()` starts ticking. D1 (new, Family D)
+  is the only scenario that restarts the container mid-run (spec §5,
+  Familia D; full design at
+  `docs/superpowers/specs/2026-09-04-trade-state-persistence-design.md`).
 
 ---
 
@@ -83,8 +101,10 @@ tests/e2e/
     b7_sl_hit_note.py
     b8_spam_noop.py
     c1_dedup.py
+    c1b_reopen_after_cooldown.py
     c2_unrecognized_to_n8n.py
     c3_entry_range_dash_variants.py
+    d1_restart_reconciliation.py
 
 tests/e2e/test_price_reader.py       # unit tests (mocked RPyC)
 tests/e2e/test_telegram_sender.py    # unit tests (mocked Telethon)
@@ -318,7 +338,13 @@ def load_config() -> E2EConfig:
 telethon>=1.36,<2
 redis>=5,<6
 httpx>=0.27,<1
-rpyc>=6,<7
+# Pinned exactly, not a range: mt5_acct1 runs pinned to rpyc==5.0.1 (commit
+# c043309, see docker-compose.yml's mt5_acct1 notes and
+# scripts/fix-mt5-linux-version.sh). rpyc>=6.0 is not wire-protocol
+# compatible with it and fails with confusing symptoms (ValueError in
+# brine.load, TimeoutError: result expired) instead of a clear connection
+# error — this must match trade_orchestrator/trade_api's own pinned version.
+rpyc==5.0.1
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1906,12 +1932,21 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ## Task 10: Family C scenarios (pipeline robustness)
 
 **Files:**
-- Create: `tests/e2e/scenarios/c1_dedup.py`, `c2_unrecognized_to_n8n.py`, `c3_entry_range_dash_variants.py`
+- Create: `tests/e2e/scenarios/c1_dedup.py`, `c1b_reopen_after_cooldown.py`, `c2_unrecognized_to_n8n.py`, `c3_entry_range_dash_variants.py`
 - Test: one test file per scenario.
 
 **Interfaces:**
 - Consumes: same `ScenarioContext` as Task 8/9; `ctx.observer.read_raw_messages`/`read_parsed_signals` (Task 5) — these are the only scenarios that read the Redis streams directly, since C1/C2 are about the parsing/dedup layer, not management.
 - Produces: `run(ctx) -> ScenarioResult`, same contract.
+
+**Note on `REOPEN_COOLDOWN_SECONDS` (commit `afbeb18`, spec §5 Familia C):**
+`TradeManager.group_age_seconds` means a repeated fast signal for the same
+symbol is discarded as a duplicate ONLY while the active group is younger
+than `REOPEN_COOLDOWN_SECONDS` (300s default) — past that, the same signal
+opens a second, independent group. C1 (below) sends its two messages a few
+seconds apart, well inside the window. C1b is the new scenario covering the
+opposite case: sending well past the cooldown must open a second group —
+the exact production bug that motivated the cooldown in the first place.
 
 - [ ] **Step 1: Write the failing test for C1 (pattern to replicate for C2/C3)**
 
@@ -1982,9 +2017,13 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'tests.e2e.scenarios.c
 ```python
 # tests/e2e/scenarios/c1_dedup.py
 """
-C1 (spec section 5, Familia C): the same fast signal sent twice in a row.
-SignalDeduplicator (services/common/signal_dedup.py) must discard the
-second within DEDUP_TTL_SECONDS -- no second group should open.
+C1 (spec section 5, Familia C): the same fast signal sent twice in a row,
+well within REOPEN_COOLDOWN_SECONDS (300s default). SignalDeduplicator
+(services/common/signal_dedup.py) discards the second within
+DEDUP_TTL_SECONDS, AND the active group is still younger than
+REOPEN_COOLDOWN_SECONDS (TradeManager.group_age_seconds, commit afbeb18),
+so app.py's handle_signal_fields treats it as a duplicate too -- no second
+group should open. See c1b_reopen_after_cooldown.py for the opposite case.
 """
 import asyncio
 
@@ -1992,7 +2031,7 @@ from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioR
 from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
 
 SYMBOL = "XAUUSD"
-BETWEEN_SENDS_SECONDS = 3
+BETWEEN_SENDS_SECONDS = 3  # must stay well under REOPEN_COOLDOWN_SECONDS (300s default)
 SETTLE_SECONDS = 10
 
 
@@ -2025,7 +2064,79 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         return ScenarioResult(
             name="c1_dedup", outcome=ScenarioOutcome.PASS,
             evidence={"positions_after": positions_after},
-            detail="second identical fast signal within dedup TTL correctly discarded",
+            detail="second identical fast signal within dedup TTL and reopen cooldown correctly discarded",
+        )
+    finally:
+        await cleanup_group(ctx, SYMBOL)
+```
+
+```python
+# tests/e2e/scenarios/c1b_reopen_after_cooldown.py
+"""
+C1b (spec section 5, Familia C, new): the same fast signal sent twice, more
+than REOPEN_COOLDOWN_SECONDS apart. Past that window, TradeManager.
+group_age_seconds (commit afbeb18) makes app.py's handle_signal_fields treat
+the repeat as a legitimate reopen rather than a duplicate -- it must open a
+SECOND, independent group (BUY or SELL). This is the exact production
+incident that motivated REOPEN_COOLDOWN_SECONDS: two real fast signals ~7
+minutes apart were both silently dropped forever before this fix. Slower
+than the rest of the suite (waits past the 300s default cooldown) --
+accepted because it reproduces the real incident.
+"""
+import asyncio
+import os
+
+from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
+from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
+
+SYMBOL = "XAUUSD"
+SETTLE_AFTER_SECOND_SEND_SECONDS = 15
+
+
+def _reopen_cooldown_seconds() -> float:
+    return float(os.environ.get("REOPEN_COOLDOWN_SECONDS", 300))
+
+
+async def run(ctx: ScenarioContext) -> ScenarioResult:
+    await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
+
+    async def check_two_legs_open():
+        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        return positions if len(positions) >= 2 else None
+
+    first_group_positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
+    if not first_group_positions:
+        return ScenarioResult(
+            name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.FAIL,
+            evidence={}, detail="first fast signal did not open two legs",
+        )
+
+    try:
+        # Wait past REOPEN_COOLDOWN_SECONDS with a margin, so the retest
+        # isn't flaky against clock/latency skew between this container and
+        # trade_orchestrator's own timing.
+        wait_seconds = _reopen_cooldown_seconds() + 20
+        await asyncio.sleep(wait_seconds)
+
+        await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
+
+        async def check_second_group_opened():
+            positions = await ctx.observer.positions_for_symbol(SYMBOL)
+            return positions if len(positions) >= 4 else None
+
+        all_positions = await _poll_until(check_second_group_opened, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
+        if not all_positions:
+            after_wait = await ctx.observer.positions_for_symbol(SYMBOL)
+            return ScenarioResult(
+                name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.FAIL,
+                evidence={"positions_after_wait": after_wait},
+                detail="fast signal past REOPEN_COOLDOWN_SECONDS was still discarded as a duplicate "
+                       "(the exact production bug this cooldown was built to fix)",
+            )
+        return ScenarioResult(
+            name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.PASS,
+            evidence={"positions": all_positions},
+            detail="fast signal past the reopen cooldown correctly opened a second, independent group",
         )
     finally:
         await cleanup_group(ctx, SYMBOL)
@@ -2147,32 +2258,384 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         await cleanup_group(ctx, SYMBOL)
 ```
 
+- [ ] **Step 3b: Write the failing test for C1b, then its implementation is already shown above**
+
+```python
+# tests/e2e/scenarios/test_c1b_reopen_after_cooldown.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome
+from tests.e2e.scenarios import c1b_reopen_after_cooldown
+
+
+@pytest.mark.asyncio
+async def test_c1b_signal_past_cooldown_opens_a_second_independent_group(monkeypatch):
+    monkeypatch.setenv("REOPEN_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr("tests.e2e.scenarios.c1b_reopen_after_cooldown.asyncio.sleep", AsyncMock())
+
+    price_reader = MagicMock()
+    sender = MagicMock()
+    sender.send = AsyncMock(return_value=1)
+    observer = MagicMock()
+    observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # first group opens
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 3, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 4, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # second group opens past cooldown
+        ]
+    )
+    cfg = MagicMock(tg_test_chat_id=-1009999999999)
+    ctx = ScenarioContext(cfg=cfg, price_reader=price_reader, sender=sender, observer=observer)
+
+    result = await c1b_reopen_after_cooldown.run(ctx)
+
+    assert ctx.sender.send.await_count == 2
+    assert result.outcome == ScenarioOutcome.PASS
+
+
+@pytest.mark.asyncio
+async def test_c1b_fails_when_signal_past_cooldown_is_still_discarded(monkeypatch):
+    monkeypatch.setenv("REOPEN_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr("tests.e2e.scenarios.c1b_reopen_after_cooldown.asyncio.sleep", AsyncMock())
+
+    price_reader = MagicMock()
+    sender = MagicMock()
+    sender.send = AsyncMock(return_value=1)
+    observer = MagicMock()
+    observer.positions_for_symbol = AsyncMock(
+        return_value=[{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+                      {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
+    )  # never grows to 4 — regression: still being discarded as a duplicate
+    cfg = MagicMock(tg_test_chat_id=-1009999999999)
+    ctx = ScenarioContext(cfg=cfg, price_reader=price_reader, sender=sender, observer=observer)
+
+    result = await c1b_reopen_after_cooldown.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.FAIL
+```
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `pytest tests/e2e/scenarios/test_c1_dedup.py -v`
+Run: `pytest tests/e2e/scenarios/test_c1_dedup.py tests/e2e/scenarios/test_c1b_reopen_after_cooldown.py -v`
 Expected: PASS (write equivalent tests for C2/C3 following the same pattern)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/e2e/scenarios/c1_dedup.py tests/e2e/scenarios/c2_unrecognized_to_n8n.py \
+git add tests/e2e/scenarios/c1_dedup.py tests/e2e/scenarios/c1b_reopen_after_cooldown.py \
+        tests/e2e/scenarios/c2_unrecognized_to_n8n.py \
         tests/e2e/scenarios/c3_entry_range_dash_variants.py tests/e2e/scenarios/test_c1_dedup.py \
+        tests/e2e/scenarios/test_c1b_reopen_after_cooldown.py \
         tests/e2e/scenarios/test_c2_unrecognized_to_n8n.py tests/e2e/scenarios/test_c3_entry_range_dash_variants.py
-git commit -m "feat(e2e): add Family C scenarios (dedup, unrecognized text, entry-range dash variants)
+git commit -m "feat(e2e): add Family C scenarios (dedup, reopen-after-cooldown, unrecognized text, entry-range dash variants)
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 11: `runner.py` CLI
+## Task 11: Family D scenario (persistence and restart reconciliation)
+
+**Files:**
+- Modify: `tests/e2e/vps_observer.py` (add `restart_container`)
+- Modify: `tests/e2e/test_vps_observer.py` (test for `restart_container`)
+- Create: `tests/e2e/scenarios/d1_restart_reconciliation.py`
+- Test: `tests/e2e/scenarios/test_d1_restart_reconciliation.py`
+
+**Interfaces:**
+- Consumes: `ScenarioContext`, `ScenarioOutcome`, `ScenarioResult`, `cleanup_group` (Task 7); `open_position_for_management_test` (Task 9, `_management_common.py`) to open the group; `b1_be_variant1`'s BE-forcing message (Task 9) as the reliable way to reach a BE-applied state without depending on TP1 being hit by real market movement.
+- Produces: `VpsObserver.restart_container(self, container: str, settle_seconds: float = 30) -> None` — runs `docker restart <container>`, then sleeps `settle_seconds` to let it reconnect to Redis/`mt5_acct1`/mount its volumes before the caller starts polling. `d1_restart_reconciliation.run(ctx) -> ScenarioResult`, same contract as every other scenario.
+
+**Background (spec §5, Familia D):** unlike every other scenario, this one
+deliberately restarts `trade_orchestrator` mid-run to exercise
+`TradeManager.reconcile_from_mt5` (see
+`docs/superpowers/specs/2026-09-04-trade-state-persistence-design.md`) —
+the subsystem built after a real production incident where a container
+restart left an open group with no mechanical management at all. This
+scenario is the only one in the suite that can catch a regression there;
+`SimuladorMT5`-based unit tests (already covering `reconcile_from_mt5`
+itself) cannot exercise a real container restart, real Redis persistence,
+or a real bind-mounted `data/trade_state.jsonl`.
+
+- [ ] **Step 1: Write the failing test for `VpsObserver.restart_container`**
+
+```python
+# add to tests/e2e/test_vps_observer.py
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_restart_container_calls_docker_restart_and_waits(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("tests.e2e.vps_observer.subprocess.run", fake_run)
+    monkeypatch.setattr("tests.e2e.vps_observer.asyncio.sleep", fake_sleep)
+
+    observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
+    await observer.restart_container("atp-trade-orchestrator", settle_seconds=45)
+
+    assert calls == [["docker", "restart", "atp-trade-orchestrator"]]
+    assert sleep_calls == [45]
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/e2e/test_vps_observer.py::test_restart_container_calls_docker_restart_and_waits -v`
+Expected: FAIL with `AttributeError: 'VpsObserver' object has no attribute 'restart_container'`
+
+- [ ] **Step 3: Add `restart_container` to `vps_observer.py`**
+
+Add to `tests/e2e/vps_observer.py` (needs `import asyncio` at the top of the file, alongside the existing `subprocess`/`rpyc` imports):
+
+```python
+    async def restart_container(self, container: str, settle_seconds: float = 30) -> None:
+        """
+        Restarts a docker-compose service container by its container_name
+        (e.g. "atp-trade-orchestrator") and waits settle_seconds for it to
+        reconnect to Redis/mt5_acct1 and remount its volumes before the
+        caller starts polling for post-restart state. Used by
+        d1_restart_reconciliation to exercise TradeManager.reconcile_from_mt5
+        against a real restart (spec section 5, Familia D).
+        """
+        subprocess.run(["docker", "restart", container], capture_output=True, text=True, check=False)
+        await asyncio.sleep(settle_seconds)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pytest tests/e2e/test_vps_observer.py -v`
+Expected: PASS (all tests, including the new one)
+
+- [ ] **Step 5: Write the failing test for D1**
+
+```python
+# tests/e2e/scenarios/test_d1_restart_reconciliation.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome
+from tests.e2e.scenarios import d1_restart_reconciliation
+
+
+def _ctx_with_be_applied_position():
+    price_reader = MagicMock()
+    price_reader.read_price = AsyncMock(return_value=2500.0)
+    sender = MagicMock()
+    sender.send = AsyncMock(return_value=1)
+    observer = MagicMock()
+    observer.restart_container = AsyncMock()
+    observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after fast open
+            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],  # after BE applied (tp1 leg closed)
+            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],  # after restart: same SL, same single position
+        ]
+    )
+    observer.grep_container_logs = MagicMock(
+        side_effect=[
+            ["[TM][EVENT] mgmt_move_sl_be_applied {'group_id': 1}"],  # BE confirmation before restart
+            ["[RECONCILE] al arranque: {'recovered_from_redis': 1, 'recovered_from_file': 0, 'degraded': 0, 'orphaned': []}"],  # after restart
+        ]
+    )
+    cfg = MagicMock(tg_test_chat_id=-1009999999999)
+    return ScenarioContext(cfg=cfg, price_reader=price_reader, sender=sender, observer=observer)
+
+
+@pytest.mark.asyncio
+async def test_d1_position_survives_restart_with_same_sl_and_no_duplicate():
+    ctx = _ctx_with_be_applied_position()
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    ctx.observer.restart_container.assert_awaited_once()
+    assert result.outcome == ScenarioOutcome.PASS
+
+
+@pytest.mark.asyncio
+async def test_d1_fails_when_position_is_orphaned_after_restart():
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
+            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],
+            [{"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # SL reverted after restart!
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
+async def test_d1_fails_when_restart_duplicates_the_group():
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
+            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],
+            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01},
+             {"ticket": 3, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # a second, duplicate position appeared
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.FAIL
+```
+
+- [ ] **Step 6: Run test to verify it fails**
+
+Run: `pytest tests/e2e/scenarios/test_d1_restart_reconciliation.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'tests.e2e.scenarios.d1_restart_reconciliation'`
+
+- [ ] **Step 7: Write minimal implementation**
+
+```python
+# tests/e2e/scenarios/d1_restart_reconciliation.py
+"""
+D1 (spec section 5, Familia D, new): open a group, force BE onto the runner
+(reusing B1's "Set BE for zero risk" message rather than waiting on real
+TP1 movement -- avoids stacking two non-deterministic market conditions),
+then restart trade_orchestrator mid-run. TradeManager.reconcile_from_mt5
+(wired in app.py's main(), see
+docs/superpowers/specs/2026-09-04-trade-state-persistence-design.md) must
+rebuild the runner's managed state from TradeStateStore (Redis primary,
+JSONL file backup) before run_forever() starts ticking again -- this is
+the exact production incident that motivated that subsystem: a restart
+silently dropping management of an open group.
+"""
+from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
+from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
+from tests.e2e.scenarios.b1_be_variant1 import MESSAGE as BE_MESSAGE
+
+RESTART_SETTLE_SECONDS = 30
+POST_RESTART_POLL_TIMEOUT_SECONDS = 60
+POST_RESTART_POLL_INTERVAL_SECONDS = 5
+CONTAINER_NAME = "atp-trade-orchestrator"
+
+
+async def run(ctx: ScenarioContext) -> ScenarioResult:
+    positions = await open_position_for_management_test(ctx)
+    if len(positions) < 2:
+        return ScenarioResult(
+            name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+            evidence={}, detail="setup failed: fast signal did not open two legs",
+        )
+
+    await ctx.sender.send(ctx.cfg.tg_test_chat_id, BE_MESSAGE)
+
+    try:
+        async def check_be_applied():
+            current = await ctx.observer.positions_for_symbol(SYMBOL)
+            runner = next(iter(current), None)
+            entry_sl = positions[0]["sl"]
+            if runner and runner["sl"] != entry_sl:
+                return runner
+            return None
+
+        runner_before_restart = await _poll_until(check_be_applied, 120, 5)
+        be_logs = ctx.observer.grep_container_logs(CONTAINER_NAME, "[TM][EVENT] mgmt_move_sl_be_applied")
+        if not runner_before_restart:
+            if not be_logs:
+                return ScenarioResult(
+                    name="d1_restart_reconciliation", outcome=ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE,
+                    evidence={}, detail="setup failed: no mgmt_move_sl_be_applied before restart — n8n/Ollama likely did not act",
+                )
+            return ScenarioResult(
+                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+                evidence={"be_logs": be_logs}, detail="setup failed: BE was logged but SL did not change before restart",
+            )
+
+        sl_before_restart = runner_before_restart["sl"]
+
+        await ctx.observer.restart_container(CONTAINER_NAME, settle_seconds=RESTART_SETTLE_SECONDS)
+
+        async def check_single_position_unchanged():
+            after = await ctx.observer.positions_for_symbol(SYMBOL)
+            return after if after else None
+
+        positions_after_restart = await _poll_until(
+            check_single_position_unchanged, POST_RESTART_POLL_TIMEOUT_SECONDS, POST_RESTART_POLL_INTERVAL_SECONDS
+        )
+        reconcile_logs = ctx.observer.grep_container_logs(CONTAINER_NAME, "[RECONCILE] al arranque")
+
+        if not positions_after_restart:
+            return ScenarioResult(
+                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+                evidence={"reconcile_logs": reconcile_logs},
+                detail="position disappeared entirely after restart — reconciliation lost the group",
+            )
+        if len(positions_after_restart) != 1:
+            return ScenarioResult(
+                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+                evidence={"positions_after_restart": positions_after_restart, "reconcile_logs": reconcile_logs},
+                detail=f"expected 1 position (the runner) after restart, found {len(positions_after_restart)} — "
+                       "reconciliation likely duplicated the group instead of recognizing the existing one",
+            )
+        if positions_after_restart[0]["sl"] != sl_before_restart:
+            return ScenarioResult(
+                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+                evidence={"sl_before_restart": sl_before_restart, "sl_after_restart": positions_after_restart[0]["sl"],
+                          "reconcile_logs": reconcile_logs},
+                detail="runner's BE-applied SL was not preserved across the restart",
+            )
+        if not reconcile_logs:
+            return ScenarioResult(
+                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+                evidence={"positions_after_restart": positions_after_restart},
+                detail="position and SL survived, but no [RECONCILE] log line was emitted — "
+                       "reconcile_from_mt5 may not have run, or logging regressed",
+            )
+        return ScenarioResult(
+            name="d1_restart_reconciliation", outcome=ScenarioOutcome.PASS,
+            evidence={"positions_after_restart": positions_after_restart, "reconcile_logs": reconcile_logs},
+            detail="trade_orchestrator restart correctly reconciled the BE-applied group with no duplication or state loss",
+        )
+    finally:
+        await cleanup_group(ctx, SYMBOL)
+```
+
+- [ ] **Step 8: Run tests to verify they pass**
+
+Run: `pytest tests/e2e/scenarios/test_d1_restart_reconciliation.py -v`
+Expected: PASS
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add tests/e2e/vps_observer.py tests/e2e/test_vps_observer.py \
+        tests/e2e/scenarios/d1_restart_reconciliation.py tests/e2e/scenarios/test_d1_restart_reconciliation.py
+git commit -m "feat(e2e): add Family D scenario (trade_orchestrator restart reconciliation)
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 12: `runner.py` CLI
 
 **Files:**
 - Create: `tests/e2e/runner.py`
 - Test: `tests/e2e/test_runner.py`
 
 **Interfaces:**
-- Consumes: `E2EConfig`/`load_config` (Task 2), `run_preflight` (Task 6), every scenario's `run(ctx) -> ScenarioResult` (Tasks 8-10), `ScenarioContext`/`ScenarioResult`/`ScenarioOutcome` (Task 7).
+- Consumes: `E2EConfig`/`load_config` (Task 2), `run_preflight` (Task 6), every scenario's `run(ctx) -> ScenarioResult` (Tasks 8-11), `ScenarioContext`/`ScenarioResult`/`ScenarioOutcome` (Task 7).
 - Produces:
   - `SCENARIOS: dict[str, Callable]` — the name → `run` function registry, one entry per scenario module.
   - `async def run_scenario(name: str, ctx: ScenarioContext) -> ScenarioResult` — looks up and calls the scenario's `run`.
@@ -2189,12 +2652,13 @@ from tests.e2e.runner import run_scenario, format_report, SCENARIOS
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult
 
 
-def test_scenarios_registry_has_all_15_entries():
+def test_scenarios_registry_has_all_17_entries():
     expected = {
         "a1_fast_only", "a2_fast_then_full_early", "a3_fast_then_full_late", "a4_full_only",
         "b1_be_variant1", "b2_be_variant2", "b3_be_variant3", "b4_forced_close",
         "b5_signal_correction", "b6_milestone_noop", "b7_sl_hit_note", "b8_spam_noop",
-        "c1_dedup", "c2_unrecognized_to_n8n", "c3_entry_range_dash_variants",
+        "c1_dedup", "c1b_reopen_after_cooldown", "c2_unrecognized_to_n8n", "c3_entry_range_dash_variants",
+        "d1_restart_reconciliation",
     }
     assert set(SCENARIOS.keys()) == expected
 
@@ -2263,7 +2727,8 @@ from tests.e2e.scenarios import (
     a1_fast_only, a2_fast_then_full_early, a3_fast_then_full_late, a4_full_only,
     b1_be_variant1, b2_be_variant2, b3_be_variant3, b4_forced_close,
     b5_signal_correction, b6_milestone_noop, b7_sl_hit_note, b8_spam_noop,
-    c1_dedup, c2_unrecognized_to_n8n, c3_entry_range_dash_variants,
+    c1_dedup, c1b_reopen_after_cooldown, c2_unrecognized_to_n8n, c3_entry_range_dash_variants,
+    d1_restart_reconciliation,
 )
 
 SCENARIOS = {
@@ -2280,8 +2745,10 @@ SCENARIOS = {
     "b7_sl_hit_note": b7_sl_hit_note.run,
     "b8_spam_noop": b8_spam_noop.run,
     "c1_dedup": c1_dedup.run,
+    "c1b_reopen_after_cooldown": c1b_reopen_after_cooldown.run,
     "c2_unrecognized_to_n8n": c2_unrecognized_to_n8n.run,
     "c3_entry_range_dash_variants": c3_entry_range_dash_variants.run,
+    "d1_restart_reconciliation": d1_restart_reconciliation.run,
 }
 
 
@@ -2383,14 +2850,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-## Task 12: Dockerfile + docker-compose `e2e_runner` service
+## Task 13: Dockerfile + docker-compose `e2e_runner` service
 
 **Files:**
 - Create: `tests/e2e/Dockerfile`
 - Modify: `docker-compose.yml`
 
 **Interfaces:**
-- Consumes: `tests/e2e/requirements.txt` (Task 2), the full `tests/e2e/` package (Tasks 2-11).
+- Consumes: `tests/e2e/requirements.txt` (Task 2), the full `tests/e2e/` package (Tasks 2-12).
 - Produces: a runnable `docker compose --profile e2e run --rm e2e_runner --scenario <name>` command against the VPS.
 
 - [ ] **Step 1: Write the Dockerfile**
@@ -2469,13 +2936,13 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-## Task 13: Full local unit-test pass + `.env.example` documentation
+## Task 14: Full local unit-test pass + `.env.example` documentation
 
 **Files:**
 - Modify: `.env.example`
 - Test: entire `tests/e2e/` unit test suite (no VPS required)
 
-**Interfaces:** none new — this task verifies Tasks 1-12 are wired together and documents the new required variables for whoever sets up the VPS `.env`.
+**Interfaces:** none new — this task verifies Tasks 1-13 are wired together and documents the new required variables for whoever sets up the VPS `.env`.
 
 - [ ] **Step 1: Run every e2e unit test together**
 
@@ -2504,6 +2971,13 @@ TRADE_ORCHESTRATOR_HOST=trade_orchestrator
 # -- ver docs/superpowers/specs/2026-09-04-e2e-test-suite-design.md seccion 3.1.
 # El n8n/Ollama de pruebas debe apuntar su webhook de entrada y su callback
 # de /mgmt/action a ESTE VPS, no a produccion -- ver seccion 4 del mismo spec.
+#
+# REOPEN_COOLDOWN_SECONDS y data/trade_state.jsonl (bind-mount de
+# trade_orchestrator) ya deben existir en el .env/host de este VPS para que
+# los escenarios C1b y D1 tengan sentido -- ver
+# docs/superpowers/specs/2026-09-04-trade-state-persistence-design.md.
+# No se redefinen aqui: ya son parte de la configuracion base de
+# trade_orchestrator, no exclusivos de la suite e2e.
 ```
 
 - [ ] **Step 4: Commit**
@@ -2520,17 +2994,24 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ## Self-Review Notes
 
 **Spec coverage:**
-- §3.1 four modules → Tasks 3, 4, 5, 11 (`price_reader`, `telegram_sender`, `vps_observer`, `runner`). ✓
-- §3.1 scenarios as files with arrange/act/assert + cleanup → Tasks 7-10. ✓
-- §3.2 `e2e_runner` service, `profile: e2e`, no new ports → Task 12 (plus the Docker-socket mount called out explicitly as a deviation the operator should confirm). ✓
-- §4 preconditions (test channel in `allowed_channels`, n8n pointing at this VPS) → Task 6 (`preflight.py` checks the channel automatically; the n8n-pointing-at-this-VPS check is inherently unverifiable from inside this repo, so it's documented as an operator precondition in Task 13's `.env.example` addition and in every Family B scenario's docstring, consistent with spec §7's own admission that this can only be a partial check).
+- §3.1 four modules → Tasks 3, 4, 5, 12 (`price_reader`, `telegram_sender`, `vps_observer`, `runner`). ✓
+- §3.1 `rpyc==5.0.1` pin (commit `c043309`) → Task 2's `requirements.txt`. ✓
+- §3.1 scenarios as files with arrange/act/assert + cleanup → Tasks 7-11. ✓
+- §3.2 `e2e_runner` service, `profile: e2e`, no new ports → Task 13 (plus the Docker-socket mount called out explicitly as a deviation the operator confirmed). ✓
+- §4 preconditions (test channel in `allowed_channels`, n8n pointing at this VPS) → Task 6 (`preflight.py` checks the channel automatically; the n8n-pointing-at-this-VPS check is inherently unverifiable from inside this repo, so it's documented as an operator precondition in Task 14's `.env.example` addition and in every Family B scenario's docstring, consistent with spec §7's own admission that this can only be a partial check).
 - §5 Family A (4 scenarios, determinism note, 5s gold entry-range note) → Task 8. ✓
 - §5 Family B (8 scenarios, corrected B7) → Task 9. ✓
-- §5 Family C (3 scenarios) → Task 10. ✓
+- §5 Family C (C1 corrected for `REOPEN_COOLDOWN_SECONDS`, C1b new, C2, C3) → Task 10. ✓
+- §5 Family D (D1, new — restart/reconciliation) → Task 11. ✓
 - §6 cleanup → `cleanup_group` (Task 7), called from every scenario's `finally`. ✓
-- §7 report + 3-way outcome classification + pre-flight → Task 11 (`format_report`), Task 6 (`preflight`). ✓
-- §8 unit tests for helpers, scenarios only exercised for real → every task pairs a helper with unit tests; scenario unit tests mock `ScenarioContext` entirely (never touch real Telethon/RPyC/Redis), consistent with "scenarios are the test, not tested" — the mocking in Tasks 8-10 verifies orchestration logic (which message is sent, how results are classified), not real infrastructure behavior.
+- §7 report + 3-way outcome classification + pre-flight → Task 12 (`format_report`), Task 6 (`preflight`). ✓
+- §8 unit tests for helpers, scenarios only exercised for real → every task pairs a helper with unit tests; scenario unit tests mock `ScenarioContext` entirely (never touch real Telethon/RPyC/Redis, and D1's test mocks `restart_container` too — no real `docker restart` runs outside the live suite), consistent with "scenarios are the test, not tested" — the mocking in Tasks 8-11 verifies orchestration logic (which message is sent, how results are classified), not real infrastructure behavior.
 
-**Type consistency check:** `ScenarioContext`, `ScenarioResult`, `ScenarioOutcome`, `cleanup_group` (Task 7) are used identically across Tasks 8, 9, 10, 11 — same field names (`cfg`, `price_reader`, `sender`, `observer`), same `run(ctx) -> ScenarioResult` signature everywhere, same `SCENARIOS` dict keys used consistently between Task 11's registry and every scenario module's filename.
+**Type consistency check:** `ScenarioContext`, `ScenarioResult`, `ScenarioOutcome`, `cleanup_group` (Task 7) are used identically across Tasks 8, 9, 10, 11, 12 — same field names (`cfg`, `price_reader`, `sender`, `observer`), same `run(ctx) -> ScenarioResult` signature everywhere, same `SCENARIOS` dict keys used consistently between Task 12's registry and every scenario module's filename (17 entries, verified in Task 12's own registry test).
 
-**Docker-socket mount:** confirmed with the user as an explicit operator decision (read-only, on an already-trusted VPS) in preference to the more complex host-exposure alternative — spec §3.2 documents it, Task 12 implements it. Not an open item.
+**Docker-socket mount:** confirmed with the user as an explicit operator decision (read-only, on an already-trusted VPS) in preference to the more complex host-exposure alternative — spec §3.2 documents it, Task 13 implements it. Not an open item.
+
+**Post-plan code changes (three landed after this plan was first written, now folded in):**
+- `rpyc==5.0.1` pin (Task 2) — without it, `price_reader`/`vps_observer` RPyC calls would fail against `mt5_acct1`'s own pinned version with confusing protocol-mismatch symptoms.
+- `REOPEN_COOLDOWN_SECONDS` (Task 10) — corrected C1's assumption that dedup is unconditional, and added C1b to cover the reopen-after-cooldown case, which is the exact real production incident that motivated the cooldown.
+- `TradeStateStore`/`reconcile_from_mt5` (Task 11, new) — the strongest new scenario in this update: no existing test (unit or e2e) exercises a real `trade_orchestrator` container restart against a real Redis/file-backed store, which is exactly the gap that caused the production incident this subsystem was built to fix.
