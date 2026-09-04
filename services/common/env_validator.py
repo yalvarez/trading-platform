@@ -61,7 +61,7 @@ def validate_telegram_ingestor() -> None:
 def validate_trade_orchestrator() -> None:
     """Valida variables requeridas por trade_orchestrator."""
     errors = []
-    for name in ("REDIS_URL",):
+    for name in ("REDIS_URL", "N8N_ACTION_API_KEY"):
         try:
             _require(name)
         except EnvError as e:

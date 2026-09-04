@@ -1,7 +1,6 @@
 aioredis
 redis==5.0.7
 pydantic==2.7.1
-telethon==1.36.0
 prometheus_client==0.16.0
 mt5linux
 httpx

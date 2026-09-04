@@ -9,8 +9,6 @@ log = logging.getLogger("redis_streams")
 class Streams:
     RAW = "raw_messages"
     SIGNALS = "parsed_signals"
-    MGMT = "mgmt_messages"
-    EVENTS = "trade_events"
 
 
 async def redis_client(redis_url: str) -> "redis.Redis":
