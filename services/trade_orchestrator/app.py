@@ -42,15 +42,24 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
             log.info("[SIGNAL][FAST] Ya existe un grupo activo para %s, ignorando fast duplicado.", symbol)
             return
         sl = float(sl_raw) if sl_raw else None
+        # Senal fast: si la señal completa (con TP1/TP2 reales) nunca llega, el
+        # grupo quedaria dependiendo solo del SL, sin ningun objetivo de salida.
+        # tp1_leg recibe un TP temporal de proteccion aqui; runner_leg se queda
+        # sin TP (tp1=None mas abajo en open_group), tal como ya era el diseño —
+        # esta pierna esta pensada para correr, no para cerrarse a un TP fijo.
+        # Si la señal completa llega despues, update_group_signal sobreescribe
+        # este TP temporal con el TP1 real (ver trade_manager.py).
+        client = tradeManager.mt5._client_for(account)
+        price = client.tick_price(symbol, direction)
+        from services.common.config import config as _config
+        point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
+        from .trade_utils import calcular_sl_default, calcular_tp_default
         if sl is None:
-            client = tradeManager.mt5._client_for(account)
-            price = client.tick_price(symbol, direction)
-            from services.common.config import config as _config
             default_sl_pips = float(_config.get("DEFAULT_SL_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_SL_PIPS", 100))
-            point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
-            from .trade_utils import calcular_sl_default
             sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
-        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=None, tp2=None)
+        default_tp_pips = float(_config.get("DEFAULT_TP_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_TP_PIPS", 100))
+        default_tp1 = calcular_tp_default(symbol, direction, price, point, default_tp_pips) if default_tp_pips > 0 else None
+        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=None)
         return
 
     sl = float(sl_raw) if sl_raw else None

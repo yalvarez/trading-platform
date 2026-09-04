@@ -202,3 +202,33 @@ def calcular_sl_default(symbol: str, direction: str, price: float, point: float,
             return round(price - sl_offset, 5)
         else:
             return round(price + sl_offset, 5)
+
+
+def calcular_tp_default(symbol: str, direction: str, price: float, point: float, default_tp_pips: float) -> float:
+    """
+    Calcula un TP1 temporal de proteccion para una señal fast (sin TP1/TP2
+    todavia), aplicado solo a la pierna tp1_leg. Mismo patron/firma que
+    calcular_sl_default, con el offset en la direccion favorable en vez de
+    en contra. Si mas tarde llega la señal completa con TP1 real,
+    update_group_signal lo sobreescribe (ver trade_manager.py).
+    Args:
+        symbol: Símbolo del instrumento (ej: 'XAUUSD', 'EURUSD')
+        direction: Dirección de la operación ('BUY' o 'SELL')
+        price: Precio de entrada actual
+        point: Valor de un punto para el símbolo
+        default_tp_pips: TP por defecto en pips (según config o entorno)
+    Returns:
+        Precio de TP recomendado según lógica centralizada
+    """
+    if symbol.upper().startswith('XAU'):
+        tp_offset = default_tp_pips * (point if point else 0.1)
+        if direction.upper() == 'BUY':
+            return round(price + tp_offset, 2)
+        else:
+            return round(price - tp_offset, 2)
+    else:
+        tp_offset = default_tp_pips * (point if point else 0.00001)
+        if direction.upper() == 'BUY':
+            return round(price + tp_offset, 5)
+        else:
+            return round(price - tp_offset, 5)
