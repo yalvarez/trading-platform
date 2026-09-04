@@ -428,3 +428,87 @@ async def test_on_tp1_leg_closed_with_missing_entry_price_does_not_raise():
     await tm._tick_once_account(ACCOUNT)
 
     assert tm.trades[runner_leg.ticket].be_applied is False  # BE was skipped, not crashed through
+
+
+class FakeConfigProvider:
+    """Minimal config_provider stub for entry-range-gate tests — fast timings."""
+    def __init__(self, **overrides):
+        self.values = {"ENTRY_WAIT_SECONDS": 1, "ENTRY_POLL_MS": 20, "TOLERANCE_PIPS": 30, **overrides}
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+
+@pytest.mark.asyncio
+async def test_open_group_executes_immediately_when_price_already_in_entry_range():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), config_provider=FakeConfigProvider())
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0,
+        entry_range=(2495.0, 2505.0),
+    )
+
+    assert group_id is not None
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+
+
+@pytest.mark.asyncio
+async def test_open_group_aborts_when_price_already_past_entry_range():
+    sim = SimuladorMT5()
+    sim.price = 2520.0  # already past the range's high end for a BUY
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), config_provider=FakeConfigProvider())
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2530.0, tp2=2550.0,
+        entry_range=(2495.0, 2505.0),
+    )
+
+    assert group_id is None
+    assert len(tm.trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_open_group_waits_and_executes_once_price_enters_entry_range():
+    sim = SimuladorMT5()
+    sim.price = 2490.0  # starts below the range, not yet past it favorably — worth waiting
+
+    async def move_price_into_range_soon():
+        import asyncio
+        await asyncio.sleep(0.05)
+        sim.price = 2500.0  # now inside [2495, 2505]
+
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), config_provider=FakeConfigProvider())
+
+    import asyncio
+    mover = asyncio.create_task(move_price_into_range_soon())
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2520.0, tp2=2540.0,
+        entry_range=(2495.0, 2505.0),
+    )
+    await mover
+
+    assert group_id is not None
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+    for t in legs:
+        assert 2495.0 <= t.entry_price <= 2505.0
+
+
+@pytest.mark.asyncio
+async def test_open_group_aborts_when_price_never_enters_entry_range_within_wait():
+    sim = SimuladorMT5()
+    sim.price = 2500.0  # inside a range that has nothing to do with the target range
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), config_provider=FakeConfigProvider(ENTRY_WAIT_SECONDS=1))
+
+    # target range is far from current price but not "already past" (below entry_lo, not
+    # past entry_hi for a BUY) -- it should wait, time out, and abort with no positions opened.
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2440.0, tp1=2470.0, tp2=2480.0,
+        entry_range=(2460.0, 2465.0),
+    )
+
+    assert group_id is None
+    assert len(tm.trades) == 0

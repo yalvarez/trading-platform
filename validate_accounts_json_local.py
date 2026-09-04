@@ -1,8 +1,12 @@
 import json
 import re
 
-# Copia el valor de ACCOUNTS_JSON aquí para validarlo
-ACCOUNTS_JSON = '[{"name":"Ysaias Vantage","host":"mt5_acct1","port":8001,"active":false,"fixed_lot":0.03,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455],"trading_mode":"general"},{"name":"Ysaias TickMill","host":"mt5_acct2","port":8001,"active":false,"fixed_lot":0.02,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455],"trading_mode":"general"},{"name":"Jesenia","host":"mt5_acct3","port":8001,"active":false,"fixed_lot":0.03,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455],"trading_mode":"general"},{"name":"Demo Leclerc","host":"mt5_acct4","port":8001,"active":true,"fixed_lot":0.03,"chat_id":8439707982,"allowed_channels":[-5250557024,-1003209803455,-1002293184715],"trading_mode":"reentry"},{"name":"Demo StarTrader","host":"mt5_acct5","port":8001,"active":true,"fixed_lot":0.03,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455,-1002293184715],"trading_mode":"general"},{"name":"Vantage Demo","host":"mt5_acct6","port":8001,"active":true,"fixed_lot":0.03,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455,-1002293184715],"trading_mode":"be_pips"},{"name":"Demo Jesenia","host":"mt5_acct7","port":8001,"active":true,"fixed_lot":0.03,"chat_id":8439707982,"allowed_channels":[-5250557024,-1003209803455,-1002293184715],"trading_mode":"be_pnl"},{"name":"Ysaias Demo 2","host":"mt5_acct8","port":8001,"active":true,"fixed_lot":0.03,"chat_id":8592452414,"allowed_channels":[-5250557024,-1003209803455],"trading_mode":"reentry"}]'
+# Copia el valor de ACCOUNTS_JSON aquí para validarlo.
+# Single-account operation for now: ACCOUNTS_JSON sigue siendo una lista (soporta
+# multi-cuenta a futuro), pero solo se configura/activa una entrada. No hay
+# allowed_channels (un solo canal TradePulse) ni trading_mode (dual-TP es el
+# unico comportamiento) en el modelo actual.
+ACCOUNTS_JSON = '[{"name":"Main Account","host":"mt5_acct1","port":8001,"active":true,"fixed_lot":0.01,"chat_id":1234567890}]'
 
 def validate_accounts_json(accounts_json):
     try:

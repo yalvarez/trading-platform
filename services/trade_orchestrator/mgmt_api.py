@@ -52,9 +52,13 @@ def create_mgmt_app(trade_manager) -> FastAPI:
     @app.post("/mgmt/action", dependencies=[Depends(_check_key)])
     async def mgmt_action(req: MgmtActionRequest) -> dict:
         correction = req.correction.model_dump() if req.correction else None
-        result = await trade_manager.apply_mgmt_action(
-            action=req.action, symbol=req.symbol, raw_text=req.raw_text, correction=correction,
-        )
+        try:
+            result = await trade_manager.apply_mgmt_action(
+                action=req.action, symbol=req.symbol, raw_text=req.raw_text, correction=correction,
+            )
+        except Exception as e:
+            log.exception("[MGMT_API] apply_mgmt_action fallo inesperadamente: action=%s symbol=%s", req.action, req.symbol)
+            return {"status": "failed", "reason": "internal_error", "detail": str(e)}
         return result
 
     @app.get("/health")

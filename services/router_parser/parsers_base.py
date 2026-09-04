@@ -1,6 +1,7 @@
 """
 Base parser framework for trading signal detection.
-Supports multiple signal formats: GB_FAST, GB_LONG, GB_SCALP, DAILY_SIGNAL, TOROFX
+The single active parser is TradePulseParser (parsers_tradepulse.py) — this
+module only defines the generic interface it implements.
 """
 
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Optional, Tuple
 @dataclass(frozen=True)
 class ParseResult:
     """Standardized signal parsing result"""
-    format_tag: str              # e.g., GB_FAST, GB_LONG, GB_SCALP, DAILY_SIGNAL, TOROFX
+    format_tag: str              # e.g., TRADEPULSE
     provider_tag: str            # Identifier for signal provider/strategy
     symbol: str                  # Trading symbol (e.g., XAUUSD)
     direction: str               # BUY or SELL

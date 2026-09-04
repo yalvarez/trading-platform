@@ -5,13 +5,6 @@ from services.common.config import Settings
 from services.common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
 from services.common.signal_dedup import SignalDeduplicator
 from parsers_base import SignalParser, ParseResult
-
-# from parsers_goldbro_fast import GoldBroFastParser
-# from parsers_goldbro_long import GoldBroLongParser
-# from parsers_goldbro_scalp import GoldBroScalpParser
-# from parsers_torofx import ToroFxParser
-# from parsers_daily_signal import DailySignalParser
-# from parsers_hannah import HannahParser
 from parsers_tradepulse import TradePulseParser
 
 

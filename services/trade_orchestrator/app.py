@@ -2,11 +2,9 @@ import os
 import json
 import asyncio
 import logging
-import uuid
-from typing import Optional
 
 from services.common.config import Settings
-from services.common.redis_streams import redis_client, xread_loop, xadd, Streams
+from services.common.redis_streams import redis_client, xread_loop, Streams
 from services.common.timewindow import parse_windows, in_windows
 
 from .trade_manager import TradeManager
@@ -29,6 +27,8 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     is_fast = fields.get("fast", "false").lower() == "true"
     sl_raw = fields.get("sl", "")
     tps = json.loads(fields.get("tps", "[]") or "[]")
+    entry_range_raw = fields.get("entry_range", "")
+    entry_range = tuple(json.loads(entry_range_raw)) if entry_range_raw and entry_range_raw != "[]" else None
 
     account = next((a for a in accounts if a.get("active")), None)
     if not account:
@@ -64,7 +64,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     if sl is None or tp1 is None or tp2 is None:
         log.error("[SIGNAL] Senal completa incompleta (sl=%s tp1=%s tp2=%s), abortando.", sl, tp1, tp2)
         return
-    await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=tp1, tp2=tp2)
+    await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=tp1, tp2=tp2, entry_range=entry_range)
 
 
 async def main():

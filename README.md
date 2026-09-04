@@ -80,7 +80,7 @@ Redis: raw_messages stream
     ↓
 [trade_orchestrator]
     ↓
-    └─ Per signal: open 2 MT5 positions (group_id = ticket of first)
+    └─ Per signal: open 2 MT5 positions (group_id = an incrementing internal counter, not a ticket)
        ├─ tp1_leg: closes at TP1, BE+trailing on remainder
        └─ runner_leg: uncapped proportional trailing, no fixed TP close
     ↓
@@ -102,7 +102,7 @@ Every entry signal opens **two MT5 positions** with the same group_id:
 - After BE is applied, trailing logic engages on the runner
 
 **Trailing Logic (mechanical loop, runner leg only):**
-- Runs continuously every 2+ seconds (fail-silent on price/volume errors)
+- Runs continuously on a ~100ms poll loop (fail-silent on price/volume errors)
 - **Formula:** `unit = tp2_price - tp1_price` (computed once per group; for SELL, reversed)
 - `peak_multiple` tracks the highest ratio ever observed: `(current_price - tp1_price) / unit` (only increases, never decreases)
 - **SL recomputation:** `new_sl = tp1_price + (peak_multiple * unit) / 3`
@@ -152,8 +152,9 @@ ACCOUNTS_JSON=[
 - `TRADING_WINDOWS`: HH:MM-HH:MM format (e.g., `06:00-22:00`); set to `00:00-23:59` for 24/7
 - `DEFAULT_SL_XAUUSD_PIPS`: fallback SL width for gold (e.g., 60)
 - `DEFAULT_SL_PIPS`: fallback SL width for other symbols (e.g., 100)
-- `ENTRY_WAIT_SECONDS`: max time to wait for price to enter range (e.g., 90)
-- `ENTRY_POLL_MS`: poll interval while waiting (e.g., 200 ms)
+- `ENTRY_WAIT_SECONDS`: max time to wait for price to enter range on a full signal that carries one (e.g., 90; gold always uses a fixed 5s window regardless of this setting)
+- `ENTRY_POLL_MS`: poll interval while waiting (e.g., 200 ms; gold always polls at 100ms)
+- `TOLERANCE_PIPS`: tolerance in pips added to the entry-range edges (e.g., 30)
 - `DEDUP_TTL_SECONDS`: duplicate signal detection window (e.g., 120 seconds)
 
 **Signal Processing:**

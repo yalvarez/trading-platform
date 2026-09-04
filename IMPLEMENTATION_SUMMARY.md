@@ -202,7 +202,7 @@ event — `group_updated`, `runner_closed`, `open_aborted`, `open_failed`,
 There is no `trade_opened` event and no fixed `entry_price`/`sl_price`/`tp_prices`/`lot` schema —
 read `_notify(...)` call sites in `trade_manager.py` for the authoritative field list per event.
 
-Optional token: `N8N_WEBHOOK_TOKEN` in Authorization header.
+Optional token: `N8N_WEBHOOK_TOKEN` is sent as the `X-N8N-Token` header (not `Authorization`).
 
 ---
 

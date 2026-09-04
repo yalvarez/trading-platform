@@ -1,4 +1,4 @@
-from .trade_utils import pips_to_price, safe_comment, calcular_sl_default, calcular_be_price
+from .trade_utils import safe_comment
 import asyncio
 import time
 import logging
@@ -57,7 +57,74 @@ class TradeManager:
         except Exception as e:
             log.warning("[TM] notify failed for event=%s: %s", event, e)
 
-    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float]) -> Optional[int]:
+    @staticmethod
+    async def _call(fn, *args, **kwargs):
+        """
+        Ejecuta una llamada MT5/RPyC sincrona (order_send, positions_get, tick_price,
+        symbol_select, symbol_info, partial_close) en un hilo aparte via
+        asyncio.to_thread, para no bloquear el event loop compartido por el loop de
+        senales, el loop de gestion mecanica (run_forever) y el endpoint /mgmt/action
+        cuando MT5 tarda, se cuelga, o esta reconectando (PooledMT5Client puede
+        bloquear hasta 1.5s en un intento de reconexion con un lock tomado).
+        """
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _wait_for_entry_range(self, client, symbol: str, direction: str, initial_price: float, entry_range: tuple) -> Optional[float]:
+        """
+        Espera a que el precio entre en [min(entry_range), max(entry_range)] antes de
+        ejecutar, con tolerancia TOLERANCE_PIPS y ventana entry_wait_seconds/entry_poll_ms
+        (reducida a 5s de espera / 100ms de poll para oro, dado su movimiento rapido).
+        Retorna el precio con el que ejecutar si entro en rango, o None si nunca entro
+        o si ya lo paso en la direccion favorable (no tiene sentido esperar mas).
+        """
+        entry_lo = float(min(entry_range))
+        entry_hi = float(max(entry_range))
+        is_buy = direction.upper() == "BUY"
+        is_gold = symbol.upper().startswith("XAU")
+
+        cp = self.config_provider
+        entry_wait_seconds = float(cp.get("ENTRY_WAIT_SECONDS", 60)) if cp else 60.0
+        entry_poll_ms = float(cp.get("ENTRY_POLL_MS", 500)) if cp else 500.0
+        tolerance_pips = float(cp.get("TOLERANCE_PIPS", 30)) if cp else 30.0
+
+        entry_wait_max = 5.0 if is_gold else entry_wait_seconds
+        entry_poll = 0.1 if is_gold else (entry_poll_ms / 1000.0)
+
+        symbol_info = await self._call(client.symbol_info, symbol)
+        point = 0.1 if is_gold else 0.00001
+        if symbol_info and getattr(symbol_info, "point", None) is not None:
+            point = float(getattr(symbol_info, "point", point))
+        pips_tolerance = tolerance_pips * point
+
+        def _price_in_range(p: float) -> bool:
+            if is_buy:
+                return entry_lo <= p <= entry_hi + pips_tolerance
+            return entry_lo - pips_tolerance <= p <= entry_hi
+
+        def _price_past_range(p: float) -> bool:
+            if is_buy:
+                return p > entry_hi + pips_tolerance
+            return p < entry_lo - pips_tolerance
+
+        price = initial_price
+        if _price_in_range(price):
+            return price
+        if _price_past_range(price):
+            return None
+
+        deadline = time.time() + entry_wait_max
+        while time.time() <= deadline:
+            await asyncio.sleep(entry_poll)
+            price = await self._call(client.tick_price, symbol, direction.upper())
+            if not price:
+                continue
+            if _price_in_range(price):
+                return price
+            if _price_past_range(price):
+                return None
+        return None
+
+    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None) -> Optional[int]:
         """
         Abre dos posiciones (tp1_leg, runner_leg) con el mismo symbol/direction/SL,
         vinculadas por un group_id nuevo. Ver dual-TP spec seccion 3.
@@ -65,8 +132,12 @@ class TradeManager:
           sin TP fijo todavia — update_group_signal los completa despues.
         - Si tp1 y tp2 vienen ambos, valida unit=tp2-tp1 en la direccion correcta
           antes de abrir; aborta si unit<=0.
+        - entry_range, si viene (min, max), espera a que el precio entre en rango
+          antes de ejecutar (hasta entry_wait_seconds, con tolerancia TOLERANCE_PIPS;
+          ventana reducida a 5s para oro dado su movimiento rapido) — mismo mecanismo
+          que existia en MT5Executor.open_complete_trade antes de la reescritura dual-TP.
         Retorna el group_id nuevo, o None si se aborto (unit invalido, SL invalido,
-        sin precio disponible).
+        sin precio disponible, o el precio nunca entro/ya paso el rango).
         """
         account = self._ensure_account_dict(account)
         if not account:
@@ -85,12 +156,19 @@ class TradeManager:
             return None
 
         client = self.mt5._client_for(account)
-        client.symbol_select(symbol, True)
-        price = client.tick_price(symbol, direction.upper())
+        await self._call(client.symbol_select, symbol, True)
+        price = await self._call(client.tick_price, symbol, direction.upper())
         if not price:
             log.error("[TM][OPEN] Abortado: sin precio para %s", symbol)
             await self._notify("open_aborted", symbol=symbol, reason="no_price")
             return None
+
+        if entry_range and len(entry_range) == 2:
+            price = await self._wait_for_entry_range(client, symbol, direction, price, entry_range)
+            if price is None:
+                log.warning("[TM][OPEN] Abortado: precio nunca entro/ya paso el rango de entrada symbol=%s range=%s", symbol, entry_range)
+                await self._notify("open_aborted", symbol=symbol, reason="entry_range_missed", entry_range=list(entry_range))
+                return None
 
         order_type = 0 if direction.upper() == "BUY" else 1
         group_id = self._next_group_id
@@ -112,11 +190,11 @@ class TradeManager:
                 "type_time": 0,
                 "type_filling": 1,
             }
-            res = client.order_send(req)
+            res = await self._call(client.order_send, req)
             if not res or getattr(res, "retcode", None) != 10009:
                 log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s", leg, symbol, getattr(res, "retcode", None))
                 for t in tickets.values():
-                    client.partial_close(account, t, 100)
+                    await self._call(client.partial_close, account, t, 100)
                 await self._notify("open_failed", symbol=symbol, leg=leg, group_id=group_id)
                 return None
             tickets[leg] = int(res.order)
@@ -193,7 +271,7 @@ class TradeManager:
             # keep the current live SL when the leg has data and it's not an
             # improvement (still send tp updates for the tp1 leg unaffected).
             is_buy = t.direction == "BUY"
-            pos_list = client.positions_get(ticket=t.ticket)
+            pos_list = await self._call(client.positions_get, ticket=t.ticket)
             current_sl = float(pos_list[0].sl) if pos_list else None
             if current_sl is not None:
                 new_is_better = (new_sl > current_sl) if is_buy else (new_sl < current_sl)
@@ -208,7 +286,7 @@ class TradeManager:
                 "sl": float(new_sl),
                 "tp": float(new_tp),
             }
-            res = client.order_send(req)
+            res = await self._call(client.order_send, req)
             ok = bool(res and getattr(res, "retcode", None) == 10009)
             if not ok:
                 log.error("[TM][UPDATE] fallo actualizando ticket=%s leg=%s", t.ticket, t.leg)
@@ -251,7 +329,7 @@ class TradeManager:
             return
         try:
             client = self.mt5._client_for(account)
-            positions = client.positions_get() or []
+            positions = await self._call(client.positions_get) or []
             pos_by_ticket = {p.ticket: p for p in positions}
 
             # Detect closed tickets for this account (TP1 hit, SL hit, or manual close)
@@ -290,8 +368,12 @@ class TradeManager:
         await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
 
     async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str) -> bool:
-        req = {"action": 6, "position": runner.ticket, "sl": float(new_sl)}
-        res = client.order_send(req)
+        # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida
+        # mecanica es el trailing SL) -- omitir "tp" en un request action=6 puede
+        # limpiar o preservar el TP existente segun el broker, asi que lo fijamos
+        # explicitamente en vez de depender de ese comportamiento implicito.
+        req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": 0.0}
+        res = await self._call(client.order_send, req)
         ok = bool(res and getattr(res, "retcode", None) == 10009)
         if not ok:
             log.error("[TM] fallo moviendo SL runner=%s reason=%s", runner.ticket, reason)
@@ -333,11 +415,14 @@ class TradeManager:
 
         legs = [t for t in self.trades.values() if t.group_id == group_id]
         account = self._ensure_account_dict(legs[0].account_name)
+        if not account:
+            log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s symbol=%s", group_id, symbol)
+            return {"status": "failed", "group_id": group_id, "reason": "account_unresolved"}
         client = self.mt5._client_for(account)
 
         if action == "close_now":
             for t in list(legs):
-                client.partial_close(account, t.ticket, 100)
+                await self._call(client.partial_close, account, t.ticket, 100)
                 self.trades.pop(t.ticket, None)
             await self._notify("mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text)
             return {"status": "closed", "group_id": group_id}
@@ -350,7 +435,7 @@ class TradeManager:
                 log.error("[TM][MGMT] move_sl_be_now: runner=%s no tiene entry_price registrado (group_id=%s)",
                           runner.ticket, group_id)
                 return {"status": "failed", "group_id": group_id, "reason": "no_entry_price"}
-            pos_list = client.positions_get(ticket=runner.ticket)
+            pos_list = await self._call(client.positions_get, ticket=runner.ticket)
             current_sl = float(pos_list[0].sl) if pos_list else None
             be_price = runner.entry_price
             is_buy = runner.direction == "BUY"
