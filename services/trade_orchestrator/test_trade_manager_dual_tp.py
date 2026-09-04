@@ -501,7 +501,8 @@ async def test_open_group_waits_and_executes_once_price_enters_entry_range():
 async def test_open_group_aborts_when_price_never_enters_entry_range_within_wait():
     sim = SimuladorMT5()
     sim.price = 2500.0  # inside a range that has nothing to do with the target range
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), config_provider=FakeConfigProvider(ENTRY_WAIT_SECONDS=1))
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier, config_provider=FakeConfigProvider(ENTRY_WAIT_SECONDS=1))
 
     # target range is far from current price but not "already past" (below entry_lo, not
     # past entry_hi for a BUY) -- it should wait, time out, and abort with no positions opened.
@@ -512,6 +513,13 @@ async def test_open_group_aborts_when_price_never_enters_entry_range_within_wait
 
     assert group_id is None
     assert len(tm.trades) == 0
+
+    # n8n must receive a human-readable message it can forward as-is (not just raw fields) —
+    # this is what lets the user learn *why* a real signal wasn't executed.
+    aborted_events = [kwargs for event, kwargs in notifier.events if event == "open_aborted"]
+    assert len(aborted_events) == 1
+    assert aborted_events[0]["reason"] == "entry_range_missed"
+    assert "no entro en el rango de entrada 2460.0-2465.0" in aborted_events[0]["message"]
 
 
 @pytest.mark.asyncio

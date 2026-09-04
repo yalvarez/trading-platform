@@ -173,12 +173,18 @@ class TradeManager:
             unit = (tp2 - tp1) if direction.upper() == "BUY" else (tp1 - tp2)
             if unit <= 0:
                 log.error("[TM][OPEN] Abortado: unit invalido (tp1=%s tp2=%s dir=%s) symbol=%s", tp1, tp2, direction, symbol)
-                await self._notify("open_aborted", symbol=symbol, reason="invalid_unit", tp1=tp1, tp2=tp2)
+                await self._notify(
+                    "open_aborted", symbol=symbol, reason="invalid_unit", tp1=tp1, tp2=tp2,
+                    message=f"Señal {direction.upper()} {symbol} no ejecutada: TP1/TP2 inconsistentes con la direccion (tp1={tp1}, tp2={tp2}).",
+                )
                 return None
 
         if sl is None or float(sl) == 0.0:
             log.error("[TM][OPEN] Abortado: SL invalido symbol=%s", symbol)
-            await self._notify("open_aborted", symbol=symbol, reason="invalid_sl")
+            await self._notify(
+                "open_aborted", symbol=symbol, reason="invalid_sl",
+                message=f"Señal {direction.upper()} {symbol} no ejecutada: SL invalido o ausente.",
+            )
             return None
 
         client = self.mt5._client_for(account)
@@ -186,14 +192,21 @@ class TradeManager:
         price = await self._get_price_with_retry(client, symbol, direction.upper())
         if not price:
             log.error("[TM][OPEN] Abortado: sin precio para %s", symbol)
-            await self._notify("open_aborted", symbol=symbol, reason="no_price")
+            await self._notify(
+                "open_aborted", symbol=symbol, reason="no_price",
+                message=f"Señal {direction.upper()} {symbol} no ejecutada: no se pudo obtener el precio actual de MT5.",
+            )
             return None
 
         if entry_range and len(entry_range) == 2:
             price = await self._wait_for_entry_range(client, symbol, direction, price, entry_range)
             if price is None:
                 log.warning("[TM][OPEN] Abortado: precio nunca entro/ya paso el rango de entrada symbol=%s range=%s", symbol, entry_range)
-                await self._notify("open_aborted", symbol=symbol, reason="entry_range_missed", entry_range=list(entry_range))
+                lo, hi = float(min(entry_range)), float(max(entry_range))
+                await self._notify(
+                    "open_aborted", symbol=symbol, reason="entry_range_missed", entry_range=list(entry_range),
+                    message=f"Señal {direction.upper()} {symbol} no ejecutada: el precio no entro en el rango de entrada {lo}-{hi} dentro del tiempo de espera.",
+                )
                 return None
 
         order_type = 0 if direction.upper() == "BUY" else 1
