@@ -151,6 +151,24 @@ runner (§7) para no confundir "el mercado no se movió" con "el bot falló".
 La fase de apertura + valores registrados (SL/TP/entry) se verifica siempre,
 incluso si la fase de cierre por TP1 queda inconclusa.
 
+**Nota sobre la ventana de entry-range de oro (5s):** para XAUUSD,
+`open_group` usa una ventana de entrada reducida a **5 segundos** (poll de
+100ms), no los `ENTRY_WAIT_SECONDS` (90s por defecto) que aplican a otros
+símbolos (`trade_manager.py`, ~línea 148:
+`entry_wait_max = 5.0 if is_gold else entry_wait_seconds`). Cualquier
+escenario de familia A o C3 que use un `SIGNAL ALERT` completo con
+`ENTRY PRICE` depende de que el precio esté dentro de ese rango dentro de
+esos 5s desde que `open_group` evalúa la señal — margen angosto frente a la
+latencia real del pipeline (Telethon → ingestor → Redis → router_parser →
+orchestrator). Mitigación: `price_reader` lee el precio **inmediatamente
+antes** de construir y enviar el mensaje (mínimo tiempo entre lectura y
+envío), y el rango de entry del mensaje se construye holgado alrededor de
+ese precio (considerando `TOLERANCE_PIPS`) en vez de un rango ajustado. Si,
+pese a eso, el escenario aborta por `open_aborted` con causa de timeout de
+rango (no por otra razón), el runner lo reporta como **inconcluso por
+timing de entry-range** (ver §7), distinto de un fallo del bot, y permite
+reintentar el escenario.
+
 - **A1. Fast solo** — `"XAUUSD BUY NOW"`, sin full después. Abre con SL/TP
   por defecto (`DEFAULT_SL_XAUUSD_PIPS`/`DEFAULT_TP_XAUUSD_PIPS`). Gestiona
   ciclo completo (BE al cerrar tp1_leg, trailing en runner, cierre) solo con
@@ -235,10 +253,14 @@ clasifica en una de tres categorías:
   esperado. El runner detecta esto por timeout en la acción de mgmt
   correspondiente sin señal de error propia, y lo reporta explícitamente
   como tal para no confundirlo con un bug del bot.
-- **Inconcluso** — exclusivo de familia A: la fase de apertura se verificó
-  correctamente, pero el precio real no alcanzó TP1 dentro del timeout del
-  escenario (ver nota de determinismo en §5, Familia A). No cuenta como
-  fallo del bot.
+- **Inconcluso** — exclusivo de familia A (y C3, por la ventana de
+  entry-range): dos motivos posibles, distinguidos en el reporte —
+  (a) la fase de apertura se verificó correctamente, pero el precio real
+  no alcanzó TP1 dentro del timeout del escenario (ver nota de
+  determinismo en §5); (b) el escenario abortó por `open_aborted` con
+  causa de timeout de la ventana de entry-range de 5s propia de XAUUSD
+  (ver nota en §5), no por otra razón — en ese caso el runner permite
+  reintentar el escenario. Ninguno de los dos cuenta como fallo del bot.
 
 **Checklist de pre-vuelo** (antes de correr `--all`, el runner valida y
 reporta si falta):
