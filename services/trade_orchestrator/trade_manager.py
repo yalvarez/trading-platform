@@ -14,7 +14,6 @@ ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
 
 MAGIC = 987654
 
-
 @dataclass
 class ManagedTrade:
     account_name: str

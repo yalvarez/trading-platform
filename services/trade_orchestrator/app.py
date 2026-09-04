@@ -46,7 +46,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
             client = tradeManager.mt5._client_for(account)
             price = client.tick_price(symbol, direction)
             from services.common.config import config as _config
-            default_sl_pips = float(_config.get("DEFAULT_SL_XAUUSD_PIPS", 300)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_SL_PIPS", 100))
+            default_sl_pips = float(_config.get("DEFAULT_SL_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_SL_PIPS", 100))
             point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
             from .trade_utils import calcular_sl_default
             sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)

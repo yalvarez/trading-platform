@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 os.environ["TRADE_API_KEY"] = "test-key-123"
-os.environ["ACCOUNTS_JSON"] = '[{"name": "acct1", "host": "mt5_acct1", "port": 8001, "active": true}]'
+os.environ["ACCOUNTS_JSON"] = '[{"name": "acct1", "host": "mt5_acct1", "port": 9081, "active": true}]'
 
 from tests.test_simulador_mt5 import SimuladorMT5
 from services.trade_api.app import app, get_mt5_client

@@ -4,7 +4,7 @@ services:
     image: redis:7-alpine
     container_name: atp-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -15,18 +15,18 @@ services:
       retries: 10
   # =========================
   mt5_acct1:
-    image: gmag11/metatrader5_vnc:latest
+    image: gmag11/metatrader5_vnc:2.3
     container_name: atp-mt5-acct1
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
       - PASSWORD=${MT5_WEB_PASS}
     ports:
       - "3001:3000"
-      - "8001:8001"
+      - "9081:9081"
     volumes:
       - mt5_acct1_config:/config
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "8001"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9081"]
       interval: 5s
       timeout: 2s
       retries: 10
@@ -45,7 +45,7 @@ services:
     volumes:
       - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
     ports:
-      - "8000:8000"
+      - "8070:8000"
 
   router_parser:
     build:
@@ -83,19 +83,19 @@ services:
       timeout: 5s
       retries: 6
 
-  trade_api:
-    build:
-      context: .
-      dockerfile: services/trade_api/Dockerfile
-    container_name: atp-trade-api
-    env_file:
-      - .env
-    ports:
-      - "8100:8100"
-    depends_on:
-      mt5_acct1:
-        condition: service_healthy
-    restart: unless-stopped
+  # trade_api:
+  #   build:
+  #     context: .
+  #     dockerfile: services/trade_api/Dockerfile
+  #   container_name: atp-trade-api
+  #   env_file:
+  #     - .env
+  #   ports:
+  #     - "8100:8100"
+  #   depends_on:
+  #     mt5_acct1:
+  #       condition: service_healthy
+  #   restart: unless-stopped
 
 volumes:
   redis_data:
