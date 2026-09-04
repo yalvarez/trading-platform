@@ -1,5 +1,6 @@
-from .trade_utils import safe_comment
+from .trade_utils import safe_comment, parse_group_comment
 import asyncio
+import inspect
 import os
 import time
 import logging
@@ -627,3 +628,159 @@ class TradeManager:
             return {"status": "ignored"}
 
         return {"status": "unknown_action"}
+
+    @staticmethod
+    async def _maybe_await(result):
+        """
+        Devuelve el valor de `result`, awaiteandolo solo si es awaitable.
+        Los metodos de TradeStateStore son async, pero reconcile_from_mt5
+        tambien se usa contra dobles de test que exponen esos mismos metodos
+        de forma sincrona; sin esto, un doble sincrono lanzaria TypeError
+        dentro del try/except de cada llamada al store y el fallo quedaria
+        enmascarado como un simple warning (perdiendo, por ejemplo, los
+        group_ids del store al calcular _next_group_id).
+        """
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def reconcile_from_mt5(self, accounts: list[dict]) -> dict:
+        """
+        Reconstruye self.trades y self._next_group_id a partir de las
+        posiciones reales en MT5, cruzadas contra el state_store (si hay
+        uno configurado). Debe correr una sola vez, al arranque, antes de
+        que run_forever() empiece a tickear — ver dual-TP spec de
+        persistencia, seccion "Reconciliacion al arranque".
+        Nunca envia order_send para abrir/cerrar posiciones — la unica
+        excepcion es aplicar BE a un runner cuyo tp1_leg se confirma
+        cerrado durante el downtime (mismo mecanismo que _on_tp1_leg_closed
+        usa en produccion, invocado aqui de forma sincrona porque el tick
+        loop normal nunca detectaria ese cierre por si solo).
+        """
+        summary = {"recovered_from_redis": 0, "recovered_from_file": 0, "degraded": 0, "orphaned": []}
+        all_positions_by_group: dict[int, dict[str, object]] = {}
+        highest_group_id_seen = 0
+
+        for account in accounts:
+            account = self._ensure_account_dict(account)
+            if not account:
+                continue
+            client = self.mt5._client_for(account)
+            try:
+                positions = await self._call(client.positions_get) or []
+            except Exception as e:
+                log.error("[TM][RECONCILE] fallo obteniendo posiciones para cuenta %s: %s", account.get("name"), e)
+                continue
+
+            for pos in positions:
+                if getattr(pos, "magic", None) != MAGIC:
+                    continue
+                comment = getattr(pos, "comment", "")
+                parsed = parse_group_comment(comment)
+                if parsed is None:
+                    summary["orphaned"].append({"ticket": pos.ticket, "symbol": pos.symbol, "comment": comment})
+                    continue
+                group_id, leg = parsed
+                highest_group_id_seen = max(highest_group_id_seen, group_id)
+                all_positions_by_group.setdefault(group_id, {"account": account, "client": client})[leg] = pos
+
+        if self.state_store:
+            try:
+                store_group_ids = await self._maybe_await(self.state_store.load_all_group_ids())
+                if store_group_ids:
+                    highest_group_id_seen = max(highest_group_id_seen, max(store_group_ids))
+            except Exception as e:
+                log.warning("[TM][RECONCILE] fallo listando group_ids del store: %s", e)
+
+        for group_id, entry in all_positions_by_group.items():
+            account = entry["account"]
+            client = entry["client"]
+            mt5_tp1 = entry.get("tp1")
+            mt5_runner = entry.get("runner")
+
+            doc = None
+            source = "none"
+            if self.state_store:
+                try:
+                    doc, source = await self._maybe_await(self.state_store.load_group(group_id))
+                except Exception as e:
+                    log.warning("[TM][RECONCILE] fallo leyendo group_id=%s del store: %s", group_id, e)
+
+            if doc is not None:
+                self._reconstruct_leg_from_doc(account, doc, "tp1", mt5_tp1)
+                self._reconstruct_leg_from_doc(account, doc, "runner", mt5_runner)
+                if source == "redis":
+                    summary["recovered_from_redis"] += 1
+                elif source == "file":
+                    summary["recovered_from_file"] += 1
+            else:
+                if mt5_tp1 is not None:
+                    self._reconstruct_leg_minimal(account, mt5_tp1, group_id, "tp1")
+                if mt5_runner is not None:
+                    self._reconstruct_leg_minimal(account, mt5_runner, group_id, "runner")
+                summary["degraded"] += 1
+
+            # The gap this whole design exists to close: the persisted doc knew
+            # about a tp1_leg that's no longer in MT5, but runner still is. The
+            # normal _tick_once_account close-detection loop compares against
+            # self.trades — tp1 was never inserted into it this run, so it would
+            # NEVER be seen as "closed". Apply BE synchronously, right here.
+            if doc is not None and mt5_tp1 is None and mt5_runner is not None:
+                runner_trade = self.trades.get(mt5_runner.ticket)
+                if runner_trade is not None:
+                    log.warning("[TM][RECONCILE] tp1_leg de group_id=%s cerro durante el downtime, aplicando BE ahora", group_id)
+                    await self._on_tp1_leg_closed(account, client, ManagedTrade(
+                        account_name=runner_trade.account_name, ticket=doc["legs"]["tp1"]["ticket"],
+                        symbol=runner_trade.symbol, direction=runner_trade.direction,
+                        group_id=group_id, leg="tp1", planned_sl=doc["legs"]["tp1"]["planned_sl"],
+                    ))
+
+            if doc is not None and mt5_tp1 is None and mt5_runner is None:
+                # Both legs of a known group are gone -- closed during downtime, clean up.
+                if self.state_store:
+                    await self._close_group_in_store(group_id)
+
+            # Re-persist to Redis anything that wasn't already there (recovered from the
+            # file backup, or reconstructed in degraded mode) — so a subsequent restart
+            # that keeps Redis intact recovers fully from layer 1 next time.
+            if source != "redis" and self.state_store and self.trades:
+                group_still_has_legs = any(t.group_id == group_id for t in self.trades.values())
+                if group_still_has_legs:
+                    await self._persist_group(group_id)
+
+        self._next_group_id = highest_group_id_seen + 1
+        ACTIVE_TRADES.set(len(self.trades))
+
+        if self.state_store:
+            try:
+                active_ids = {t.group_id for t in self.trades.values()}
+                await self._maybe_await(self.state_store.compact(active_ids))
+            except Exception as e:
+                log.warning("[TM][RECONCILE] fallo compactando el store: %s", e)
+
+        log.info("[TM][RECONCILE] completado: recuperados_redis=%s degradados=%s huerfanos=%s",
+                  summary["recovered_from_redis"], summary["degraded"], len(summary["orphaned"]))
+        await self._notify("reconciliation_summary", **summary)
+        return summary
+
+    def _reconstruct_leg_from_doc(self, account, doc: dict, leg: str, mt5_pos) -> None:
+        if mt5_pos is None:
+            return
+        leg_doc = doc["legs"].get(leg)
+        if leg_doc is None:
+            return
+        self.trades[mt5_pos.ticket] = ManagedTrade(
+            account_name=doc["account_name"], ticket=mt5_pos.ticket, symbol=doc["symbol"],
+            direction=doc["direction"], group_id=doc["group_id"], leg=leg,
+            planned_sl=leg_doc["planned_sl"], tp1_price=doc.get("tp1_price"), tp2_price=doc.get("tp2_price"),
+            entry_price=leg_doc.get("entry_price"), be_applied=leg_doc.get("be_applied", False),
+            peak_multiple=leg_doc.get("peak_multiple", 0.0),
+        )
+
+    def _reconstruct_leg_minimal(self, account, mt5_pos, group_id: int, leg: str) -> None:
+        direction = "BUY" if getattr(mt5_pos, "type", 0) == 0 else "SELL"
+        self.trades[mt5_pos.ticket] = ManagedTrade(
+            account_name=account["name"], ticket=mt5_pos.ticket, symbol=mt5_pos.symbol,
+            direction=direction, group_id=group_id, leg=leg,
+            planned_sl=float(getattr(mt5_pos, "sl", 0.0)), entry_price=float(getattr(mt5_pos, "price_open", 0.0)),
+        )

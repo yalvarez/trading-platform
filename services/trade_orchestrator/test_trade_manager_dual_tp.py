@@ -3,7 +3,7 @@ import time
 import pytest
 
 from tests.test_simulador_mt5 import SimuladorMT5
-from services.trade_orchestrator.trade_manager import TradeManager, ManagedTrade
+from services.trade_orchestrator.trade_manager import TradeManager, ManagedTrade, MAGIC
 
 
 class DummyExecutor:
@@ -660,12 +660,23 @@ class RecordingStore:
     def __init__(self):
         self.saved: list[dict] = []
         self.closed: list[int] = []
+        self.docs: dict[int, dict] = {}
 
     async def save_group(self, doc):
         self.saved.append(doc)
 
     async def close_group(self, group_id):
         self.closed.append(group_id)
+
+    async def load_group(self, group_id):
+        doc = self.docs.get(group_id)
+        return (doc, "redis") if doc is not None else (None, "none")
+
+    async def load_all_group_ids(self):
+        return set(self.docs.keys())
+
+    async def compact(self, active_group_ids):
+        pass
 
 
 @pytest.mark.asyncio
@@ -787,3 +798,145 @@ async def test_no_state_store_is_a_safe_default():
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
     assert group_id is not None  # did not raise despite no store configured
+
+
+# --- Task 4: reconcile_from_mt5 startup recovery ---
+
+def _open_raw_position(sim, *, ticket_price, sl, tp, comment, magic=MAGIC, direction_type=0):
+    """Directly injects a position into SimuladorMT5, bypassing TradeManager —
+    simulates a position that existed before this process started."""
+    req = {
+        "action": 1, "symbol": "XAUUSD", "volume": 0.04, "type": direction_type,
+        "price": ticket_price, "sl": sl, "tp": tp, "comment": comment, "magic": magic,
+    }
+    res = sim.order_send(req)
+    return res.order
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recovers_full_state_from_store():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()  # its default load_group/load_all_group_ids read from store.docs directly
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": tp1_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": True, "peak_multiple": 0.35},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert summary["recovered_from_redis"] == 1
+    assert len(tm.trades) == 2
+    runner = tm.trades[runner_ticket]
+    assert runner.tp1_price == 2510.0
+    assert runner.tp2_price == 2530.0
+    assert runner.be_applied is True
+    assert runner.peak_multiple == 0.35
+
+
+@pytest.mark.asyncio
+async def test_reconcile_falls_back_to_degraded_when_store_has_nothing():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()  # empty store.docs -- every group_id misses
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP7-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP7-runner")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert summary["degraded"] == 1
+    assert len(tm.trades) == 2
+    runner = tm.trades[runner_ticket]
+    assert runner.tp1_price is None
+    assert runner.tp2_price is None
+    assert runner.be_applied is False
+    assert runner.peak_multiple == 0.0
+    assert runner.planned_sl == 2490.0  # recovered directly from the MT5 position
+    assert runner.entry_price == 2500.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_orphan_for_unparseable_comment():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    store.compact = lambda active_group_ids: None
+
+    ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="some-old-format")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert len(summary["orphaned"]) == 1
+    assert summary["orphaned"][0]["ticket"] == ticket
+    assert summary["orphaned"][0]["comment"] == "some-old-format"
+    assert ticket not in tm.trades  # never managed automatically
+
+
+@pytest.mark.asyncio
+async def test_reconcile_applies_be_synchronously_when_tp1_closed_during_downtime():
+    """The gap this whole design exists to close: tp1_leg closed while the
+    process was down, runner is still open. The normal close-detection loop
+    would never see this (tp1 was never re-inserted into self.trades) —
+    reconcile_from_mt5 must apply BE inline, during reconciliation itself."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    # Only the runner still exists in MT5 -- tp1_leg closed during downtime.
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": 999999, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    runner_pos = sim.positions_get(ticket=runner_ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6  # moved to entry price (BE)
+    assert tm.trades[runner_ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sets_next_group_id_above_the_highest_seen():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()  # empty docs -- load_group naturally returns (None, "none")
+    store.load_all_group_ids = lambda: {5}  # group 5 known only from a closed entry in the file
+
+    _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP3-tp1")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert tm._next_group_id == 6  # max(3 from MT5, 5 from store) + 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_with_no_state_store_still_recovers_degraded():
+    """No state_store configured at all -- must behave like every group is degraded, not crash."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())  # no state_store
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert summary["degraded"] == 1
+    assert len(tm.trades) == 2
