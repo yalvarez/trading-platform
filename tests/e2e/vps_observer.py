@@ -32,9 +32,14 @@ class VpsObserver:
         return [line for line in combined.splitlines() if pattern in line]
 
     async def positions_for_symbol(self, symbol: str) -> list[dict]:
-        client = rpyc.connect(self.mt5_host, self.mt5_port)
-        positions = client.root.positions_get(symbol=symbol) or []
-        return [
-            {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume}
-            for p in positions
-        ]
+        client = None
+        try:
+            client = rpyc.connect(self.mt5_host, self.mt5_port)
+            positions = client.root.positions_get(symbol=symbol) or []
+            return [
+                {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume}
+                for p in positions
+            ]
+        finally:
+            if client is not None:
+                client.close()
