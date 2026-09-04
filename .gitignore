@@ -10,6 +10,10 @@ log.txt
 *.session
 *.session-journal
 
+# Trade state persistence (operational data, not versioned)
+data/trade_state.jsonl
+data/trade_state.jsonl.tmp
+
 # Python cache
 __pycache__/
 *.pyo

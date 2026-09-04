@@ -9,6 +9,7 @@ from services.common.timewindow import parse_windows, in_windows
 
 from .trade_manager import TradeManager
 from .mt5_executor import MT5Executor
+from .trade_state_store import TradeStateStore
 
 container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "trade_orchestrator"
 log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
@@ -133,7 +134,11 @@ async def main():
         entry_buffer_points=float(s["entry_buffer_points"]),
         config_provider=_config,
     )
-    tradeManager = TradeManager(tradeExecutor, notifier=notifier_adapter, config_provider=_config)
+    state_store = TradeStateStore(r, os.path.join(os.path.dirname(__file__), "..", "..", "data", "trade_state.jsonl"))
+    tradeManager = TradeManager(tradeExecutor, notifier=notifier_adapter, config_provider=_config, state_store=state_store)
+
+    reconciliation_summary = await tradeManager.reconcile_from_mt5(accounts)
+    log.info("[RECONCILE] al arranque: %s", reconciliation_summary)
 
     from .mgmt_api import create_mgmt_app
     import uvicorn

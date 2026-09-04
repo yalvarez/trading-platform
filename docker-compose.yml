@@ -75,6 +75,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
+      - ./data/trade_state.jsonl:/app/data/trade_state.jsonl:rw
     ports:
       - "8200:8200"
 
