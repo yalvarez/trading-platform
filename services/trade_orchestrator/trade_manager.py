@@ -53,6 +53,7 @@ class TradeManager:
         return None
 
     async def _notify(self, event: str, **kwargs) -> None:
+        log.info("[TM][EVENT] %s %s", event, kwargs)
         if not self.notifier:
             return
         try:

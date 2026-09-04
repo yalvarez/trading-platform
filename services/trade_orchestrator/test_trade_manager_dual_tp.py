@@ -954,3 +954,19 @@ async def test_reconcile_with_no_state_store_still_recovers_degraded():
 
     assert summary["degraded"] == 1
     assert len(tm.trades) == 2
+
+
+@pytest.mark.asyncio
+async def test_notify_emits_log_line_for_every_event(caplog):
+    import logging
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    with caplog.at_level(logging.INFO, logger="trade_orchestrator.trade_manager"):
+        await tm._notify("group_opened", group_id=42, symbol="XAUUSD")
+
+    assert any(
+        "[TM][EVENT]" in r.message and "group_opened" in r.message
+        for r in caplog.records
+    )
