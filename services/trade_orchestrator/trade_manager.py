@@ -380,6 +380,19 @@ class TradeManager:
         newest = max(candidates, key=lambda t: (t.opened_ts, t.group_id))
         return newest.group_id
 
+    def group_age_seconds(self, group_id: int) -> Optional[float]:
+        """
+        Segundos desde que se abrio `group_id` (min opened_ts entre sus piernas),
+        o None si el grupo no tiene piernas activas. Usado por handle_signal_fields
+        (app.py) para decidir si una señal fast nueva del mismo simbolo es un
+        duplicado reciente a ignorar, o una reapertura legitima (BUY o SELL) a
+        abrir aparte — ver REOPEN_COOLDOWN_SECONDS.
+        """
+        legs = [t for t in self.trades.values() if t.group_id == group_id]
+        if not legs:
+            return None
+        return time.time() - min(t.opened_ts for t in legs)
+
     async def run_forever(self) -> None:
         LOOP_INTERVAL = 0.1
         log.info("[TM] run_forever iniciado")

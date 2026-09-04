@@ -39,8 +39,22 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
 
     if is_fast:
         if existing_group_id is not None:
-            log.info("[SIGNAL][FAST] Ya existe un grupo activo para %s, ignorando fast duplicado.", symbol)
-            return
+            # find_active_group_for_symbol no tiene nocion de tiempo: sin este
+            # cooldown, CUALQUIER señal fast nueva del mismo simbolo se ignoraria
+            # para siempre mientras el grupo anterior siga abierto, sin importar
+            # si pasaron 17 segundos (duplicado real) o 17 minutos (reapertura
+            # legitima del proveedor, BUY o SELL). REOPEN_COOLDOWN_SECONDS
+            # distingue ambos casos: solo se ignora si el grupo activo es MAS
+            # NUEVO que el cooldown.
+            from services.common.config import config as _config
+            reopen_cooldown = float(_config.get("REOPEN_COOLDOWN_SECONDS", 300))
+            age = tradeManager.group_age_seconds(existing_group_id)
+            if age is None or age < reopen_cooldown:
+                log.info("[SIGNAL][FAST] Grupo activo reciente para %s (edad=%s s < cooldown=%s s), ignorando fast duplicado.",
+                         symbol, f"{age:.1f}" if age is not None else "?", reopen_cooldown)
+                return
+            log.info("[SIGNAL][FAST] Grupo activo para %s tiene %.1fs (>= cooldown=%ss) — tratando como reapertura, abriendo grupo nuevo.",
+                      symbol, age, reopen_cooldown)
         sl = float(sl_raw) if sl_raw else None
         # Senal fast: si la señal completa (con TP1/TP2 reales) nunca llega, el
         # grupo quedaria dependiendo solo del SL, sin ningun objetivo de salida,

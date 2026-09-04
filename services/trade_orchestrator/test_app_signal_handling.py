@@ -1,4 +1,5 @@
 import json
+import time
 import pytest
 
 from tests.test_simulador_mt5 import SimuladorMT5
@@ -136,6 +137,63 @@ async def test_fast_signal_runner_still_gets_be_and_trailing_when_full_signal_ne
     expected_sl = runner_leg.tp1_price + advance / 3.0
     assert abs(runner_pos.sl - expected_sl) < 1e-6
     assert runner_pos.sl > runner_leg.entry_price  # progressed beyond BE
+
+
+@pytest.mark.asyncio
+async def test_fast_signal_ignored_as_duplicate_when_active_group_is_recent():
+    """
+    find_active_group_for_symbol has no time concept of its own — without
+    REOPEN_COOLDOWN_SECONDS, this fast signal would be ignored forever while
+    the first group stays open, whether it arrived 17 seconds or 17 hours
+    later. A signal arriving BEFORE the cooldown elapses must still be
+    treated as an accidental duplicate and ignored.
+    """
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+    assert len(tm.trades) == 2
+
+    # Second fast signal for the same symbol arrives well within the (default
+    # 300s) cooldown -- still fresh, must be ignored as a duplicate.
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+    assert len(tm.trades) == 2  # unchanged -- no second group opened
+
+
+@pytest.mark.asyncio
+async def test_fast_signal_opens_new_group_as_reopen_after_cooldown_elapses(monkeypatch):
+    """
+    The user's exact real-world case: TradePulse sends 'XAUUSD BUY NOW', then
+    (minutes later, well past any accidental-resend window) sends it again --
+    a legitimate reopen/re-entry, not a duplicate. Once the active group is
+    older than REOPEN_COOLDOWN_SECONDS, a new fast signal for the same symbol
+    must open a second, independent group rather than being silently dropped.
+    """
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    monkeypatch.setenv("REOPEN_COOLDOWN_SECONDS", "300")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+    first_group_id = next(iter(tm.trades.values())).group_id
+    assert len(tm.trades) == 2
+
+    # Simulate the first group being well past the cooldown window.
+    for t in tm.trades.values():
+        t.opened_ts = time.time() - 400.0
+
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+
+    assert len(tm.trades) == 4  # a second, independent group was opened
+    group_ids = {t.group_id for t in tm.trades.values()}
+    assert group_ids == {first_group_id, first_group_id + 1}
 
 
 @pytest.mark.asyncio
