@@ -18,6 +18,11 @@ log = logging.getLogger("router_parser")
 
 from services.common.config import FAST_UPDATE_WINDOW_SECONDS
 
+# Sentinel distinto de None: el texto SI fue reconocido como señal valida,
+# pero el deduplicador lo descarto por repetido. Distinguirlo de "no
+# reconocido" evita reenviarlo a n8n como ruido (ver SignalRouter.process_raw_signal).
+DUPLICATE_SIGNAL = object()
+
 
 async def forward_to_n8n(text: str, chat_id: str, webhook_url: str) -> None:
     """
@@ -72,6 +77,15 @@ class SignalRouter:
         return None
 
     async def process_raw_signal(self, chat_id, text):
+        """
+        Retorna un dict de señal lista para publicar, None si el texto no
+        coincidio con ningun parser (candidato a reenviarse a n8n/Ollama), o
+        el sentinel DUPLICATE_SIGNAL si SI fue reconocido pero el
+        deduplicador lo descarto por repetido dentro de DEDUP_TTL_SECONDS.
+        Esa distincion importa: un duplicado ya fue procesado la primera vez,
+        asi que no debe reenviarse a n8n como si fuera texto no reconocido
+        (ver app.py: loop_signals trata cada caso distinto).
+        """
         parse_result = self.parse_signal(text, chat_id=chat_id)
         if not parse_result:
             return None
@@ -89,14 +103,14 @@ class SignalRouter:
                 # No deduplicar, forzar update
             elif await self.deduplicator.is_duplicate(chat_id, parse_result):
                 # log.info("[DEDUP] %s", parse_result.provider_tag)  # Reduce log noise
-                return None
+                return DUPLICATE_SIGNAL
         else:
             # Es señal FAST, guarda referencia para posible actualización
             key_prefix = f"fast_sig:{chat_id}:{parse_result.symbol}:{parse_result.direction}"
             await self.redis.setex(key_prefix, int(self.fast_update_window), "1")
             if await self.deduplicator.is_duplicate(chat_id, parse_result):
                 # log.info("[DEDUP] %s", parse_result.provider_tag)  # Reduce log noise
-                return None
+                return DUPLICATE_SIGNAL
 
         entry_range = json.dumps(parse_result.entry_range) if parse_result.entry_range else ""
         tps = parse_result.tps or []
@@ -145,7 +159,11 @@ async def main():
 
                 try:
                     sig = await router.process_raw_signal(chat_id, text)
-                    if sig:
+                    if sig is DUPLICATE_SIGNAL:
+                        # Reconocida pero descartada por dedup — ya se proceso la primera
+                        # vez, no reenviar a n8n como si fuera texto no reconocido.
+                        pass
+                    elif sig:
                         trace_id = uuid.uuid4().hex[:8]
                         sig["chat_id"] = chat_id
                         sig["raw_text"] = text
