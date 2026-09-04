@@ -1,7 +1,8 @@
+import os
 from telethon import TelegramClient
 
-api_id = 21104104
-api_hash = "7afb33549783f0315ae6538370c78ab9"
+api_id = int(os.environ["TG_API_ID"])
+api_hash = os.environ["TG_API_HASH"]
 
 client_name = "telegram_ingestor"
 client = TelegramClient(client_name, api_id, api_hash)
