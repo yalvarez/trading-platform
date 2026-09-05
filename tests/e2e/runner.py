@@ -97,13 +97,26 @@ def _print_preflight_report(preflight) -> None:
     print(PREFLIGHT_WEBHOOK_NOTE)
 
 
+# Absolute path matching docker-compose.yml's e2e_runner bind mount of the
+# host-side session file at /app/tests/e2e/e2e_test_session.session. The
+# Dockerfile's WORKDIR is /app, and Telethon resolves a relative session_name
+# against the process cwd — so the default relative "e2e_test_session" would
+# land at /app/e2e_test_session.session, which the compose mount never
+# touches, and the session could never persist across --rm container runs.
+# Telethon appends ".session" itself, so it is omitted here.
+TELEGRAM_SESSION_PATH = "/app/tests/e2e/e2e_test_session"
+
+
 async def _build_context(cfg: E2EConfig) -> ScenarioContext:
     import redis.asyncio as redis_asyncio
     redis_client = redis_asyncio.from_url(cfg.redis_url, decode_responses=True)
     return ScenarioContext(
         cfg=cfg,
         price_reader=PriceReader(host=cfg.mt5_host, port=cfg.mt5_port),
-        sender=TelegramSender(api_id=cfg.tg_api_id, api_hash=cfg.tg_api_hash, phone=cfg.tg_phone),
+        sender=TelegramSender(
+            api_id=cfg.tg_api_id, api_hash=cfg.tg_api_hash, phone=cfg.tg_phone,
+            session_name=TELEGRAM_SESSION_PATH,
+        ),
         observer=VpsObserver(redis_client=redis_client, mt5_host=cfg.mt5_host, mt5_port=cfg.mt5_port),
     )
 
