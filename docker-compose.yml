@@ -117,6 +117,33 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  e2e_runner:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+    container_name: atp-e2e-runner
+    profiles: ["e2e"]
+    env_file:
+      - .env
+    environment:
+      - MT5_HOST=mt5_acct1
+      - MT5_PORT=8001
+      - TRADE_ORCHESTRATOR_HOST=trade_orchestrator
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./tests/e2e/e2e_test_session.session:/app/tests/e2e/e2e_test_session.session:rw
+    depends_on:
+      redis:
+        condition: service_healthy
+      mt5_acct1:
+        condition: service_healthy
+      telegram_ingestor:
+        condition: service_started
+      router_parser:
+        condition: service_started
+      trade_orchestrator:
+        condition: service_started
+
 volumes:
   redis_data:
   mt5_acct1_config:
