@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
 
 
@@ -30,3 +30,28 @@ def test_scenario_result_holds_outcome_and_evidence():
     )
     assert result.outcome == ScenarioOutcome.PASS
     assert result.name == "a1_fast_only"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_group_uses_rpyc_default_path():
+    observer = MagicMock()
+    observer.mt5_host = "localhost"
+    observer.mt5_port = 18812
+    observer.positions_for_symbol = AsyncMock(return_value=[{"ticket": 222, "sl": 0, "tp": 0, "volume": 0.05}])
+
+    ctx = ScenarioContext(cfg=MagicMock(), price_reader=MagicMock(), sender=MagicMock(), observer=observer)
+
+    mock_client = MagicMock()
+    mock_client.root.partial_close = MagicMock()
+
+    with patch("rpyc.connect", return_value=mock_client) as mock_connect:
+        await cleanup_group(ctx, "XAUUSD")
+
+        mock_connect.assert_called_once_with("localhost", 18812)
+        mock_client.root.partial_close.assert_called_once()
+        call_args = mock_client.root.partial_close.call_args
+        assert call_args[0][1] == 222  # ticket
+        assert call_args[0][2] == 100  # percent (100%)
+        assert call_args[0][0]["host"] == "localhost"
+        assert call_args[0][0]["port"] == 18812
+        mock_client.close.assert_called_once()

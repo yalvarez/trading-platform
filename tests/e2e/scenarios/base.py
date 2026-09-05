@@ -42,7 +42,7 @@ async def cleanup_group(ctx: ScenarioContext, symbol: str, close_fn: Optional[Ca
     """
     Best-effort emergency cleanup: closes any position still open for
     `symbol`. `close_fn(ticket, volume)` defaults to a direct RPyC
-    order_send close against ctx.observer's MT5 connection; a scenario's
+    partial_close against ctx.observer's MT5 connection; a scenario's
     unit test injects a fake to avoid touching a real MT5 connection.
     Never raises — a cleanup failure is logged, not propagated, so it
     never masks the scenario's own result.
@@ -60,7 +60,13 @@ async def cleanup_group(ctx: ScenarioContext, symbol: str, close_fn: Optional[Ca
                 await close_fn(pos["ticket"], pos["volume"])
             else:
                 import rpyc
-                client = rpyc.connect(ctx.observer.mt5_host, ctx.observer.mt5_port)
-                client.root.close_position(pos["ticket"])
+                client = None
+                try:
+                    client = rpyc.connect(ctx.observer.mt5_host, ctx.observer.mt5_port)
+                    account = {"host": ctx.observer.mt5_host, "port": ctx.observer.mt5_port}
+                    client.root.partial_close(account, pos["ticket"], 100)
+                finally:
+                    if client is not None:
+                        client.close()
         except Exception as e:
             log.warning("cleanup_group: failed to close ticket=%s: %s", pos["ticket"], e)
