@@ -7,7 +7,8 @@ data only — scenarios own the assertions.
 """
 import asyncio
 import subprocess
-import rpyc
+
+from tests.e2e.mt5_client_factory import build_mt5_client
 
 
 class VpsObserver:
@@ -33,17 +34,12 @@ class VpsObserver:
         return [line for line in combined.splitlines() if pattern in line]
 
     async def positions_for_symbol(self, symbol: str) -> list[dict]:
-        client = None
-        try:
-            client = rpyc.connect(self.mt5_host, self.mt5_port)
-            positions = client.root.positions_get(symbol=symbol) or []
-            return [
-                {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume}
-                for p in positions
-            ]
-        finally:
-            if client is not None:
-                client.close()
+        client = build_mt5_client(self.mt5_host, self.mt5_port)
+        positions = client.positions_get(symbol=symbol) or []
+        return [
+            {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume}
+            for p in positions
+        ]
 
     async def restart_container(self, container: str, settle_seconds: float = 30) -> None:
         """

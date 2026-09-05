@@ -59,14 +59,10 @@ async def cleanup_group(ctx: ScenarioContext, symbol: str, close_fn: Optional[Ca
             if close_fn is not None:
                 await close_fn(pos["ticket"], pos["volume"])
             else:
-                import rpyc
-                client = None
-                try:
-                    client = rpyc.connect(ctx.observer.mt5_host, ctx.observer.mt5_port)
-                    account = {"host": ctx.observer.mt5_host, "port": ctx.observer.mt5_port}
-                    client.root.partial_close(account, pos["ticket"], 100)
-                finally:
-                    if client is not None:
-                        client.close()
+                from tests.e2e.mt5_client_factory import build_mt5_client
+
+                client = build_mt5_client(ctx.observer.mt5_host, ctx.observer.mt5_port)
+                account = {"host": ctx.observer.mt5_host, "port": ctx.observer.mt5_port}
+                client.partial_close(account, pos["ticket"], 100)
         except Exception as e:
             log.warning("cleanup_group: failed to close ticket=%s: %s", pos["ticket"], e)

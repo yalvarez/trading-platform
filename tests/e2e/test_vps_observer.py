@@ -55,9 +55,9 @@ def test_grep_container_logs_filters_matching_lines(monkeypatch):
 async def test_positions_for_symbol_returns_position_dicts(monkeypatch):
     fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01)
     fake_client = MagicMock()
-    fake_client.root.positions_get.return_value = [fake_pos]
+    fake_client.positions_get.return_value = [fake_pos]
     monkeypatch.setattr(
-        "tests.e2e.vps_observer.rpyc.connect",
+        "tests.e2e.vps_observer.build_mt5_client",
         lambda host, port: fake_client,
     )
     observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
@@ -65,40 +65,41 @@ async def test_positions_for_symbol_returns_position_dicts(monkeypatch):
     positions = await observer.positions_for_symbol("XAUUSD")
 
     assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01}]
-    fake_client.root.positions_get.assert_called_once_with(symbol="XAUUSD")
+    fake_client.positions_get.assert_called_once_with(symbol="XAUUSD")
 
 
 @pytest.mark.asyncio
-async def test_positions_for_symbol_closes_connection_on_success(monkeypatch):
+async def test_positions_for_symbol_calls_build_mt5_client_with_host_and_port(monkeypatch):
     fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01)
     fake_client = MagicMock()
-    fake_client.root.positions_get.return_value = [fake_pos]
-    monkeypatch.setattr(
-        "tests.e2e.vps_observer.rpyc.connect",
-        lambda host, port: fake_client,
-    )
+    fake_client.positions_get.return_value = [fake_pos]
+    calls = []
+
+    def fake_build(host, port):
+        calls.append((host, port))
+        return fake_client
+
+    monkeypatch.setattr("tests.e2e.vps_observer.build_mt5_client", fake_build)
     observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
 
     positions = await observer.positions_for_symbol("XAUUSD")
 
     assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01}]
-    fake_client.close.assert_called_once()
+    assert calls == [("mt5_acct1", 8001)]
 
 
 @pytest.mark.asyncio
-async def test_positions_for_symbol_closes_connection_on_failure(monkeypatch):
+async def test_positions_for_symbol_propagates_failure(monkeypatch):
     fake_client = MagicMock()
-    fake_client.root.positions_get.side_effect = RuntimeError("connection error")
+    fake_client.positions_get.side_effect = RuntimeError("connection error")
     monkeypatch.setattr(
-        "tests.e2e.vps_observer.rpyc.connect",
+        "tests.e2e.vps_observer.build_mt5_client",
         lambda host, port: fake_client,
     )
     observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
 
     with pytest.raises(RuntimeError):
         await observer.positions_for_symbol("XAUUSD")
-
-    fake_client.close.assert_called_once()
 
 
 @pytest.mark.asyncio
