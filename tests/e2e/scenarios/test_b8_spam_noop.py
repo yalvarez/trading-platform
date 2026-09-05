@@ -58,3 +58,18 @@ async def test_b8_fails_when_spam_triggers_a_mgmt_action_log():
     result = await b8_spam_noop.run(ctx)
 
     assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
+async def test_b8_scopes_log_grep_since_to_scenario_start_not_hardcoded_5m():
+    ctx = _ctx()
+
+    await b8_spam_noop.run(ctx)
+
+    ctx.observer.grep_container_logs.assert_called_once()
+    _args, kwargs = ctx.observer.grep_container_logs.call_args
+    assert "since" in kwargs
+    assert kwargs["since"] != "5m"
+    # Must be a real RFC3339 timestamp parseable back to a datetime.
+    from datetime import datetime
+    datetime.fromisoformat(kwargs["since"])

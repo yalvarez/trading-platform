@@ -6,7 +6,11 @@ positive here is the failure mode under test.
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
+from tests.e2e.scenarios._management_common import (
+    open_position_for_management_test,
+    SYMBOL,
+    MUTATING_EVENTS_EXCLUDING_GROUP_OPENED,
+)
 
 QUIET_WINDOW_SECONDS = 60
 MESSAGES = ["+240 PIPS SKYROCKETING", "TP 1 DONE", "Road to TP ONE"]
@@ -28,7 +32,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         positions_after = await ctx.observer.positions_for_symbol(SYMBOL)
         mutating_logs = [
             line for line in ctx.observer.grep_container_logs("atp-trade-orchestrator", "[TM][EVENT]")
-            if any(ev in line for ev in ("mgmt_close_now", "mgmt_move_sl_be_applied", "group_updated"))
+            if any(ev in line for ev in MUTATING_EVENTS_EXCLUDING_GROUP_OPENED)
         ]
         if mutating_logs or positions_after != positions_before:
             return ScenarioResult(

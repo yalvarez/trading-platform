@@ -7,7 +7,11 @@ Assert "no mutation", not "no action" (spec section 5 correction).
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
+from tests.e2e.scenarios._management_common import (
+    open_position_for_management_test,
+    SYMBOL,
+    MUTATING_EVENTS_EXCLUDING_GROUP_OPENED,
+)
 
 QUIET_WINDOW_SECONDS = 60
 MESSAGE = "HIT SL ❌. GET READY FOR RECOVERY \U0001f91d"
@@ -28,7 +32,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         positions_after = await ctx.observer.positions_for_symbol(SYMBOL)
         mutating_logs = [
             line for line in ctx.observer.grep_container_logs("atp-trade-orchestrator", "[TM][EVENT]")
-            if any(ev in line for ev in ("mgmt_close_now", "mgmt_move_sl_be_applied", "group_updated"))
+            if any(ev in line for ev in MUTATING_EVENTS_EXCLUDING_GROUP_OPENED)
         ]
         if mutating_logs or positions_after != positions_before:
             return ScenarioResult(

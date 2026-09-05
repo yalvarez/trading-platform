@@ -1,8 +1,10 @@
 """B8 (spec section 5): promotional spam must produce zero effects — no
 trade, no mgmt action."""
 import asyncio
+from datetime import datetime, timezone
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult
+from tests.e2e.scenarios._management_common import MUTATING_EVENTS
 
 QUIET_WINDOW_SECONDS = 60
 MESSAGE = (
@@ -12,14 +14,18 @@ MESSAGE = (
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    scenario_start_time = datetime.now(timezone.utc)
+
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
 
     await asyncio.sleep(QUIET_WINDOW_SECONDS)
 
     positions = await ctx.observer.positions_for_symbol("XAUUSD")
     mutating_logs = [
-        line for line in ctx.observer.grep_container_logs("atp-trade-orchestrator", "[TM][EVENT]")
-        if any(ev in line for ev in ("group_opened", "mgmt_close_now", "mgmt_move_sl_be_applied", "group_updated"))
+        line for line in ctx.observer.grep_container_logs(
+            "atp-trade-orchestrator", "[TM][EVENT]", since=scenario_start_time.isoformat()
+        )
+        if any(ev in line for ev in MUTATING_EVENTS)
     ]
     if positions or mutating_logs:
         return ScenarioResult(
