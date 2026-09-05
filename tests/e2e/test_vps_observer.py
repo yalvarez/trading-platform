@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 import subprocess
 from unittest.mock import AsyncMock, MagicMock
@@ -98,3 +99,26 @@ async def test_positions_for_symbol_closes_connection_on_failure(monkeypatch):
         await observer.positions_for_symbol("XAUUSD")
 
     fake_client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_container_calls_docker_restart_and_waits(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("tests.e2e.vps_observer.subprocess.run", fake_run)
+    monkeypatch.setattr("tests.e2e.vps_observer.asyncio.sleep", fake_sleep)
+
+    observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
+    await observer.restart_container("atp-trade-orchestrator", settle_seconds=45)
+
+    assert calls == [["docker", "restart", "atp-trade-orchestrator"]]
+    assert sleep_calls == [45]

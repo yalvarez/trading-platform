@@ -5,6 +5,7 @@ is no Redis stream for management messages, see spec section 3.1), and
 live MT5 positions via the same RPyC pattern as price_reader. Returns raw
 data only — scenarios own the assertions.
 """
+import asyncio
 import subprocess
 import rpyc
 
@@ -43,3 +44,15 @@ class VpsObserver:
         finally:
             if client is not None:
                 client.close()
+
+    async def restart_container(self, container: str, settle_seconds: float = 30) -> None:
+        """
+        Restarts a docker-compose service container by its container_name
+        (e.g. "atp-trade-orchestrator") and waits settle_seconds for it to
+        reconnect to Redis/mt5_acct1 and remount its volumes before the
+        caller starts polling for post-restart state. Used by
+        d1_restart_reconciliation to exercise TradeManager.reconcile_from_mt5
+        against a real restart (spec section 5, Familia D).
+        """
+        subprocess.run(["docker", "restart", container], capture_output=True, text=True, check=False)
+        await asyncio.sleep(settle_seconds)
