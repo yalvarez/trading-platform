@@ -27,6 +27,9 @@ class MT5Client:
     def symbol_info_tick(self, symbol: str):
         return self.mt5.symbol_info_tick(symbol)
 
+    def account_info(self):
+        return self.mt5.account_info()
+
     def partial_close(self, account: dict, ticket: int, percent: int) -> bool:
         if hasattr(self.mt5, "connect_to_account"):
             try:

@@ -7,7 +7,10 @@ VPS — that stays a documented operator precondition (spec section 4).
 """
 from dataclasses import dataclass, field
 
+from mt5linux import Constants
+
 from tests.e2e.config import E2EConfig
+from tests.e2e.mt5_client_factory import build_mt5_client
 
 
 @dataclass
@@ -46,6 +49,22 @@ async def run_preflight(cfg: E2EConfig, accounts_json: list[dict], http_client) 
     except Exception as e:
         problems.append(
             f"trade_orchestrator unreachable at {cfg.trade_orchestrator_host}:{cfg.mgmt_api_port}: {e}"
+        )
+
+    try:
+        mt5_client = build_mt5_client(cfg.mt5_host, cfg.mt5_port)
+        info = mt5_client.account_info()
+        trade_mode = getattr(info, "trade_mode", None)
+        if trade_mode != Constants.ACCOUNT_TRADE_MODE_DEMO:
+            problems.append(
+                f"MT5 account at {cfg.mt5_host}:{cfg.mt5_port} is not a DEMO account "
+                f"(trade_mode={trade_mode!r}, expected {Constants.ACCOUNT_TRADE_MODE_DEMO} "
+                "= ACCOUNT_TRADE_MODE_DEMO) — refusing to run a suite that opens and "
+                "force-closes real positions against a non-demo account."
+            )
+    except Exception as e:
+        problems.append(
+            f"could not verify MT5 account type at {cfg.mt5_host}:{cfg.mt5_port}: {e}"
         )
 
     return PreflightResult(ok=len(problems) == 0, problems=problems)

@@ -123,3 +123,29 @@ async def test_restart_container_calls_docker_restart_and_waits(monkeypatch):
 
     assert calls == [["docker", "restart", "atp-trade-orchestrator"]]
     assert sleep_calls == [45]
+
+
+@pytest.mark.asyncio
+async def test_restart_container_raises_when_docker_restart_fails(monkeypatch):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0], returncode=1, stdout="", stderr="Error: No such container: typo-name"
+        )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("tests.e2e.vps_observer.subprocess.run", fake_run)
+    monkeypatch.setattr("tests.e2e.vps_observer.asyncio.sleep", fake_sleep)
+
+    observer = VpsObserver(redis_client=MagicMock(), mt5_host="mt5_acct1", mt5_port=8001)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await observer.restart_container("typo-name", settle_seconds=45)
+
+    assert "typo-name" in str(exc_info.value)
+    assert "No such container" in str(exc_info.value)
+    # Must not proceed to the settle sleep on a failed restart.
+    assert sleep_calls == []

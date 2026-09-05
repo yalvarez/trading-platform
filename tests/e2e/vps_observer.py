@@ -50,5 +50,9 @@ class VpsObserver:
         d1_restart_reconciliation to exercise TradeManager.reconcile_from_mt5
         against a real restart (spec section 5, Familia D).
         """
-        subprocess.run(["docker", "restart", container], capture_output=True, text=True, check=False)
+        result = subprocess.run(["docker", "restart", container], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"docker restart {container} failed (exit {result.returncode}): {result.stderr}"
+            )
         await asyncio.sleep(settle_seconds)

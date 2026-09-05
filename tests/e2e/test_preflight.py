@@ -14,8 +14,19 @@ def _cfg(chat_id=-1009999999999):
     )
 
 
+def _mock_demo_mt5_client(monkeypatch, trade_mode=0):
+    fake_client = MagicMock()
+    fake_client.account_info.return_value = MagicMock(trade_mode=trade_mode)
+    monkeypatch.setattr(
+        "tests.e2e.preflight.build_mt5_client",
+        lambda host, port: fake_client,
+    )
+    return fake_client
+
+
 @pytest.mark.asyncio
-async def test_preflight_ok_when_channel_allowed_and_health_up():
+async def test_preflight_ok_when_channel_allowed_and_health_up(monkeypatch):
+    _mock_demo_mt5_client(monkeypatch)
     accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1009999999999]}]
     http_client = MagicMock()
     http_client.get = AsyncMock(return_value=MagicMock(status_code=200))
@@ -27,7 +38,8 @@ async def test_preflight_ok_when_channel_allowed_and_health_up():
 
 
 @pytest.mark.asyncio
-async def test_preflight_fails_when_test_chat_id_not_in_allowed_channels():
+async def test_preflight_fails_when_test_chat_id_not_in_allowed_channels(monkeypatch):
+    _mock_demo_mt5_client(monkeypatch)
     accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1002293184715]}]
     http_client = MagicMock()
     http_client.get = AsyncMock(return_value=MagicMock(status_code=200))
@@ -39,7 +51,8 @@ async def test_preflight_fails_when_test_chat_id_not_in_allowed_channels():
 
 
 @pytest.mark.asyncio
-async def test_preflight_fails_when_trade_orchestrator_unreachable():
+async def test_preflight_fails_when_trade_orchestrator_unreachable(monkeypatch):
+    _mock_demo_mt5_client(monkeypatch)
     accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1009999999999]}]
     http_client = MagicMock()
     http_client.get = AsyncMock(side_effect=ConnectionError("refused"))
@@ -48,3 +61,47 @@ async def test_preflight_fails_when_trade_orchestrator_unreachable():
 
     assert result.ok is False
     assert any("trade_orchestrator" in p for p in result.problems)
+
+
+@pytest.mark.asyncio
+async def test_preflight_ok_when_mt5_account_is_demo(monkeypatch):
+    fake_client = _mock_demo_mt5_client(monkeypatch, trade_mode=0)
+    accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1009999999999]}]
+    http_client = MagicMock()
+    http_client.get = AsyncMock(return_value=MagicMock(status_code=200))
+
+    result = await run_preflight(_cfg(), accounts, http_client)
+
+    assert result.ok is True
+    assert result.problems == []
+    fake_client.account_info.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_when_mt5_account_is_not_demo(monkeypatch):
+    # ACCOUNT_TRADE_MODE_REAL = 2 (mt5linux.Constants) — a live account.
+    _mock_demo_mt5_client(monkeypatch, trade_mode=2)
+    accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1009999999999]}]
+    http_client = MagicMock()
+    http_client.get = AsyncMock(return_value=MagicMock(status_code=200))
+
+    result = await run_preflight(_cfg(), accounts, http_client)
+
+    assert result.ok is False
+    assert any("DEMO" in p or "demo" in p for p in result.problems)
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_gracefully_when_mt5_connection_fails(monkeypatch):
+    def raise_connection_error(host, port):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("tests.e2e.preflight.build_mt5_client", raise_connection_error)
+    accounts = [{"name": "acct1", "active": True, "allowed_channels": [-1009999999999]}]
+    http_client = MagicMock()
+    http_client.get = AsyncMock(return_value=MagicMock(status_code=200))
+
+    result = await run_preflight(_cfg(), accounts, http_client)
+
+    assert result.ok is False
+    assert any("MT5" in p or "mt5" in p for p in result.problems)
