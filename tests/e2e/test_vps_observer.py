@@ -6,30 +6,33 @@ from tests.e2e.vps_observer import VpsObserver
 
 
 @pytest.mark.asyncio
-async def test_read_raw_messages_calls_xrange_on_raw_messages_stream():
+async def test_read_raw_messages_calls_xrevrange_on_raw_messages_stream():
     fake_redis = MagicMock()
-    fake_redis.xrange = AsyncMock(return_value=[
+    fake_redis.xrevrange = AsyncMock(return_value=[
         ("1-0", {"chat_id": "-100123", "text": "XAUUSD BUY NOW"}),
     ])
     observer = VpsObserver(redis_client=fake_redis, mt5_host="mt5_acct1", mt5_port=8001)
 
     messages = await observer.read_raw_messages(count=10)
 
-    fake_redis.xrange.assert_awaited_once_with("raw_messages", "-", "+", count=10)
+    # XREVRANGE (newest-first), not XRANGE (oldest-first) — on a live stream
+    # with real production history, XRANGE's oldest-N would never surface a
+    # message just sent. See vps_observer.py's read_raw_messages docstring.
+    fake_redis.xrevrange.assert_awaited_once_with("raw_messages", "+", "-", count=10)
     assert messages == [{"chat_id": "-100123", "text": "XAUUSD BUY NOW"}]
 
 
 @pytest.mark.asyncio
-async def test_read_parsed_signals_calls_xrange_on_parsed_signals_stream():
+async def test_read_parsed_signals_calls_xrevrange_on_parsed_signals_stream():
     fake_redis = MagicMock()
-    fake_redis.xrange = AsyncMock(return_value=[
+    fake_redis.xrevrange = AsyncMock(return_value=[
         ("2-0", {"symbol": "XAUUSD", "direction": "BUY", "fast": "true"}),
     ])
     observer = VpsObserver(redis_client=fake_redis, mt5_host="mt5_acct1", mt5_port=8001)
 
     signals = await observer.read_parsed_signals(count=10)
 
-    fake_redis.xrange.assert_awaited_once_with("parsed_signals", "-", "+", count=10)
+    fake_redis.xrevrange.assert_awaited_once_with("parsed_signals", "+", "-", count=10)
     assert signals == [{"symbol": "XAUUSD", "direction": "BUY", "fast": "true"}]
 
 

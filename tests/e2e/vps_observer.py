@@ -18,11 +18,17 @@ class VpsObserver:
         self.mt5_port = mt5_port
 
     async def read_raw_messages(self, count: int = 20) -> list[dict]:
-        entries = await self.redis.xrange("raw_messages", "-", "+", count=count)
+        # XRANGE - + returns the OLDEST `count` entries in the whole stream —
+        # on a stream that already has real production history (this is the
+        # live raw_messages stream, not a fresh test-only one), a fast-moving
+        # message just sent would never be among the first N ever recorded.
+        # XREVRANGE + - reads newest-first instead, which is what every
+        # caller actually wants: "did the message I just sent show up".
+        entries = await self.redis.xrevrange("raw_messages", "+", "-", count=count)
         return [fields for _msg_id, fields in entries]
 
     async def read_parsed_signals(self, count: int = 20) -> list[dict]:
-        entries = await self.redis.xrange("parsed_signals", "-", "+", count=count)
+        entries = await self.redis.xrevrange("parsed_signals", "+", "-", count=count)
         return [fields for _msg_id, fields in entries]
 
     def grep_container_logs(self, container: str, pattern: str, since: str = "5m") -> list[str]:
