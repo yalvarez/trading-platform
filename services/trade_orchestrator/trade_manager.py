@@ -385,13 +385,19 @@ class TradeManager:
             new_tp = t.tp1_price if (t.leg == "tp1" and t.tp1_price is not None) else 0.0
 
             # Never regress a live SL that's already better than the new planned_sl
-            # (e.g. BE-applied or trailed forward) — only write an improvement, or
-            # keep the current live SL when the leg has data and it's not an
-            # improvement (still send tp updates for the tp1 leg unaffected).
+            # ONLY once real management (BE/trailing) has actually moved it — that's
+            # what be_applied tracks. Before that, the live SL is just the fast
+            # signal's wide default protective SL (or the still-unmoved real SL),
+            # not an earned improvement, so the incoming signal's SL must always
+            # win even if it looks numerically "worse" (narrower/closer to price)
+            # than that placeholder. Real production bug: comparing unconditionally
+            # left both legs stuck on the fast default forever, since a fast
+            # signal's default SL is deliberately wide and a real signal's SL is
+            # usually narrower.
             is_buy = t.direction == "BUY"
             pos_list = await self._call(client.positions_get, ticket=t.ticket)
             current_sl = float(pos_list[0].sl) if pos_list else None
-            if current_sl is not None:
+            if current_sl is not None and t.be_applied:
                 new_is_better = (new_sl > current_sl) if is_buy else (new_sl < current_sl)
                 if not new_is_better:
                     log.info("[TM][UPDATE] SL no mejora, se conserva el SL actual | ticket=%s leg=%s current_sl=%s new_sl=%s",

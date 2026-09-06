@@ -106,6 +106,37 @@ async def test_update_group_signal_fills_in_tp1_tp2_on_fast_guard_pair():
 
 
 @pytest.mark.asyncio
+async def test_update_group_signal_applies_real_sl_even_when_narrower_than_fast_default():
+    """
+    Real production bug: the fast signal opens both legs with a wide default
+    protective SL (e.g. 100 pips). When the full signal arrives shortly after
+    with the real SL — which is very often numerically "worse" (narrower/
+    closer to price) than that wide default — the never-regress guard in
+    update_group_signal compared it against the fast default SL and refused
+    to write it, leaving both legs stuck on the fast default forever. That
+    guard exists to protect a runner's SL after BE/trailing already moved it
+    (see be_applied), not to protect an arbitrary fast placeholder. Neither
+    leg has be_applied/trailing yet here, so the real SL must always win.
+    """
+    sim = SimuladorMT5()
+    sim.price = 4434.53
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=4424.53, tp1=None, tp2=None)
+
+    await tm.update_group_signal(group_id, sl=4410.0, tp1=4460.0, tp2=4490.0)
+
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    tp1_leg = next(t for t in legs if t.leg == "tp1")
+    runner_leg = next(t for t in legs if t.leg == "runner")
+    assert tp1_leg.planned_sl == 4410.0
+    assert runner_leg.planned_sl == 4410.0
+    tp1_pos = sim.positions_get(ticket=tp1_leg.ticket)[0]
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert tp1_pos.sl == 4410.0
+    assert runner_pos.sl == 4410.0
+
+
+@pytest.mark.asyncio
 async def test_find_active_group_for_symbol_returns_most_recent():
     sim = SimuladorMT5()
     sim.price = 2500.0
