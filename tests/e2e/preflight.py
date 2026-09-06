@@ -7,10 +7,17 @@ VPS — that stays a documented operator precondition (spec section 4).
 """
 from dataclasses import dataclass, field
 
-from mt5linux import Constants
-
 from tests.e2e.config import E2EConfig
 from tests.e2e.mt5_client_factory import build_mt5_client
+
+
+# MT5 account_info().trade_mode values, per the MetaTrader5 API
+# (ENUM_ACCOUNT_TRADE_MODE) — hardcoded rather than imported from mt5linux,
+# since the module has exposed these both as a separate `Constants` class
+# and as attributes directly on `MetaTrader5` across different installed
+# versions (observed both shapes in practice); the numeric values themselves
+# are stable MT5 API constants, not implementation details of mt5linux.
+ACCOUNT_TRADE_MODE_DEMO = 0
 
 
 @dataclass
@@ -55,10 +62,10 @@ async def run_preflight(cfg: E2EConfig, accounts_json: list[dict], http_client) 
         mt5_client = build_mt5_client(cfg.mt5_host, cfg.mt5_port)
         info = mt5_client.account_info()
         trade_mode = getattr(info, "trade_mode", None)
-        if trade_mode != Constants.ACCOUNT_TRADE_MODE_DEMO:
+        if trade_mode != ACCOUNT_TRADE_MODE_DEMO:
             problems.append(
                 f"MT5 account at {cfg.mt5_host}:{cfg.mt5_port} is not a DEMO account "
-                f"(trade_mode={trade_mode!r}, expected {Constants.ACCOUNT_TRADE_MODE_DEMO} "
+                f"(trade_mode={trade_mode!r}, expected {ACCOUNT_TRADE_MODE_DEMO} "
                 "= ACCOUNT_TRADE_MODE_DEMO) — refusing to run a suite that opens and "
                 "force-closes real positions against a non-demo account."
             )
