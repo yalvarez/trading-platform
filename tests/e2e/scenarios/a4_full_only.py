@@ -3,7 +3,7 @@ A4 (spec section 5): a full SIGNAL ALERT with no preceding fast signal.
 Opens directly with the full signal's SL/TP1/TP2 (not defaults).
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios.a2_fast_then_full_early import _build_full_signal_text
 
 SYMBOL = "XAUUSD"
@@ -14,12 +14,14 @@ TP1_POLL_INTERVAL_SECONDS = 10
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     price = await ctx.price_reader.read_price(SYMBOL)
     full_text = _build_full_signal_text("BUY", price, sl_pips=6, tp1_pips=1.5, tp2_pips=3)
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, full_text)
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -46,7 +48,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             )
 
         async def check_tp1_closed():
-            remaining = await ctx.observer.positions_for_symbol(SYMBOL)
+            remaining = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return remaining if len(remaining) == 1 else None
 
         remaining = await _poll_until(check_tp1_closed, TP1_POLL_TIMEOUT_SECONDS, TP1_POLL_INTERVAL_SECONDS)
@@ -62,4 +64,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="full signal alone opened two legs with its own SL/TP1/TP2, TP1 closed",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

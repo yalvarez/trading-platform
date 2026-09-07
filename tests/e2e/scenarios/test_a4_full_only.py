@@ -40,6 +40,7 @@ async def test_a4_sends_full_signal_text_and_opens_with_its_own_sl():
     ctx = _ctx(price=price)
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": expected_sl, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": expected_sl, "tp": 0.0, "volume": 0.01}],  # two legs opened by full signal
             [{"ticket": 2, "sl": expected_sl, "tp": 0.0, "volume": 0.01}],  # TP1 leg closed, runner remains
@@ -84,12 +85,11 @@ async def test_a4_fails_when_opened_sl_does_not_match_full_signal_sl():
     wrong_sl = price - 999  # not the full signal's SL, not close to it
 
     ctx = _ctx(price=price)
-    ctx.observer.positions_for_symbol = AsyncMock(
-        return_value=[
-            {"ticket": 1, "sl": wrong_sl, "tp": 0.0, "volume": 0.01},
-            {"ticket": 2, "sl": wrong_sl, "tp": 0.0, "volume": 0.01},
-        ]
-    )
+    two_legs_wrong_sl = [
+        {"ticket": 1, "sl": wrong_sl, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": wrong_sl, "tp": 0.0, "volume": 0.01},
+    ]
+    ctx.observer.positions_for_symbol = AsyncMock(side_effect=[[]] + [two_legs_wrong_sl] * 20)
 
     result = await a4_full_only.run(ctx)
 

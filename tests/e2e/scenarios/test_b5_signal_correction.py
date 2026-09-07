@@ -16,12 +16,13 @@ def _ctx_with_open_position():
     sender = MagicMock()
     sender.send = AsyncMock(return_value=1)
     observer = MagicMock()
-    observer.positions_for_symbol = AsyncMock(
-        return_value=[
-            {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-            {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-        ]
-    )
+    two_legs = [
+        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+    ]
+    # First call is the preexisting_tickets snapshot (nothing open yet); every
+    # call after that returns the two legs this scenario opened.
+    observer.positions_for_symbol = AsyncMock(side_effect=[[]] + [two_legs] * 20)
     observer.grep_container_logs = MagicMock(return_value=["[TM][EVENT] group_updated {'group_id': 1, 'tp2': 4687.0}"])
     cfg = MagicMock(tg_test_chat_id=-1009999999999)
     return ScenarioContext(cfg=cfg, price_reader=price_reader, sender=sender, observer=observer)

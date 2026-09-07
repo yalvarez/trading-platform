@@ -25,6 +25,7 @@ def _ctx_with_open_position():
     observer = MagicMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after fast open
             [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],  # after BE applied
@@ -59,7 +60,9 @@ async def test_b1_reports_external_dependency_failure_on_timeout_without_error()
 
     async def _positions_for_symbol(_symbol):
         calls["n"] += 1
-        return setup_positions if calls["n"] == 1 else unchanged_runner  # SL never moves after setup
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot: nothing open yet
+        return setup_positions if calls["n"] == 2 else unchanged_runner  # SL never moves after setup
 
     ctx.observer.positions_for_symbol = _positions_for_symbol
     ctx.observer.grep_container_logs = MagicMock(return_value=[])  # no mgmt event logged at all

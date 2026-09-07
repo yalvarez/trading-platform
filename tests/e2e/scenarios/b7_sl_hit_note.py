@@ -7,6 +7,7 @@ Assert "no mutation", not "no action" (spec section 5 correction).
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
+from tests.e2e.scenarios.a1_fast_only import _preexisting_tickets
 from tests.e2e.scenarios._management_common import (
     open_position_for_management_test,
     SYMBOL,
@@ -18,7 +19,9 @@ MESSAGE = "HIT SL ❌. GET READY FOR RECOVERY \U0001f91d"
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions_before = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions_before = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions_before) < 2:
         return ScenarioResult(
             name="b7_sl_hit_note", outcome=ScenarioOutcome.FAIL,
@@ -46,4 +49,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="SL-hit/recovery message correctly left the position unmutated",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

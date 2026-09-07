@@ -8,7 +8,13 @@ parses and opens correctly. Subject to the same 5s gold entry-range window
 as A2/A4 (spec section 5 gold note).
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
+from tests.e2e.scenarios.a1_fast_only import (
+    _poll_until,
+    _preexisting_tickets,
+    _new_positions,
+    OPEN_POLL_TIMEOUT_SECONDS,
+    OPEN_POLL_INTERVAL_SECONDS,
+)
 
 SYMBOL = "XAUUSD"
 ENTRY_RANGE_HALF_WIDTH_PIPS = 3.0
@@ -29,12 +35,14 @@ def _build_signal_with_dash_variant(price: float, dash: str) -> str:
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     price = await ctx.price_reader.read_price(SYMBOL)
     text = _build_signal_with_dash_variant(price, dash="- ")  # e.g. "4600- 4590" style spacing
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, text)
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -58,4 +66,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="irregular dash spacing in ENTRY PRICE parsed and opened correctly",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

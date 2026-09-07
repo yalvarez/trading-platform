@@ -11,7 +11,13 @@ fast, then sends the full signal.
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
+from tests.e2e.scenarios.a1_fast_only import (
+    _poll_until,
+    _preexisting_tickets,
+    _new_positions,
+    OPEN_POLL_TIMEOUT_SECONDS,
+    OPEN_POLL_INTERVAL_SECONDS,
+)
 from tests.e2e.scenarios.a2_fast_then_full_early import _build_full_signal_text
 
 SYMBOL = "XAUUSD"
@@ -20,11 +26,13 @@ TP1_CLOSE_POLL_INTERVAL_SECONDS = 10
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     price = await ctx.price_reader.read_price(SYMBOL)
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -40,7 +48,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         # in normal XAUUSD movement; if it never does, report inconclusive
         # rather than a false FAIL, consistent with A1/A2).
         async def check_tp1_closed():
-            remaining = await ctx.observer.positions_for_symbol(SYMBOL)
+            remaining = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return remaining if len(remaining) == 1 else None
 
         remaining_before_full = await _poll_until(check_tp1_closed, TP1_CLOSE_TIMEOUT_SECONDS, TP1_CLOSE_POLL_INTERVAL_SECONDS)
@@ -60,7 +68,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         await ctx.sender.send(ctx.cfg.tg_test_chat_id, full_text)
 
         async def check_sl_after_update():
-            after = await ctx.observer.positions_for_symbol(SYMBOL)
+            after = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return after if after else None
 
         positions_after_update = await _poll_until(check_sl_after_update, 30, 2)
@@ -83,4 +91,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="late full signal did not regress an already-improved SL",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

@@ -10,7 +10,7 @@ section 2) -- a timeout with no mgmt event logged is reported as an
 external dependency failure, not a bot FAIL (spec section 7).
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
 
 MGMT_POLL_TIMEOUT_SECONDS = 120
@@ -19,7 +19,9 @@ MESSAGE = "Set BE for zero risk"
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions) < 2:
         return ScenarioResult(
             name="b1_be_variant1", outcome=ScenarioOutcome.FAIL,
@@ -31,7 +33,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
     try:
         async def check_be_applied():
-            current = await ctx.observer.positions_for_symbol(SYMBOL)
+            current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             runner = next(iter(current), None)
             if runner and runner["sl"] != runner_sl_before:
                 return runner
@@ -56,4 +58,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="'Set BE for zero risk' correctly moved runner SL to entry",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

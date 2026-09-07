@@ -13,6 +13,7 @@ def _ctx_with_be_applied_position():
     observer.restart_container = AsyncMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after fast open
             [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],  # after BE applied (tp1 leg closed)
@@ -44,6 +45,7 @@ async def test_d1_fails_when_position_is_orphaned_after_restart():
     ctx = _ctx_with_be_applied_position()
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
             [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],
@@ -61,6 +63,7 @@ async def test_d1_fails_when_restart_duplicates_the_group():
     ctx = _ctx_with_be_applied_position()
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
             [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],

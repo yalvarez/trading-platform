@@ -15,6 +15,7 @@ async def test_c1b_signal_past_cooldown_opens_a_second_independent_group(monkeyp
     observer = MagicMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # first group opens
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
@@ -41,10 +42,12 @@ async def test_c1b_fails_when_signal_past_cooldown_is_still_discarded(monkeypatc
     sender = MagicMock()
     sender.send = AsyncMock(return_value=1)
     observer = MagicMock()
-    observer.positions_for_symbol = AsyncMock(
-        return_value=[{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-                      {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
-    )  # never grows to 4 — regression: still being discarded as a duplicate
+    two_legs = [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+                {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
+    # First call is the preexisting_tickets snapshot (nothing open yet); every
+    # call after that keeps returning the same two legs — never grows to 4 —
+    # regression: still being discarded as a duplicate.
+    observer.positions_for_symbol = AsyncMock(side_effect=[[]] + [two_legs] * 20)
     cfg = MagicMock(tg_test_chat_id=-1009999999999)
     ctx = ScenarioContext(cfg=cfg, price_reader=price_reader, sender=sender, observer=observer)
 
@@ -65,6 +68,7 @@ async def test_c1b_uses_env_cooldown_plus_margin(monkeypatch):
     observer = MagicMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},

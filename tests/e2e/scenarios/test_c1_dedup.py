@@ -24,6 +24,7 @@ async def test_c1_second_identical_signal_does_not_open_a_second_group():
     observer = MagicMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after 1st send
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
@@ -48,6 +49,7 @@ async def test_c1_fails_when_second_signal_opens_a_second_group():
     observer = MagicMock()
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},

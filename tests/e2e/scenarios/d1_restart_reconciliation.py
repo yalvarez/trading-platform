@@ -11,7 +11,7 @@ the exact production incident that motivated that subsystem: a restart
 silently dropping management of an open group.
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
 from tests.e2e.scenarios.b1_be_variant1 import MESSAGE as BE_MESSAGE
 
@@ -22,7 +22,9 @@ CONTAINER_NAME = "atp-trade-orchestrator"
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions) < 2:
         return ScenarioResult(
             name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
@@ -33,7 +35,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
     try:
         async def check_be_applied():
-            current = await ctx.observer.positions_for_symbol(SYMBOL)
+            current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             runner = next(iter(current), None)
             entry_sl = positions[0]["sl"]
             if runner and runner["sl"] != entry_sl:
@@ -58,7 +60,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         await ctx.observer.restart_container(CONTAINER_NAME, settle_seconds=RESTART_SETTLE_SECONDS)
 
         async def check_single_position_unchanged():
-            after = await ctx.observer.positions_for_symbol(SYMBOL)
+            after = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return after if after else None
 
         positions_after_restart = await _poll_until(
@@ -99,4 +101,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="trade_orchestrator restart correctly reconciled the BE-applied group with no duplication or state loss",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

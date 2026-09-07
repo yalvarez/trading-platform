@@ -36,6 +36,7 @@ async def test_a2_sends_fast_signal_then_full_signal_and_updates_sl():
 
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # two legs opened by fast signal
             [{"ticket": 1, "sl": expected_sl, "tp": 0.0, "volume": 0.01},
@@ -69,20 +70,16 @@ async def test_a2_fails_when_fast_signal_never_opens_two_legs():
 @pytest.mark.asyncio
 async def test_a2_reports_entry_range_timeout_when_full_signal_aborted():
     ctx = _ctx(price=2500.0)
+    # First call is the preexisting_tickets snapshot (nothing open yet); every
+    # call after that (two-legs-open poll, then the SL-update poll that times
+    # out) returns the same unmodified positions forever, so the SL-update
+    # poll never sees an update and the scenario checks the abort logs.
     ctx.observer.positions_for_symbol = AsyncMock(
-        side_effect=[
-            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # two legs opened by fast signal
-        ]
+        side_effect=[[]] + [[
+            {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+            {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        ]] * 50
     )
-    # After the two-legs-open poll succeeds, every further poll call (for the
-    # SL update) keeps returning the same unmodified positions forever, so
-    # the SL-update poll times out and the scenario checks the abort logs.
-    ctx.observer.positions_for_symbol.side_effect = None
-    ctx.observer.positions_for_symbol.return_value = [
-        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-    ]
     ctx.observer.grep_container_logs = MagicMock(
         return_value=["[TM][EVENT] open_aborted reason=entry_range symbol=XAUUSD"]
     )

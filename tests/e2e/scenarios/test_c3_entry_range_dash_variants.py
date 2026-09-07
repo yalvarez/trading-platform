@@ -30,6 +30,7 @@ async def test_c3_sends_dash_variant_signal_and_confirms_two_legs_open():
     ctx = _ctx(price=2500.0)
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2494.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2494.0, "tp": 0.0, "volume": 0.01}],  # two legs opened
         ]

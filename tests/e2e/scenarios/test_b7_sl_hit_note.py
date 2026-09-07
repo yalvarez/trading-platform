@@ -20,7 +20,9 @@ def _ctx_with_open_position():
         {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
         {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
     ]
-    observer.positions_for_symbol = AsyncMock(return_value=same_positions)
+    # First call is the preexisting_tickets snapshot (nothing open yet); every
+    # call after that returns the same two legs this scenario opened.
+    observer.positions_for_symbol = AsyncMock(side_effect=[[]] + [same_positions] * 20)
     # note_sl_hit legitimately logs a [TM][EVENT] line — it just must not be
     # one of the mutating actions (close/BE/update).
     observer.grep_container_logs = MagicMock(return_value=["[TM][EVENT] note_sl_hit {'group_id': 1}"])

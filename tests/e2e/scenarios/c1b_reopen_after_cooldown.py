@@ -13,7 +13,13 @@ import asyncio
 import os
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
+from tests.e2e.scenarios.a1_fast_only import (
+    _poll_until,
+    _preexisting_tickets,
+    _new_positions,
+    OPEN_POLL_TIMEOUT_SECONDS,
+    OPEN_POLL_INTERVAL_SECONDS,
+)
 
 SYMBOL = "XAUUSD"
 SETTLE_AFTER_SECOND_SEND_SECONDS = 15
@@ -24,10 +30,12 @@ def _reopen_cooldown_seconds() -> float:
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     first_group_positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -47,12 +55,12 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
         async def check_second_group_opened():
-            positions = await ctx.observer.positions_for_symbol(SYMBOL)
+            positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return positions if len(positions) >= 4 else None
 
         all_positions = await _poll_until(check_second_group_opened, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
         if not all_positions:
-            after_wait = await ctx.observer.positions_for_symbol(SYMBOL)
+            after_wait = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return ScenarioResult(
                 name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.FAIL,
                 evidence={"positions_after_wait": after_wait},
@@ -65,4 +73,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="fast signal past the reopen cooldown correctly opened a second, independent group",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

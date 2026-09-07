@@ -3,7 +3,7 @@ B4 (spec section 5): "MARKET STRUCTURE SHIFTED! DON'T HOLD SELL. Close now"
 -> action close_now (trade_manager.apply_mgmt_action) closes both legs.
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
 
 MGMT_POLL_TIMEOUT_SECONDS = 120
@@ -12,7 +12,9 @@ MESSAGE = "MARKET STRUCTURE SHIFTED! DON'T HOLD SELL. Close now"
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions) < 2:
         return ScenarioResult(
             name="b4_forced_close", outcome=ScenarioOutcome.FAIL,
@@ -23,7 +25,10 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
     try:
         async def check_all_closed():
-            current = await ctx.observer.positions_for_symbol(SYMBOL)
+            # Only this scenario's own two legs matter here — this demo
+            # account may keep carrying unrelated real positions in XAUUSD
+            # the whole time, which must never block "all closed."
+            current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             # _poll_until treats a falsy return as "not done yet" — an empty
             # list is falsy in Python, so returning `current` itself here
             # would make a genuinely-closed position indistinguishable from
@@ -49,4 +54,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             evidence={"logs": logs}, detail="forced-close message correctly closed both legs",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)  # no-op if already closed
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)  # no-op if already closed

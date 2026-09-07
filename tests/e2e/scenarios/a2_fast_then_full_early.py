@@ -9,7 +9,13 @@ entry-range window (spec section 5 gold entry-range note).
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS
+from tests.e2e.scenarios.a1_fast_only import (
+    _poll_until,
+    _preexisting_tickets,
+    _new_positions,
+    OPEN_POLL_TIMEOUT_SECONDS,
+    OPEN_POLL_INTERVAL_SECONDS,
+)
 
 SYMBOL = "XAUUSD"
 TP1_POLL_TIMEOUT_SECONDS = 600
@@ -36,11 +42,13 @@ def _build_full_signal_text(direction: str, price: float, sl_pips: float, tp1_pi
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     price = await ctx.price_reader.read_price(SYMBOL)
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -58,7 +66,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
     try:
         async def check_updated_sl():
-            updated = await ctx.observer.positions_for_symbol(SYMBOL)
+            updated = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             expected_sl = price_for_full - 6
             if updated and all(abs(p["sl"] - expected_sl) < 0.5 for p in updated):
                 return updated
@@ -79,7 +87,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             )
 
         async def check_tp1_closed():
-            remaining = await ctx.observer.positions_for_symbol(SYMBOL)
+            remaining = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return remaining if len(remaining) == 1 else None
 
         remaining = await _poll_until(check_tp1_closed, TP1_POLL_TIMEOUT_SECONDS, TP1_POLL_INTERVAL_SECONDS)
@@ -95,4 +103,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="fast opened, full signal updated SL/TP1/TP2 on same group, TP1 closed",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

@@ -27,12 +27,31 @@ async def _poll_until(condition_fn, timeout_seconds: float, interval_seconds: fl
     return None
 
 
+async def _preexisting_tickets(ctx: ScenarioContext, symbol: str) -> set:
+    """
+    Snapshot of tickets already open for `symbol` BEFORE this scenario sends
+    anything. This demo account is shared with real, unrelated live trading
+    on this VPS — every scenario must take this snapshot first and use it to
+    tell "a position this scenario opened" apart from "a position that was
+    already there," both when detecting its own open/close and when cleaning
+    up (see cleanup_group's `preexisting_tickets` parameter).
+    """
+    existing = await ctx.observer.positions_for_symbol(symbol)
+    return {p["ticket"] for p in existing}
+
+
+def _new_positions(positions: list, preexisting_tickets: set) -> list:
+    return [p for p in positions if p["ticket"] not in preexisting_tickets]
+
+
 async def run(ctx: ScenarioContext) -> ScenarioResult:
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
     await ctx.price_reader.read_price(SYMBOL)  # sanity read; fast signal carries no price itself
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
     async def check_two_legs_open():
-        positions = await ctx.observer.positions_for_symbol(SYMBOL)
+        positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
         return positions if len(positions) >= 2 else None
 
     positions = await _poll_until(check_two_legs_open, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
@@ -45,7 +64,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
     try:
         async def check_tp1_closed():
-            remaining = await ctx.observer.positions_for_symbol(SYMBOL)
+            remaining = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return remaining if len(remaining) == 1 else None
 
         remaining = await _poll_until(check_tp1_closed, TP1_POLL_TIMEOUT_SECONDS, TP1_POLL_INTERVAL_SECONDS)
@@ -61,4 +80,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="opened two legs, TP1 leg closed, runner remains under BE/trailing",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

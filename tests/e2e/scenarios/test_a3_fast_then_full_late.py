@@ -36,6 +36,7 @@ async def test_a3_passes_when_late_full_signal_does_not_regress_sl():
 
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot: nothing open before the scenario starts
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # two legs opened by fast signal
             [{"ticket": 2, "sl": sl_before_full, "tp": 0.0, "volume": 0.01}],  # tp1 leg closed, BE/trailing applied
@@ -60,6 +61,7 @@ async def test_a3_fails_when_sl_regresses_after_late_full_signal():
 
     ctx.observer.positions_for_symbol = AsyncMock(
         side_effect=[
+            [],  # preexisting_tickets snapshot
             [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
              {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],
             [{"ticket": 2, "sl": sl_before_full, "tp": 0.0, "volume": 0.01}],
@@ -77,12 +79,14 @@ async def test_a3_fails_when_sl_regresses_after_late_full_signal():
 @pytest.mark.asyncio
 async def test_a3_inconclusive_when_tp1_never_reached_before_full_signal():
     ctx = _ctx(price=2500.0)
-    ctx.observer.positions_for_symbol = AsyncMock(
-        return_value=[
-            {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-            {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-        ]
-    )
+    two_legs = [
+        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+    ]
+    # First call is the preexisting_tickets snapshot (nothing open yet); every
+    # call after that keeps returning the same two legs forever (TP1 never
+    # closes to just the runner).
+    ctx.observer.positions_for_symbol = AsyncMock(side_effect=[[]] + [two_legs] * 100)
 
     result = await a3_fast_then_full_late.run(ctx)
 

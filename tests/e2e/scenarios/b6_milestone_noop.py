@@ -6,6 +6,7 @@ positive here is the failure mode under test.
 import asyncio
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
+from tests.e2e.scenarios.a1_fast_only import _preexisting_tickets
 from tests.e2e.scenarios._management_common import (
     open_position_for_management_test,
     SYMBOL,
@@ -17,7 +18,9 @@ MESSAGES = ["+240 PIPS SKYROCKETING", "TP 1 DONE", "Road to TP ONE"]
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions_before = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions_before = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions_before) < 2:
         return ScenarioResult(
             name="b6_milestone_noop", outcome=ScenarioOutcome.FAIL,
@@ -46,4 +49,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             detail="milestone messages correctly produced no mgmt action",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)

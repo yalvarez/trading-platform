@@ -38,22 +38,39 @@ class ScenarioResult:
     detail: str = ""
 
 
-async def cleanup_group(ctx: ScenarioContext, symbol: str, close_fn: Optional[Callable] = None) -> None:
+async def cleanup_group(
+    ctx: ScenarioContext,
+    symbol: str,
+    close_fn: Optional[Callable] = None,
+    preexisting_tickets: Optional[set] = None,
+) -> None:
     """
     Best-effort emergency cleanup: closes any position still open for
-    `symbol`. `close_fn(ticket, volume)` defaults to a direct RPyC
-    partial_close against ctx.observer's MT5 connection; a scenario's
-    unit test injects a fake to avoid touching a real MT5 connection.
-    Never raises — a cleanup failure is logged, not propagated, so it
-    never masks the scenario's own result.
+    `symbol` that the scenario itself opened. `close_fn(ticket, volume)`
+    defaults to a direct RPyC partial_close against ctx.observer's MT5
+    connection; a scenario's unit test injects a fake to avoid touching a
+    real MT5 connection. Never raises — a cleanup failure is logged, not
+    propagated, so it never masks the scenario's own result.
+
+    `preexisting_tickets`: tickets already open for `symbol` BEFORE the
+    scenario sent anything (a snapshot taken at the very start of `run()`).
+    This demo account is shared with real, unrelated live trading on this
+    VPS — without this exclusion, cleanup would close ANY open position of
+    the symbol, including a real position that has nothing to do with the
+    test. Every ticket in this set is left untouched; only tickets NOT in
+    it (i.e. genuinely new, opened by this scenario) are closed. Pass None
+    (or omit) only when the scenario is certain it owns every position for
+    `symbol` — e.g. a hermetic unit test — never in a real run.
     """
     import logging
     log = logging.getLogger("e2e.cleanup")
+    preexisting_tickets = preexisting_tickets or set()
     try:
         positions = await ctx.observer.positions_for_symbol(symbol)
     except Exception as e:
         log.warning("cleanup_group: could not read positions for %s: %s", symbol, e)
         return
+    positions = [p for p in positions if p["ticket"] not in preexisting_tickets]
     for pos in positions:
         try:
             if close_fn is not None:

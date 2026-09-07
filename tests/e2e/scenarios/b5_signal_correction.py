@@ -8,7 +8,7 @@ tp2 reference used by trailing (trade_manager.apply_mgmt_action, action ==
 so there is no SL/TP change to observe in MT5, only the log line.
 """
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
-from tests.e2e.scenarios.a1_fast_only import _poll_until
+from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
 
 MGMT_POLL_TIMEOUT_SECONDS = 120
@@ -18,7 +18,9 @@ MESSAGE_2 = "TP 2 IS 4687 Correction"
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
-    positions = await open_position_for_management_test(ctx)
+    preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
+
+    positions = await open_position_for_management_test(ctx, preexisting_tickets)
     if len(positions) < 2:
         return ScenarioResult(
             name="b5_signal_correction", outcome=ScenarioOutcome.FAIL,
@@ -44,4 +46,4 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             evidence={"logs": logs}, detail="free-text TP2 correction was classified and applied via signal_correction",
         )
     finally:
-        await cleanup_group(ctx, SYMBOL)
+        await cleanup_group(ctx, SYMBOL, preexisting_tickets=preexisting_tickets)
