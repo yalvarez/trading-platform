@@ -53,6 +53,37 @@ async def test_open_group_opens_two_positions_with_shared_group_id():
 
 
 @pytest.mark.asyncio
+async def test_open_group_defaults_chat_id_to_none_when_not_passed():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+    for t in legs:
+        assert t.chat_id is None
+
+
+@pytest.mark.asyncio
+async def test_open_group_propagates_chat_id_to_both_legs():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0,
+        chat_id="-1001234567890",
+    )
+
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+    for t in legs:
+        assert t.chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
 async def test_open_group_aborts_when_tp2_not_above_tp1_for_buy():
     sim = SimuladorMT5()
     sim.price = 2500.0

@@ -31,6 +31,7 @@ class ManagedTrade:
     be_applied: bool = False
     peak_multiple: float = 0.0
     opened_ts: float = field(default_factory=lambda: time.time())
+    chat_id: Optional[str] = None
 
 
 class TradeManager:
@@ -228,7 +229,7 @@ class TradeManager:
                 return None
         return None
 
-    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None) -> Optional[int]:
+    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None, chat_id: Optional[str] = None) -> Optional[int]:
         """
         Abre dos posiciones (tp1_leg, runner_leg) con el mismo symbol/direction/SL,
         vinculadas por un group_id nuevo. Ver dual-TP spec seccion 3.
@@ -240,6 +241,13 @@ class TradeManager:
           antes de ejecutar (hasta entry_wait_seconds, con tolerancia TOLERANCE_PIPS;
           ventana reducida a 5s para oro dado su movimiento rapido) — mismo mecanismo
           que existia en MT5Executor.open_complete_trade antes de la reescritura dual-TP.
+        - chat_id, si viene, se guarda en ambas piernas del grupo (dual-TP
+          spec + chat_id-scoping spec seccion 3) — identifica el canal de
+          Telegram que origino la senal, usado por /mgmt/action para
+          resolver a que grupos aplicar una accion de gestion. None si la
+          senal no trae chat_id (legacy) o si open_group se llama sin el
+          (p. ej. en tests existentes) -- un grupo con chat_id=None queda
+          huerfano de gestion automatica via /mgmt/action.
         Retorna el group_id nuevo, o None si se aborto (unit invalido, SL invalido,
         sin precio disponible, o el precio nunca entro/ya paso el rango).
         """
@@ -328,6 +336,7 @@ class TradeManager:
                 tp1_price=float(tp1) if tp1 is not None else None,
                 tp2_price=float(tp2) if tp2 is not None else None,
                 entry_price=float(price),
+                chat_id=chat_id,
             )
         TRADES_OPENED.inc(2)
         ACTIVE_TRADES.set(len(self.trades))
