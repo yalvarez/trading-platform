@@ -444,6 +444,32 @@ class TradeManager:
         newest = max(candidates, key=lambda t: (t.opened_ts, t.group_id))
         return newest.group_id
 
+    def find_active_groups_for_chat(self, chat_id: str) -> list[int]:
+        """
+        Todos los group_id con al menos una pierna activa cuyo chat_id
+        coincide exactamente con `chat_id` (chat_id-scoping spec seccion 5).
+        Un grupo con chat_id=None (huerfano -- legacy o reconciliado en
+        modo degradado) NUNCA aparece aqui, sin importar que chat_id se
+        consulte (incluido chat_id=None): no hay gestion automatica para
+        un grupo cuyo canal de origen no se conoce con certeza. Usado
+        exclusivamente por apply_mgmt_action -- handle_signal_fields sigue
+        usando find_active_group_for_symbol para su propia logica de
+        fast/full por simbolo, que no tiene relacion con /mgmt/action.
+        Ordenado de mas antiguo a mas reciente (por opened_ts, luego
+        group_id como desempate -- mismo criterio que
+        find_active_group_for_symbol ya usa).
+        """
+        if chat_id is None:
+            return []
+        candidates = [t for t in self.trades.values() if t.chat_id == chat_id]
+        group_ids = sorted(
+            {t.group_id for t in candidates},
+            key=lambda gid: min(
+                (t.opened_ts, t.group_id) for t in candidates if t.group_id == gid
+            ),
+        )
+        return group_ids
+
     def group_age_seconds(self, group_id: int) -> Optional[float]:
         """
         Segundos desde que se abrio `group_id` (min opened_ts entre sus piernas),

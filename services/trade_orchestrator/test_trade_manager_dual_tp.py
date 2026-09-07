@@ -505,6 +505,61 @@ async def test_find_active_group_for_symbol_tie_breaks_on_group_id_when_opened_t
     assert found == g2  # the higher group_id (the actually-newer group) wins
 
 
+# --- chat_id-scoping: find_active_groups_for_chat ---
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_returns_all_groups_oldest_first():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatB")
+
+    found = tm.find_active_groups_for_chat("chatA")
+
+    assert found == [g1, g2]
+
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_returns_empty_list_for_unknown_chat():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+
+    found = tm.find_active_groups_for_chat("chatZ")
+
+    assert found == []
+
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_never_returns_orphaned_none_chat_id_groups():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    # Opened without chat_id (legacy / test default) -- an orphan.
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    found_for_none = tm.find_active_groups_for_chat(None)
+    found_for_real_chat = tm.find_active_groups_for_chat("chatA")
+
+    assert found_for_none == []  # querying with None must not match orphans either
+    assert found_for_real_chat == []
+
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_deduplicates_group_ids_across_both_legs():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+
+    found = tm.find_active_groups_for_chat("chatA")
+
+    assert found == [g1]  # not [g1, g1] -- one entry per group, not per leg
+
+
 # --- Review fix 3: entry_price=None must not raise ---
 
 @pytest.mark.asyncio
