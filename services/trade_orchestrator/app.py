@@ -85,7 +85,14 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
         default_tp1 = calcular_tp_default(symbol, direction, price, point, default_tp_pips) if default_tp_pips > 0 else None
         default_tp2 = None
         if default_tp1 is not None:
-            default_tp2 = default_tp1 + point if direction.upper() == "BUY" else default_tp1 - point
+            # tp2 = tp1 + N pips (not "+1 point"): a 1-point unit made
+            # _apply_trailing's peak_multiple hypersensitive to tiny price
+            # ticks, sending an SL order_send on nearly every tick (~15 in
+            # 2 minutes observed live, group_id=23). DEFAULT_TP2_EXTRA_PIPS
+            # gives tp1/tp2 a real, configurable distance — the same order
+            # of magnitude a genuine signal's TP1/TP2 pair would have.
+            tp2_extra_pips = float(_config.get("DEFAULT_TP2_EXTRA_PIPS", 40))
+            default_tp2 = calcular_tp_default(symbol, direction, default_tp1, point, tp2_extra_pips)
         await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2)
         return
 

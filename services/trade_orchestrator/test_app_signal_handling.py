@@ -197,6 +197,35 @@ async def test_fast_signal_opens_new_group_as_reopen_after_cooldown_elapses(monk
 
 
 @pytest.mark.asyncio
+async def test_fast_signal_tp2_is_extra_pips_past_tp1_not_one_point():
+    """
+    Real production bug found live (group_id=23): the synthetic tp2 for a fast
+    signal used to be `tp1 +/- 1 point` (a single price point, e.g. 0.10 for
+    XAUUSD). That made unit = |tp1 - tp2| tiny, which made _apply_trailing
+    recompute (and re-send order_send for) a new SL on almost every tick
+    (~15 updates in 2 minutes were observed live for group 23). tp2 must
+    instead be tp1 +/- DEFAULT_TP2_EXTRA_PIPS pips (a real, configurable
+    distance), same order of magnitude a genuine signal's TP1/TP2 pair would
+    have.
+    """
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+
+    by_leg = {t.leg: t for t in tm.trades.values()}
+    tp1_price = by_leg["tp1"].tp1_price
+    tp2_price = by_leg["tp1"].tp2_price
+    # default DEFAULT_TP2_EXTRA_PIPS (40 pips = 4.0 for XAUUSD) past tp1, not 1 point (0.1).
+    assert abs(tp2_price - tp1_price) == pytest.approx(4.0, abs=1e-6)
+    assert tp2_price > tp1_price  # BUY: tp2 further in the favorable direction than tp1
+
+
+@pytest.mark.asyncio
 async def test_full_signal_without_prior_fast_opens_group_directly():
     from services.trade_orchestrator.app import handle_signal_fields
 
