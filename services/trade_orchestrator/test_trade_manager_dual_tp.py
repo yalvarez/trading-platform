@@ -862,6 +862,22 @@ async def test_no_state_store_is_a_safe_default():
     assert group_id is not None  # did not raise despite no store configured
 
 
+@pytest.mark.asyncio
+async def test_group_doc_includes_chat_id():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0,
+        chat_id="-1001234567890",
+    )
+
+    doc = tm._group_doc(group_id)
+    assert doc["chat_id"] == "-1001234567890"
+
+
 # --- Task 4: reconcile_from_mt5 startup recovery ---
 
 def _open_raw_position(sim, *, ticket_price, sl, tp, comment, magic=MAGIC, direction_type=0):
@@ -902,6 +918,73 @@ async def test_reconcile_recovers_full_state_from_store():
     assert runner.tp2_price == 2530.0
     assert runner.be_applied is True
     assert runner.peak_multiple == 0.35
+
+
+@pytest.mark.asyncio
+async def test_reconcile_inherits_chat_id_from_store_doc():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "chat_id": "-1001234567890",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": tp1_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": True, "peak_multiple": 0.35},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert tm.trades[tp1_ticket].chat_id == "-1001234567890"
+    assert tm.trades[runner_ticket].chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_chat_id_none_when_store_doc_predates_the_field():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        # Legacy doc persisted before chat_id existed -- no "chat_id" key at all.
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": tp1_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": True, "peak_multiple": 0.35},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert tm.trades[tp1_ticket].chat_id is None
+    assert tm.trades[runner_ticket].chat_id is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_degraded_mode_leaves_chat_id_none():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()  # empty docs -- every group_id misses, forcing degraded mode
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP7-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP7-runner")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert summary["degraded"] == 1
+    assert tm.trades[tp1_ticket].chat_id is None
+    assert tm.trades[runner_ticket].chat_id is None
 
 
 @pytest.mark.asyncio

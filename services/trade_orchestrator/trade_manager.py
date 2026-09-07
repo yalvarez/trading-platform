@@ -76,6 +76,7 @@ class TradeManager:
             "account_name": first.account_name,
             "symbol": first.symbol,
             "direction": first.direction,
+            "chat_id": first.chat_id,
             "tp1_price": first.tp1_price,
             "tp2_price": first.tp2_price,
             "legs": {},
@@ -808,7 +809,7 @@ class TradeManager:
             direction=doc["direction"], group_id=doc["group_id"], leg=leg,
             planned_sl=leg_doc["planned_sl"], tp1_price=doc.get("tp1_price"), tp2_price=doc.get("tp2_price"),
             entry_price=leg_doc.get("entry_price"), be_applied=leg_doc.get("be_applied", False),
-            peak_multiple=leg_doc.get("peak_multiple", 0.0),
+            peak_multiple=leg_doc.get("peak_multiple", 0.0), chat_id=doc.get("chat_id"),
         )
 
     def _reconstruct_leg_minimal(self, account, mt5_pos, group_id: int, leg: str) -> None:
