@@ -40,12 +40,29 @@ async def test_b8_sends_spam_message_and_confirms_no_effects():
 async def test_b8_fails_when_spam_opens_a_position():
     ctx = _ctx()
     ctx.observer.positions_for_symbol = AsyncMock(
-        return_value=[{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]  # false positive: it opened a trade
+        side_effect=[
+            [],  # before: nothing open (may include unrelated production positions in reality)
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after: a NEW position appeared
+        ]
     )
 
     result = await b8_spam_noop.run(ctx)
 
     assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
+async def test_b8_passes_when_only_a_preexisting_unrelated_position_is_present():
+    # This demo account may already carry real production positions in
+    # XAUUSD unrelated to this scenario — the same position present both
+    # before and after must NOT be treated as a false positive.
+    ctx = _ctx()
+    preexisting = [{"ticket": 999, "sl": 2400.0, "tp": 0.0, "volume": 0.04}]
+    ctx.observer.positions_for_symbol = AsyncMock(side_effect=[preexisting, preexisting])
+
+    result = await b8_spam_noop.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.PASS
 
 
 @pytest.mark.asyncio

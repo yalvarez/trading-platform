@@ -19,13 +19,20 @@ MESSAGE = "Anyone else watching the Fed announcement today? Curious how gold rea
 async def run(ctx: ScenarioContext) -> ScenarioResult:
     scenario_start_time = datetime.now(timezone.utc)
 
+    # Snapshot BEFORE sending — same rationale as b8_spam_noop: this demo
+    # account may already carry real, unrelated production positions in
+    # XAUUSD, so only a NEW position between before/after counts as this
+    # scenario's own false positive.
+    positions_before = await ctx.observer.positions_for_symbol("XAUUSD")
+
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
     await asyncio.sleep(SETTLE_SECONDS)
 
     raw_messages = await ctx.observer.read_raw_messages(count=20)
     reached_raw = any(MESSAGE in m.get("text", "") for m in raw_messages)
 
-    positions = await ctx.observer.positions_for_symbol("XAUUSD")
+    positions_after = await ctx.observer.positions_for_symbol("XAUUSD")
+    new_positions = [p for p in positions_after if p not in positions_before]
     mutating_logs = [
         line for line in ctx.observer.grep_container_logs(
             "atp-trade-orchestrator", "[TM][EVENT]", since=scenario_start_time.isoformat()
@@ -39,10 +46,10 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             evidence={"raw_messages": raw_messages},
             detail="message never reached raw_messages — ingestor/filter issue, not an n8n issue",
         )
-    if positions or mutating_logs:
+    if new_positions or mutating_logs:
         return ScenarioResult(
             name="c2_unrecognized_to_n8n", outcome=ScenarioOutcome.FAIL,
-            evidence={"positions": positions, "logs": mutating_logs},
+            evidence={"new_positions": new_positions, "logs": mutating_logs},
             detail="unrecognized text incorrectly produced a trade or mgmt action",
         )
     return ScenarioResult(

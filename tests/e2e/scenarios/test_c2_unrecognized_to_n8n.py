@@ -49,12 +49,28 @@ async def test_c2_fails_when_message_never_reaches_raw_messages():
 async def test_c2_fails_when_unrecognized_text_opens_a_position():
     ctx = _ctx()
     ctx.observer.positions_for_symbol = AsyncMock(
-        return_value=[{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]  # false positive: it opened a trade
+        side_effect=[
+            [],  # before: nothing open
+            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after: a NEW position appeared
+        ]
     )
 
     result = await c2_unrecognized_to_n8n.run(ctx)
 
     assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
+async def test_c2_passes_when_only_a_preexisting_unrelated_position_is_present():
+    # Same demo account may already carry real production positions in
+    # XAUUSD, unrelated to this scenario — must not be a false positive.
+    ctx = _ctx()
+    preexisting = [{"ticket": 999, "sl": 2400.0, "tp": 0.0, "volume": 0.04}]
+    ctx.observer.positions_for_symbol = AsyncMock(side_effect=[preexisting, preexisting])
+
+    result = await c2_unrecognized_to_n8n.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.PASS
 
 
 @pytest.mark.asyncio
