@@ -25,6 +25,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     """
     symbol = fields.get("symbol")
     direction = fields.get("direction")
+    chat_id = fields.get("chat_id")
     is_fast = fields.get("fast", "false").lower() == "true"
     sl_raw = fields.get("sl", "")
     tps = json.loads(fields.get("tps", "[]") or "[]")
@@ -86,7 +87,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
         default_tp2 = None
         if default_tp1 is not None:
             default_tp2 = default_tp1 + point if direction.upper() == "BUY" else default_tp1 - point
-        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2)
+        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2, chat_id=chat_id)
         return
 
     sl = float(sl_raw) if sl_raw else None
@@ -100,7 +101,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     if sl is None or tp1 is None or tp2 is None:
         log.error("[SIGNAL] Senal completa incompleta (sl=%s tp1=%s tp2=%s), abortando.", sl, tp1, tp2)
         return
-    await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=tp1, tp2=tp2, entry_range=entry_range)
+    await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=tp1, tp2=tp2, entry_range=entry_range, chat_id=chat_id)
 
 
 async def main():
