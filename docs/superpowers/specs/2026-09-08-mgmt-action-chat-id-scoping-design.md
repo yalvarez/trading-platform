@@ -174,6 +174,79 @@ si en el futuro se activa una segunda cuenta y dos grupos del mismo
 - **Sin ningún grupo activo para ese `chat_id`** (cualquier acción excepto
   `ignore`): `{"status": "no_active_trade"}` — mismo shape que hoy.
 
+### 5.1. Notificación de rutas de salida silenciosas
+
+Auditoría separada (2026-09-08) de cada `await self._notify(...)` en
+`trade_manager.py` encontró que los 16 llamados existentes ya incluyen
+`message=` — no requieren cambios. Pero `apply_mgmt_action` tiene **5 rutas
+de retorno que hoy nunca llaman a `_notify`**, por lo que un caso de falla o
+ambigüedad queda invisible para n8n/el operador (solo aparece en
+`docker logs`), aun cuando `raw_text` ya está disponible como parámetro en
+la mayoría de estos puntos y se descarta en silencio. Este cambio agrega
+`_notify` a cada una de esas 5 rutas, como parte del mismo trabajo que
+redefine `apply_mgmt_action` (ambos tocan el mismo método):
+
+1. **Ningún grupo activo para el `chat_id`** (`find_active_groups_for_chat`
+   devuelve lista vacía, sección 5 arriba) — hoy solo `log.info`. Agregar:
+   ```python
+   await self._notify(
+       event="mgmt_no_active_trade",
+       message=f"Acción '{action}' recibida pero no hay trades activos para este chat. Texto: {raw_text!r}",
+       chat_id=chat_id,
+       action=action,
+   )
+   ```
+2. **Cuenta no resoluble** (`account_unresolved`, dentro del loop por
+   grupo — ver aislamiento por-grupo arriba) — hoy solo `log.error`. Se
+   notifica por grupo, no una sola vez:
+   ```python
+   await self._notify(
+       event="mgmt_account_unresolved",
+       message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
+       chat_id=chat_id,
+       group_id=group_id,
+       action=action,
+   )
+   ```
+3. **`move_sl_be_now` sin runner leg** en un grupo (`no_active_trade` a
+   nivel de grupo, dentro del resultado por-grupo de la sección 5) — hoy
+   sin ningún aviso. Se notifica por grupo:
+   ```python
+   await self._notify(
+       event="mgmt_no_runner_leg",
+       message=f"Grupo {group_id} no tiene runner leg activo; no se pudo mover SL a BE.",
+       chat_id=chat_id,
+       group_id=group_id,
+   )
+   ```
+4. **`signal_correction` con campo inválido** (`correction.get("field")`
+   fuera de `("sl", "tp1", "tp2")`) — hoy sin aviso. `raw_text` está
+   disponible:
+   ```python
+   await self._notify(
+       event="mgmt_invalid_correction",
+       message=f"Corrección con campo inválido ('{correction.get('field')}') para el chat. Texto: {raw_text!r}",
+       chat_id=chat_id,
+       correction=correction,
+   )
+   ```
+5. **`action` desconocida** (fallthrough final) — hoy sin aviso.
+   `raw_text` está disponible:
+   ```python
+   await self._notify(
+       event="mgmt_unknown_action",
+       message=f"Acción desconocida '{action}' recibida. Texto: {raw_text!r}",
+       chat_id=chat_id,
+       action=action,
+   )
+   ```
+
+Ninguno de estos 5 casos cambia el `dict` que `apply_mgmt_action` retorna
+(los shapes ya definidos en la sección 5 no se alteran) — el cambio es
+exclusivamente que cada ruta, antes de retornar, ahora también llama a
+`_notify` con el mismo criterio (nombre de evento + `message` legible +
+contexto estructurado) que ya usan las 16 llamadas existentes.
+
 ## 6. Contrato de `/mgmt/action`
 
 `MgmtActionRequest` (`services/trade_orchestrator/mgmt_api.py`):
@@ -237,3 +310,21 @@ inferencia, a diferencia de `symbol`.
   - `reconcile_from_mt5`: un documento del store con `chat_id` lo hereda
     correctamente al `ManagedTrade` reconstruido; uno sin esa clave (o
     reconstruido en modo degradado) resuelve a `None`.
+  - Ningún grupo activo para el `chat_id`: `apply_mgmt_action` llama a
+    `_notify` con `event="mgmt_no_active_trade"` y un `message` que incluye
+    el `raw_text` recibido, además de retornar `{"status": "no_active_trade"}`.
+  - Cuenta no resoluble en un grupo (`account_unresolved`): `_notify` se
+    llama con `event="mgmt_account_unresolved"` y el `group_id` afectado;
+    si hay más de un grupo bajo el mismo `chat_id`, se llama una vez por
+    cada grupo cuya cuenta falla, no una sola vez para todo el request.
+  - `move_sl_be_now` sobre un grupo sin runner leg: `_notify` se llama con
+    `event="mgmt_no_runner_leg"` y ese `group_id`, además de que el
+    resultado de ESE grupo en la lista `results` sea `no_active_trade`
+    (los demás grupos del mismo request no se ven afectados).
+  - `signal_correction` con `correction.field` fuera de
+    `("sl", "tp1", "tp2")`: `_notify` se llama con
+    `event="mgmt_invalid_correction"` y un `message` que incluye el campo
+    inválido recibido, además de retornar `{"status": "invalid_correction"}`.
+  - `action` no reconocida: `_notify` se llama con
+    `event="mgmt_unknown_action"` y un `message` que incluye el `raw_text`
+    recibido, además de retornar `{"status": "unknown_action"}`.
