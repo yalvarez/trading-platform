@@ -11,6 +11,7 @@ accepted because it reproduces the real incident.
 """
 import asyncio
 import os
+import re
 
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
 from tests.e2e.scenarios.a1_fast_only import (
@@ -24,9 +25,31 @@ from tests.e2e.scenarios.a1_fast_only import (
 SYMBOL = "XAUUSD"
 SETTLE_AFTER_SECOND_SEND_SECONDS = 15
 
+_GROUP_OPENED_ID_RE = re.compile(r"group_opened \{'group_id': (\d+)")
+
 
 def _reopen_cooldown_seconds() -> float:
     return float(os.environ.get("REOPEN_COOLDOWN_SECONDS", 300))
+
+
+def _group_opened_ids(logs: list) -> set:
+    """
+    Extract every distinct group_id from [TM][EVENT] group_opened log lines.
+    Used instead of counting live positions: XAUUSD moves fast enough with
+    default SL/TP that the FIRST group can close completely (both legs) on
+    its own before REOPEN_COOLDOWN_SECONDS elapses and the second fast
+    signal arrives — a real, observed outcome, not a bug. Position counts
+    can't tell "reopened cleanly" apart from "second signal was discarded"
+    in that case, but the event log can: two distinct group_opened events
+    mean two real signals were each accepted and opened, regardless of
+    whether either has since closed.
+    """
+    ids = set()
+    for line in logs:
+        m = _GROUP_OPENED_ID_RE.search(line)
+        if m:
+            ids.add(int(m.group(1)))
+    return ids
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
@@ -45,6 +68,10 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             evidence={}, detail="first fast signal did not open two legs",
         )
 
+    first_group_ids = _group_opened_ids(
+        ctx.observer.grep_container_logs("atp-trade-orchestrator", "[TM][EVENT] group_opened")
+    )
+
     try:
         # Wait past REOPEN_COOLDOWN_SECONDS with a margin, so the retest
         # isn't flaky against clock/latency skew between this container and
@@ -54,22 +81,23 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
         await ctx.sender.send(ctx.cfg.tg_test_chat_id, "XAUUSD BUY NOW")
 
-        async def check_second_group_opened():
-            positions = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
-            return positions if len(positions) >= 4 else None
+        async def check_second_group_opened_id():
+            logs = ctx.observer.grep_container_logs("atp-trade-orchestrator", "[TM][EVENT] group_opened")
+            new_ids = _group_opened_ids(logs) - first_group_ids
+            return new_ids if new_ids else None
 
-        all_positions = await _poll_until(check_second_group_opened, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
-        if not all_positions:
+        new_group_ids = await _poll_until(check_second_group_opened_id, OPEN_POLL_TIMEOUT_SECONDS, OPEN_POLL_INTERVAL_SECONDS)
+        if not new_group_ids:
             after_wait = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             return ScenarioResult(
                 name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.FAIL,
-                evidence={"positions_after_wait": after_wait},
+                evidence={"positions_after_wait": after_wait, "first_group_ids": sorted(first_group_ids)},
                 detail="fast signal past REOPEN_COOLDOWN_SECONDS was still discarded as a duplicate "
-                       "(the exact production bug this cooldown was built to fix)",
+                       "(the exact production bug this cooldown was built to fix) — no new group_opened event",
             )
         return ScenarioResult(
             name="c1b_reopen_after_cooldown", outcome=ScenarioOutcome.PASS,
-            evidence={"positions": all_positions},
+            evidence={"first_group_ids": sorted(first_group_ids), "new_group_ids": sorted(new_group_ids)},
             detail="fast signal past the reopen cooldown correctly opened a second, independent group",
         )
     finally:
