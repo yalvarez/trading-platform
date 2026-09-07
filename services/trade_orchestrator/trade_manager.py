@@ -604,62 +604,161 @@ class TradeManager:
             await self._notify("trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl)
             await self._persist_group(runner.group_id)
 
-    async def apply_mgmt_action(self, *, action: str, symbol: str, raw_text: str, correction: Optional[dict]) -> dict:
+    @staticmethod
+    def _fmt_price(price: Optional[float]) -> str:
+        """Formatea un precio para mensajes legibles al humano; None -> 'N/A'."""
+        if price is None:
+            return "N/A"
+        return f"{float(price):.5f}"
+
+    async def _get_close_price(self, client, ticket: int) -> Optional[float]:
         """
-        Ejecuta una decision de /mgmt/action (dual-TP spec seccion 5.2).
-        Resuelve el grupo activo mas reciente para `symbol` y aplica la accion.
+        Precio de cierre aproximado para el mensaje de /mgmt/action close_now.
+        Se llama DESPUES de partial_close, que ya elimino la posicion del
+        broker -- positions_get(ticket=...) ya no la encontraria -- asi que
+        usamos el ticket todavia presente en self.trades para pedir el
+        tick_price actual del simbolo en vez de depender de la posicion.
         """
-        group_id = self.find_active_group_for_symbol(symbol)
-        if group_id is None:
-            log.info("[TM][MGMT] no_active_trade symbol=%s action=%s text=%r", symbol, action, raw_text[:80])
+        t = self.trades.get(ticket)
+        if t is None:
+            return None
+        try:
+            price = await self._call(client.tick_price, t.symbol, t.direction)
+            return float(price) if price else None
+        except Exception:
+            return None
+
+    async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict]) -> dict:
+        """
+        Ejecuta una decision de /mgmt/action (chat_id-scoping spec seccion 5).
+        Resuelve TODOS los grupos activos del `chat_id` que mando el mensaje
+        de gestion -- no un simbolo, y no solo el grupo mas reciente -- y
+        aplica la accion segun su propia semantica (ver cada rama abajo).
+        """
+        group_ids = self.find_active_groups_for_chat(chat_id)
+        if not group_ids:
+            log.info("[TM][MGMT] no_active_trade chat_id=%s action=%s text=%r", chat_id, action, raw_text[:80])
+            await self._notify(
+                "mgmt_no_active_trade",
+                message=f"Acción '{action}' recibida pero no hay trades activos para este chat. Texto: {raw_text!r}",
+                chat_id=chat_id,
+                action=action,
+            )
             return {"status": "no_active_trade"}
 
-        legs = [t for t in self.trades.values() if t.group_id == group_id]
-        account = self._ensure_account_dict(legs[0].account_name)
-        if not account:
-            log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s symbol=%s", group_id, symbol)
-            return {"status": "failed", "group_id": group_id, "reason": "account_unresolved"}
-        client = self.mt5._client_for(account)
-
         if action == "close_now":
-            for t in list(legs):
-                await self._call(client.partial_close, account, t.ticket, 100)
-                self.trades.pop(t.ticket, None)
-            await self._notify("mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text)
-            await self._close_group_in_store(group_id)
-            return {"status": "closed", "group_id": group_id}
+            results = []
+            for group_id in group_ids:
+                try:
+                    legs = [t for t in self.trades.values() if t.group_id == group_id]
+                    account = self._ensure_account_dict(legs[0].account_name)
+                    if not account:
+                        log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
+                        await self._notify(
+                            "mgmt_account_unresolved",
+                            message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
+                            chat_id=chat_id, group_id=group_id, action=action,
+                        )
+                        results.append({"group_id": group_id, "status": "failed", "reason": "account_unresolved"})
+                        continue
+                    client = self.mt5._client_for(account)
+                    leg_summaries = []
+                    for t in list(legs):
+                        await self._call(client.partial_close, account, t.ticket, 100)
+                        close_price = await self._get_close_price(client, t.ticket)
+                        leg_summaries.append(
+                            f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
+                            f"cierre {self._fmt_price(close_price)})"
+                        )
+                        self.trades.pop(t.ticket, None)
+                    await self._notify(
+                        "mgmt_close_now", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
+                        message=f"Grupo {group_id} cerrado manualmente via /mgmt/action: "
+                                f"{', '.join(leg_summaries)}. Texto original: {raw_text!r}",
+                    )
+                    await self._close_group_in_store(group_id)
+                    results.append({"group_id": group_id, "status": "closed"})
+                except Exception as e:
+                    log.error("[TM][MGMT] excepcion cerrando group_id=%s chat_id=%s: %s", group_id, chat_id, e)
+                    results.append({"group_id": group_id, "status": "failed", "reason": "exception"})
+            return {"status": "completed", "results": results}
 
         if action == "move_sl_be_now":
-            runner = next((t for t in legs if t.leg == "runner"), None)
-            if not runner:
-                return {"status": "no_active_trade"}
-            if runner.entry_price is None:
-                log.error("[TM][MGMT] move_sl_be_now: runner=%s no tiene entry_price registrado (group_id=%s)",
-                          runner.ticket, group_id)
-                return {"status": "failed", "group_id": group_id, "reason": "no_entry_price"}
-            pos_list = await self._call(client.positions_get, ticket=runner.ticket)
-            current_sl = float(pos_list[0].sl) if pos_list else None
-            be_price = runner.entry_price
-            is_buy = runner.direction == "BUY"
-            worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
-            if not worse_than_be:
-                await self._notify("mgmt_move_sl_be_already_satisfied", group_id=group_id, symbol=symbol)
-                return {"status": "already_satisfied", "group_id": group_id}
-            ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
-            if ok:
-                runner.be_applied = True
-                await self._notify("mgmt_move_sl_be_applied", group_id=group_id, symbol=symbol, raw_text=raw_text)
-                await self._persist_group(group_id)
-                return {"status": "applied", "group_id": group_id}
-            return {"status": "failed", "group_id": group_id}
+            results = []
+            for group_id in group_ids:
+                try:
+                    legs = [t for t in self.trades.values() if t.group_id == group_id]
+                    account = self._ensure_account_dict(legs[0].account_name)
+                    if not account:
+                        log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
+                        await self._notify(
+                            "mgmt_account_unresolved",
+                            message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
+                            chat_id=chat_id, group_id=group_id, action=action,
+                        )
+                        results.append({"group_id": group_id, "status": "failed", "reason": "account_unresolved"})
+                        continue
+                    client = self.mt5._client_for(account)
+                    runner = next((t for t in legs if t.leg == "runner"), None)
+                    if not runner:
+                        await self._notify(
+                            "mgmt_no_runner_leg",
+                            message=f"Grupo {group_id} no tiene runner leg activo; no se pudo mover SL a BE.",
+                            chat_id=chat_id, group_id=group_id,
+                        )
+                        results.append({"group_id": group_id, "status": "no_active_trade"})
+                        continue
+                    if runner.entry_price is None:
+                        log.error("[TM][MGMT] move_sl_be_now: runner=%s no tiene entry_price registrado (group_id=%s)",
+                                  runner.ticket, group_id)
+                        results.append({"group_id": group_id, "status": "failed", "reason": "no_entry_price"})
+                        continue
+                    pos_list = await self._call(client.positions_get, ticket=runner.ticket)
+                    current_sl = float(pos_list[0].sl) if pos_list else None
+                    be_price = runner.entry_price
+                    is_buy = runner.direction == "BUY"
+                    worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
+                    if not worse_than_be:
+                        await self._notify(
+                            "mgmt_move_sl_be_already_satisfied", group_id=group_id, chat_id=chat_id,
+                            message=f"Grupo {group_id}: SL ya estaba en breakeven o mejor, no se aplico ningun cambio.",
+                        )
+                        results.append({"group_id": group_id, "status": "already_satisfied"})
+                        continue
+                    ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
+                    if ok:
+                        runner.be_applied = True
+                        await self._notify(
+                            "mgmt_move_sl_be_applied", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
+                            message=f"Grupo {group_id}: SL movido a breakeven manualmente via /mgmt/action. "
+                                    f"Texto original: {raw_text!r}",
+                        )
+                        await self._persist_group(group_id)
+                        results.append({"group_id": group_id, "status": "applied"})
+                    else:
+                        results.append({"group_id": group_id, "status": "failed"})
+                except Exception as e:
+                    log.error("[TM][MGMT] excepcion aplicando BE a group_id=%s chat_id=%s: %s", group_id, chat_id, e)
+                    results.append({"group_id": group_id, "status": "failed", "reason": "exception"})
+            return {"status": "completed", "results": results}
 
         if action == "note_sl_hit":
-            await self._notify("mgmt_note_sl_hit", group_id=group_id, symbol=symbol, raw_text=raw_text)
-            return {"status": "noted", "group_id": group_id}
+            await self._notify(
+                "mgmt_note_sl_hit", group_ids=group_ids, chat_id=chat_id, raw_text=raw_text,
+                message=f"SL hit reportado via /mgmt/action para los grupos {group_ids} (solo nota, sin accion en MT5). "
+                        f"Texto original: {raw_text!r}",
+            )
+            return {"status": "noted", "group_ids": group_ids}
 
         if action == "signal_correction":
             if not correction or correction.get("field") not in ("sl", "tp1", "tp2"):
+                await self._notify(
+                    "mgmt_invalid_correction",
+                    message=f"Corrección con campo inválido ('{correction.get('field') if correction else None}') para el chat. Texto: {raw_text!r}",
+                    chat_id=chat_id, correction=correction,
+                )
                 return {"status": "invalid_correction"}
+            group_id = group_ids[-1]  # solo el grupo mas reciente
             field = correction["field"]
             value = float(correction["value"])
             kwargs = {"sl": None, "tp1": None, "tp2": None}
@@ -670,6 +769,11 @@ class TradeManager:
         if action == "ignore":
             return {"status": "ignored"}
 
+        await self._notify(
+            "mgmt_unknown_action",
+            message=f"Acción desconocida '{action}' recibida. Texto: {raw_text!r}",
+            chat_id=chat_id, action=action,
+        )
         return {"status": "unknown_action"}
 
     @staticmethod
