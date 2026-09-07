@@ -114,19 +114,42 @@ def find_active_groups_for_chat(self, chat_id: str) -> list[int]:
 `apply_mgmt_action(*, action: str, chat_id: str, raw_text: str, correction: Optional[dict]) -> dict`
 (firma actualizada: `symbol` → `chat_id`):
 
+**Aislamiento por grupo (obligatorio para `close_now` y `move_sl_be_now`):**
+cada iteración del loop sobre `group_id` — incluida la resolución de la
+cuenta de ese grupo específico (ver nota de cuentas más abajo) — va
+envuelta en su propio `try/except Exception`. Una excepción real (no solo
+un resultado con `retcode` fallido — p. ej. un timeout de red, una
+excepción de `_call`) en el procesamiento de un `group_id` se captura ahí
+mismo, se registra en el resultado de ESE grupo como
+`{"group_id": N, "status": "failed", "reason": "exception"}`, y el loop
+sigue con el siguiente `group_id`. Sin esto, una excepción no capturada en
+el primer grupo abortaría todo el método antes de reportar los grupos ya
+procesados — perdiendo exactamente la granularidad por-grupo que este
+cambio busca preservar.
+
+**Resolución de cuenta por grupo:** el código actual resuelve la cuenta una
+sola vez antes del switch de acciones
+(`account = self._ensure_account_dict(legs[0].account_name)`, asumiendo un
+único grupo). Con múltiples `group_id` bajo el mismo `chat_id`, la cuenta
+se resuelve **dentro de cada iteración**, a partir de las `legs` de ESE
+`group_id` — no de un `legs[0]` global. Hoy esto es un no-op observable
+(una sola cuenta activa en `ACCOUNTS_JSON`), pero deja el código correcto
+si en el futuro se activa una segunda cuenta y dos grupos del mismo
+`chat_id` terminan en cuentas distintas.
+
 - **`close_now`**: itera `find_active_groups_for_chat(chat_id)` en orden.
-  Por cada `group_id`, intenta cerrar ambas piernas (mismo mecanismo de
-  hoy). Un fallo en un grupo no detiene el procesamiento de los demás.
-  Retorna:
+  Por cada `group_id`, resuelve su cuenta y sus `legs` propias, e intenta
+  cerrar ambas piernas (mismo mecanismo de hoy), con el aislamiento
+  por-grupo descrito arriba. Retorna:
   ```json
   {"status": "completed", "results": [
     {"group_id": 5, "status": "closed"},
     {"group_id": 7, "status": "failed"}
   ]}
   ```
-- **`move_sl_be_now`**: mismo patrón de iteración. Por cada grupo, aplica
-  BE al runner (mismo mecanismo de hoy: no-op si ya está en o mejor que
-  BE). Retorna:
+- **`move_sl_be_now`**: mismo patrón de iteración con el mismo aislamiento
+  por-grupo. Por cada grupo, aplica BE al runner (mismo mecanismo de hoy:
+  no-op si ya está en o mejor que BE). Retorna:
   ```json
   {"status": "completed", "results": [
     {"group_id": 5, "status": "applied"},
@@ -134,7 +157,9 @@ def find_active_groups_for_chat(self, chat_id: str) -> list[int]:
   ]}
   ```
   (`status` por grupo: `applied` | `already_satisfied` | `failed` |
-  `no_active_trade` si el grupo no tiene runner).
+  `no_active_trade` si el grupo no tiene runner; un `failed` puede llevar
+  `"reason": "exception"` si el aislamiento por-grupo capturó una
+  excepción real, distinto de un `retcode` fallido de MT5).
 - **`note_sl_hit`**: se notifica una vez por cada `group_id` activo del
   `chat_id` (no toca MT5, aplicar a todos es seguro). Retorna
   `{"status": "noted", "group_ids": [5, 7]}`.
@@ -180,6 +205,10 @@ inferencia, a diferencia de `symbol`.
   prueba; ese es exactamente el valor que el n8n/Ollama real debe extraer
   y mandar como `chat_id` en el callback. El ajuste pendiente es del lado
   del flujo de n8n (fuera de este repo), ya en curso por el usuario.
+- `mgmt_api.py`'s docstring de módulo (líneas 3-8 actuales) describe el
+  endpoint como resolviendo "el grupo activo por símbolo" — se actualiza
+  para reflejar la resolución por `chat_id`, evitando que quede
+  describiendo el mecanismo viejo.
 
 ## 8. Testing
 
@@ -189,8 +218,14 @@ inferencia, a diferencia de `symbol`.
 - Casos nuevos a cubrir:
   - Un `chat_id` con 2 grupos activos: `close_now` cierra ambos, reporta
     ambos resultados.
-  - Un `chat_id` con 2 grupos, uno falla al cerrar: el otro se cierra
-    igual, el resultado combinado refleja ambos estados.
+  - Un `chat_id` con 2 grupos, uno falla al cerrar (resultado con
+    `retcode` fallido, no excepción): el otro se cierra igual, el
+    resultado combinado refleja ambos estados.
+  - Un `chat_id` con 2 grupos, uno lanza una excepción real durante su
+    procesamiento (no solo un `retcode` fallido — p. ej. `_call` propaga
+    una excepción): el aislamiento por-grupo la captura, ese grupo queda
+    `{"status": "failed", "reason": "exception"}`, y el otro grupo se
+    procesa y reporta con normalidad.
   - Un `chat_id` con 2 grupos: `move_sl_be_now` aplica a ambos con estados
     mixtos (uno `applied`, otro `already_satisfied`).
   - `signal_correction` con 2 grupos del mismo `chat_id`: solo el más
