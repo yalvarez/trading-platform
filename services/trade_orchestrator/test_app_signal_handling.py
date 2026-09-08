@@ -101,10 +101,11 @@ async def test_fast_signal_runner_still_gets_be_and_trailing_when_full_signal_ne
     runner still get the same BE + proportional trailing behavior as with a
     full signal? Yes — tp1_leg's temporary TP and a synthetic tp2 (1 point
     past it, same direction) give the runner a valid unit > 0 from the start.
-    The unit is purely a scaling constant in SL = tp1 + (peak*unit)/3 with
-    peak = advance/unit — it cancels out algebraically, so any unit > 0
+    The unit is purely a scaling constant in SL = entry_price + (peak*unit)/3
+    with peak = advance/unit — it cancels out algebraically, so any unit > 0
     yields the same SL for the same price advance. This test asserts the SL
     value directly to prove that, independent of which internal unit was used.
+    (Anchored on entry_price, not tp1_price — see _apply_trailing.)
     """
     from services.trade_orchestrator.app import handle_signal_fields
 
@@ -127,14 +128,14 @@ async def test_fast_signal_runner_still_gets_be_and_trailing_when_full_signal_ne
     assert abs(runner_pos.sl - runner_leg.entry_price) < 1e-6  # moved to BE
 
     # Price advances well past tp1_price -- trailing must kick in exactly like
-    # the full-signal path (same SL = tp1 + advance/3 formula), not stay frozen at BE.
+    # the full-signal path (same SL = entry + advance/3 formula), not stay frozen at BE.
     advance = 30.0
     sim.price = runner_leg.tp1_price + advance
     sim.positions[runner_leg.ticket]['price_current'] = sim.price
     await tm._tick_once_account(ACCOUNTS[0])
 
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    expected_sl = runner_leg.tp1_price + advance / 3.0
+    expected_sl = runner_leg.entry_price + advance / 3.0
     assert abs(runner_pos.sl - expected_sl) < 1e-6
     assert runner_pos.sl > runner_leg.entry_price  # progressed beyond BE
 

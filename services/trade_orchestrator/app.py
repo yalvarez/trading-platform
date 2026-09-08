@@ -67,8 +67,8 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
         # disenada para correr. Pero SI necesita tp1_price/tp2_price poblados
         # en memoria para que el trailing se active. tp2_temp es sintetico
         # (1 punto mas alla de tp1_temp, misma direccion) unicamente para
-        # definir un "unit" > 0: en la formula SL = tp1 + (peak*unit)/3 con
-        # peak = avance/unit, el unit se cancela algebraicamente — cualquier
+        # definir un "unit" > 0: en la formula SL = entry_price + (peak*unit)/3
+        # con peak = avance/unit, el unit se cancela algebraicamente — cualquier
         # unit > 0 produce el mismo SL para el mismo avance de precio. No es
         # un techo, es solo la unidad de medida del trailing.
         # Si la señal completa llega despues, update_group_signal sobreescribe

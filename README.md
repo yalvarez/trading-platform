@@ -105,9 +105,16 @@ Every entry signal opens **two MT5 positions** with the same group_id:
 - Runs continuously on a ~100ms poll loop (fail-silent on price/volume errors)
 - **Formula:** `unit = tp2_price - tp1_price` (computed once per group; for SELL, reversed)
 - `peak_multiple` tracks the highest ratio ever observed: `(current_price - tp1_price) / unit` (only increases, never decreases)
-- **SL recomputation:** `new_sl = tp1_price + (peak_multiple * unit) / 3`
+- **SL recomputation:** `new_sl = entry_price + (peak_multiple * unit) / 3` (anchored on the runner's entry/BE price, not tp1_price — see note below)
 - This formula has **no cap** — if price runs far past tp2, peak_multiple can exceed 1.0 and the SL keeps trailing proportionally
-- Example: if unit=50 pips and peak_multiple reaches 2.0, the SL trails at tp1 + (2.0 * 50) / 3 = tp1 + 33.3 pips
+- Example: if unit=50 pips and peak_multiple reaches 2.0, the SL trails at entry + (2.0 * 50) / 3 = entry + 33.3 pips
+- **Anchor revised 2026-09-08:** originally anchored on `tp1_price` instead of `entry_price`. Since `peak_multiple` starts near 0 right after crossing TP1, that version put the SL only 0-3 points from the live price at that moment — tighter than BE's own margin — so a normal pullback right after TP1 could stop the runner out almost simultaneously with the tp1 leg closing (confirmed in production). Anchoring on `entry_price` makes the SL equal to BE exactly at `peak=0`, then rises from there.
+
+**TP2 Partial Close (added 2026-09-08):**
+- The first time the runner's live price reaches `tp2_price`, 50% of its current volume is closed via `partial_close` — once per group (`tp2_partial_applied` flag, same pattern as `be_applied`)
+- The remaining 50% keeps trailing exactly as before — `tp2_price` is NOT a new anchor, `peak_multiple`/SL are untouched by this close
+- Simple trigger: `price >= tp2_price` (BUY) / `price <= tp2_price` (SELL), no confirmation threshold
+- Rationale: `tp2_price` was previously decorative for the runner (only defined the trailing's scale, never took profit there). Simulations show locking half at TP2 systematically wins when price reverts after touching it, and only costs (bounded to half the volume) when price keeps running without a pullback.
 
 No more `general` / `be_pips` / `be_pnl` / `reentry` trading_mode system — dual-TP is the **only** behavior.
 

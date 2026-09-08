@@ -105,10 +105,35 @@ y `_maybe_addon_midpoint` de `trade_manager.py`.
   - `peak` = múltiplo máximo histórico de `unit` que el precio haya
     alcanzado desde TP1 (puede superar 1.0 indefinidamente; nunca
     disminuye).
-  - `SL_price = TP1_price + (peak × unit) / 3` — el SL solo puede subir,
-    nunca baja, incluso si el precio retrocede desde el peak.
+  - `SL_price = entry_price + (peak × unit) / 3` — el SL solo puede subir,
+    nunca baja, incluso si el precio retrocede desde el peak. **Revisado
+    2026-09-08:** la version original anclaba en `TP1_price` en vez de
+    `entry_price`. Como `peak` arranca cerca de 0 justo al cruzar TP1, esa
+    version dejaba el SL a solo 0-3 puntos del precio vivo en ese momento
+    — mas cerca que el propio colchon de BE — y un retroceso de precio
+    perfectamente normal alcanzaba para cerrar el runner casi junto con
+    `tp1_leg` (confirmado en produccion, grupo 60). Anclar en `entry_price`
+    hace que en `peak=0` el SL sea exactamente el BE ya aplicado, y sube
+    desde ahi con la misma pendiente (1/3 del avance) en vez de arrancar
+    pegado al precio.
   - Antes de que `tp1_leg` cierre, `runner_leg` no tiene trailing activo —
     corre con el mismo SL original que `tp1_leg`.
+- **TP2 partial close (agregado 2026-09-08):** la primera vez que el precio
+  en vivo de `runner_leg` alcanza `TP2_price`, se cierra el 50% de su
+  volumen vivo en ese momento (una sola vez por grupo, flag
+  `tp2_partial_applied` — mismo patrón que `be_applied`). El 50% restante
+  sigue el trailing exactamente igual que antes: `TP2_price` NO se
+  convierte en un nuevo ancla, `peak_multiple`/`SL` no se reinician ni se
+  alteran por este cierre. Disparo simple (`price >= TP2_price` para BUY,
+  `price <= TP2_price` para SELL), sin umbral de confirmación adicional.
+  Motivación: antes de esto `TP2_price` era puramente una referencia de
+  escala para el trailing, nunca se tomaba ganancia ahí — simulaciones
+  numéricas (sesión 2026-09-08) muestran que asegurar la mitad en TP2 gana
+  sistemáticamente cuando el precio revierte después de tocarlo (protege
+  una porción de la ganancia que el trailing, deliberadamente lento en
+  alcanzar el precio, dejaría expuesta) y solo cuesta rendimiento —
+  acotado a la mitad del volumen — cuando el precio sigue corriendo sin
+  revertir.
 - **Comportamiento por defecto sin intervención externa:** si el precio
   nunca alcanza TP1, ambas posiciones cierran en el SL original cuando el
   mercado lo golpea — pérdida simétrica normal. Este es el comportamiento

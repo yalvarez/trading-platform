@@ -29,6 +29,7 @@ class ManagedTrade:
     tp2_price: Optional[float] = None
     entry_price: Optional[float] = None
     be_applied: bool = False
+    tp2_partial_applied: bool = False
     peak_multiple: float = 0.0
     opened_ts: float = field(default_factory=lambda: time.time())
     chat_id: Optional[str] = None
@@ -88,6 +89,7 @@ class TradeManager:
                 "planned_sl": t.planned_sl,
                 "entry_price": t.entry_price,
                 "be_applied": t.be_applied,
+                "tp2_partial_applied": t.tp2_partial_applied,
                 "peak_multiple": t.peak_multiple,
             }
         return doc
@@ -542,6 +544,11 @@ class TradeManager:
                 pos = pos_by_ticket.get(ticket)
                 if not pos or t.leg != "runner" or not t.be_applied:
                     continue
+                await self._apply_tp2_partial_close(account, client, t, pos)
+                # Re-fetch: partial_close above may have changed this position's
+                # live volume, and _apply_trailing's SL move must act on that
+                # up-to-date position, not a stale pre-partial-close snapshot.
+                pos = (await self._call(client.positions_get, ticket=ticket) or [pos])[0]
                 await self._apply_trailing(account, client, t, pos)
 
         except Exception as e:
@@ -640,13 +647,72 @@ class TradeManager:
             log.error("[TM] fallo moviendo SL runner=%s reason=%s tras %d intentos", runner.ticket, reason, attempts)
         return ok
 
+    async def _apply_tp2_partial_close(self, account, client, runner: ManagedTrade, pos) -> None:
+        """
+        TP2 partial close (product decision 2026-09-08, dual-TP spec seccion 4
+        ampliada): la primera vez que el precio en vivo del runner alcanza
+        tp2_price, se cierra el 50% de su volumen VIVO en ese momento (mismo
+        patron/helper partial_close ya usado en el resto del codigo para
+        cierres totales), una sola vez por grupo (flag tp2_partial_applied,
+        mismo patron que be_applied). El 50% restante sigue el trailing
+        exactamente igual que hoy -- tp2 no se vuelve un nuevo ancla, y
+        peak_multiple/SL no se tocan aqui en absoluto.
+
+        Motivacion: antes de esto, tp2_price era puramente decorativo para el
+        runner (solo define `unit`, la escala del trailing) -- nunca se
+        tomaba ganancia ahi. Simulado contra escenarios reales: asegurar la
+        mitad en tp2 gana sistematicamente cuando el precio revierte despues
+        de tocar tp2 (protege una porcion de la ganancia que el trailing,
+        deliberadamente lento en alcanzar el precio, dejaria expuesta) y solo
+        cuesta rendimiento cuando el precio sigue corriendo sin revertir --
+        pero ese costo esta acotado a la mitad del volumen, mientras que la
+        ganancia protegida en una reversion suele superarlo (ver discusion y
+        simulaciones de la sesion 2026-09-08).
+
+        Disparo simple (price>=tp2 para BUY, price<=tp2 para SELL), sin
+        umbral de confirmacion -- decision explicita del usuario para
+        mantenerlo fiel a la mecanica tal como fue especificada.
+        """
+        if runner.tp2_partial_applied or runner.tp2_price is None:
+            return
+        is_buy = runner.direction == "BUY"
+        current = float(pos.price_current)
+        reached_tp2 = (current >= runner.tp2_price) if is_buy else (current <= runner.tp2_price)
+        if not reached_tp2:
+            return
+        ok = await self._call(client.partial_close, account, runner.ticket, 50)
+        if not ok:
+            log.error("[TM] fallo aplicando partial close en tp2 runner=%s group_id=%s",
+                      runner.ticket, runner.group_id)
+            return
+        runner.tp2_partial_applied = True
+        await self._notify(
+            "tp2_partial_closed", group_id=runner.group_id, ticket=runner.ticket, symbol=runner.symbol,
+            message=f"Runner del grupo {runner.group_id} ({runner.symbol}, ticket={runner.ticket}) alcanzo TP2 "
+                    f"({self._fmt_price(runner.tp2_price)}): 50% del volumen cerrado, el resto sigue corriendo con trailing.",
+        )
+        await self._persist_group(runner.group_id)
+
     async def _apply_trailing(self, account, client, runner: ManagedTrade, pos) -> None:
         """
-        Trailing proporcional sin techo (dual-TP spec seccion 4):
+        Trailing proporcional sin techo (dual-TP spec seccion 4, revisado):
         unit = tp2_price - tp1_price (constante); peak = maximo multiplo de unit
-        alcanzado desde tp1_price (nunca decrece); SL = tp1_price + (peak*unit)/3.
+        alcanzado desde tp1_price (nunca decrece); SL = entry_price + (peak*unit)/3.
+
+        Ancla en entry_price (BE), NO en tp1_price. La formula original del
+        spec anclaba en tp1_price, lo que dejaba el SL a 0-3 puntos del precio
+        vivo justo al cruzar TP1 (peak cerca de 0) -- mas cerca que el propio
+        BE (~10 puntos de colchon en valores tipicos), y ese colchon minimo
+        es tambien lo que hace mas probable el rechazo por trade_stops_level
+        que ya vimos en produccion (grupo 60). Un retroceso de precio del
+        todo normal recien despues de TP1 bastaba para tocar ese SL y cerrar
+        el runner casi junto con tp1_leg -- el patron real reportado por el
+        usuario. Anclar en entry_price hace que en peak=0 el SL sea
+        exactamente el BE (mismo colchon que ya se gano al cerrar tp1_leg),
+        y sube desde ahi con la misma pendiente (1/3 del avance) en vez de
+        arrancar practicamente pegado al precio.
         """
-        if runner.tp1_price is None or runner.tp2_price is None:
+        if runner.tp1_price is None or runner.tp2_price is None or runner.entry_price is None:
             return
         is_buy = runner.direction == "BUY"
         unit = (runner.tp2_price - runner.tp1_price) if is_buy else (runner.tp1_price - runner.tp2_price)
@@ -657,11 +723,29 @@ class TradeManager:
         multiple = advance / unit
         if multiple <= runner.peak_multiple:
             return  # never decreases
-        runner.peak_multiple = multiple
         sl_offset = (multiple * unit) / 3.0
-        new_sl = runner.tp1_price + sl_offset if is_buy else runner.tp1_price - sl_offset
+        new_sl = runner.entry_price + sl_offset if is_buy else runner.entry_price - sl_offset
+        # No explicit "never worse than BE" guard needed here: peak_multiple
+        # can never be negative (starts at 0.0; update_group_signal's rescale
+        # clamps it with max(0.0, ...)), and the "never decreases" guard above
+        # already requires multiple > peak_multiple >= 0 to reach this line —
+        # so sl_offset is always > 0 and new_sl is always strictly better than
+        # entry_price. Anchoring on entry_price is what makes this hold; it
+        # did NOT hold with the old tp1_price anchor (see git history / spec
+        # note), which is why that version needed (and had) a guard here.
+        # peak_multiple must only advance once the SL move actually lands in MT5.
+        # Real production bug (group 60, live): peak_multiple was bumped here
+        # unconditionally, before knowing whether order_send succeeded. When MT5
+        # rejected the candidate SL (e.g. too close to trade_stops_level right
+        # after TP1), the real SL stayed frozen at the last level that *did*
+        # land, while this in-memory peak kept climbing — so the "never
+        # decreases" guard above then silently discarded subsequent price
+        # levels MT5 would have accepted, and a trailing_updated notification
+        # fired for an SL that was never actually applied. Same failure mode
+        # _apply_be already guards against for the breakeven move.
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
+            runner.peak_multiple = multiple
             await self._notify(
                 "trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl,
                 message=f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): "
@@ -1034,6 +1118,7 @@ class TradeManager:
             direction=doc["direction"], group_id=doc["group_id"], leg=leg,
             planned_sl=leg_doc["planned_sl"], tp1_price=doc.get("tp1_price"), tp2_price=doc.get("tp2_price"),
             entry_price=leg_doc.get("entry_price"), be_applied=leg_doc.get("be_applied", False),
+            tp2_partial_applied=leg_doc.get("tp2_partial_applied", False),
             peak_multiple=leg_doc.get("peak_multiple", 0.0), chat_id=doc.get("chat_id"),
         )
 

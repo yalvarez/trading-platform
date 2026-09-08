@@ -96,8 +96,8 @@ Position 2 (ticket=12346): leg="runner", lot=0.01, group_id=12345
   - `current_advance = current_price - tp1_price` (BUY); reversed for SELL
   - `multiple = current_advance / unit` (ratio of how many "units" past tp1 the price has moved)
   - `peak_multiple = max(peak_multiple, multiple)` (only increases, never decreases)
-  - **New SL:** `new_sl = tp1_price + (peak_multiple * unit) / 3`
-- Example: if tp1=2515, tp2=2530 (unit=15), and price hits 2545 (multiple=2.0), then SL trails at 2515 + (2.0 * 15) / 3 = 2525 pips
+  - **New SL:** `new_sl = entry_price + (peak_multiple * unit) / 3` — anchored on the runner's entry/BE price, not tp1_price (revised 2026-09-08: anchoring on tp1_price left the SL only 0-3 points from the live price right after crossing TP1, tighter than BE's own margin, letting a normal pullback stop the runner almost simultaneously with the tp1 leg)
+- Example: if entry=2500, tp1=2515, tp2=2530 (unit=15), and price hits 2545 (multiple=2.0), then SL trails at 2500 + (2.0 * 15) / 3 = 2510 pips
 - **No cap:** If price runs far past tp2, peak_multiple can exceed 1.0 and the SL keeps trailing proportionally
 
 ---

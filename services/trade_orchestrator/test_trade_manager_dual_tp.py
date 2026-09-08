@@ -506,12 +506,12 @@ async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing
     del sim.positions[tp1_leg.ticket]
     await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
 
-    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = 2510 + 10 = 2520
+    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = entry(2500) + 10 = 2510
     sim.positions[runner_leg.ticket]["price_current"] = 2540.0
     sim.price = 2540.0
     await tm._tick_once_account(ACCOUNT)
     sl_after_trailing = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert abs(sl_after_trailing - 2520.0) < 1e-6
+    assert abs(sl_after_trailing - 2510.0) < 1e-6
 
     # A signal_correction that only touches tp2 must NOT regress the live SL
     # back down to the original planned_sl (2490).
@@ -661,10 +661,48 @@ async def test_trailing_raises_runner_sl_proportionally_to_peak():
     sim.price = 2522.0
     await tm._tick_once_account(ACCOUNT)
 
-    # peak_multiple = 0.6, SL = tp1 + (0.6 * 20)/3 = 2510 + 4 = 2514
+    # peak_multiple = 0.6, SL = entry + (0.6 * 20)/3 = 2500 + 4 = 2504
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert abs(runner_pos.sl - 2514.0) < 1e-6
+    assert abs(runner_pos.sl - 2504.0) < 1e-6
     assert abs(tm.trades[runner_leg.ticket].peak_multiple - 0.6) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_trailing_at_peak_zero_equals_be_with_full_protective_margin():
+    """
+    Real production concern (group 60, user-reported): anchoring the
+    formula on tp1_price left the trailing SL only 0-3 points from the
+    live price right after crossing TP1 (peak near 0) — tighter than the
+    BE's own protective margin, and a completely normal pullback right
+    after TP1 was enough to stop the runner out almost simultaneously
+    with tp1_leg closing. Anchoring on entry_price instead means the
+    first trailing tick past TP1 (peak just above 0) computes an SL
+    barely past the BE itself, not a fresh, much tighter level — so the
+    runner keeps the same protective margin BE already earned instead of
+    trading it away the instant price ticks past TP1.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied: SL = entry = 2500
+
+    # Price ticks just barely past tp1 (2510 -> 2511): the smallest advance
+    # that still makes multiple > 0 and triggers a trailing attempt.
+    sim.positions[runner_leg.ticket]["price_current"] = 2511.0
+    sim.price = 2511.0
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    # multiple = 1/20 = 0.05 -> SL = entry + (0.05*20)/3 = 2500 + 0.333...
+    assert abs(runner_pos.sl - 2500.3333333333335) < 1e-6
+    # The live price-to-SL distance is still close to the BE's own margin
+    # (10 points), not collapsed to a couple of points like the old
+    # tp1-anchored formula produced at this same price.
+    assert (2511.0 - runner_pos.sl) > 9.5
 
 
 @pytest.mark.asyncio
@@ -693,6 +731,55 @@ async def test_trailing_sl_never_decreases_on_price_pullback():
 
 
 @pytest.mark.asyncio
+async def test_trailing_never_regresses_below_be_after_a_signal_correction_moves_tp1():
+    """
+    _apply_trailing anchors its formula on entry_price (SL = entry_price +
+    (peak*unit)/3), so new_sl is structurally always >= entry_price once BE
+    has landed: peak_multiple can never be negative, and the "never
+    decreases" guard already requires multiple > peak_multiple >= 0 before
+    a candidate is even computed. This still must hold after a
+    signal_correction (update_group_signal, dual-TP spec §5.2) drags
+    tp1_price/tp2_price around post-BE without validating them against
+    entry_price — the correction changes `unit`/`multiple`'s magnitude, but
+    must never be able to push new_sl below the BE already in MT5.
+
+    (Historical note: this test originally exercised an explicit
+    "candidate worse than BE" guard, back when the formula was anchored on
+    tp1_price instead — a stale correction could then drag tp1_price behind
+    entry_price and produce a candidate genuinely worse than BE. Re-anchoring
+    on entry_price fixed that at the source, making the guard unreachable;
+    it was removed, and this test now documents the structural property
+    that replaced it.)
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE: runner SL -> entry_price = 2500.0
+
+    be_sl = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert be_sl == 2500.0
+
+    # A signal_correction drags tp1/tp2 back down, below the runner's entry —
+    # an inverted/stale correction, but update_group_signal doesn't validate
+    # tp1 against entry_price, so it lands as-is.
+    await tm.update_group_signal(group_id, sl=None, tp1=2495.0, tp2=2505.0)
+
+    # Price sits just past the new tp1 (2495), still well below the BE (2500)
+    # already live. multiple > 0 so the "never decreases" guard doesn't
+    # short-circuit before _force_runner_sl is even attempted.
+    sim.positions[runner_leg.ticket]["price_current"] = 2496.0
+    sim.price = 2496.0
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.sl >= be_sl  # must never regress below the BE already applied
+
+
+@pytest.mark.asyncio
 async def test_trailing_extrapolates_unit_beyond_tp2():
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -708,9 +795,206 @@ async def test_trailing_extrapolates_unit_beyond_tp2():
     sim.price = 2540.0
     await tm._tick_once_account(ACCOUNT)
 
-    # SL = tp1 + (1.5 * 20)/3 = 2510 + 10 = 2520
+    # SL = entry + (1.5 * 20)/3 = 2500 + 10 = 2510
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert abs(runner_pos.sl - 2520.0) < 1e-6
+    assert abs(runner_pos.sl - 2510.0) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_trailing_peak_multiple_not_advanced_when_order_send_fails():
+    """
+    Real production bug (group 60, XAUUSD SELL, live): peak_multiple was
+    advanced unconditionally before attempting the SL move, even when
+    order_send failed after all retries (e.g. candidate SL inside the
+    broker's trade_stops_level right after TP1). That left the runner's
+    real MT5 SL frozen at the last successfully-applied level while the
+    orchestrator's internal peak kept climbing — so the next tick's
+    "never decreases" guard silently discarded price levels that MT5
+    would have accepted, and a "trailing_updated" notification fired for
+    an SL that was never actually applied. The runner then got stopped
+    out by its stale real SL almost immediately after TP1, mirroring
+    _apply_be's already-fixed failure mode. peak_multiple must only
+    advance, and trailing_updated must only fire, when the order_send
+    attempt actually succeeds.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+
+    sl_after_be = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+
+    # Every order_send for this ticket's trailing move (action=6) fails from
+    # here on, simulating MT5 rejecting the candidate SL (e.g. retcode=10016,
+    # too close to trade_stops_level).
+    real_order_send = sim.order_send
+
+    def failing_order_send(req):
+        if req.get("action") == 6 and req.get("position") == runner_leg.ticket:
+            return type('OrderSendResult', (), {'retcode': 10016, 'order': 0, 'deal': 0, 'comment': 'Invalid stops'})()
+        return real_order_send(req)
+
+    sim.order_send = failing_order_send
+
+    # unit = tp2 - tp1 = 20. Move price to 60% of unit past tp1 = 2510 + 12 = 2522
+    sim.positions[runner_leg.ticket]["price_current"] = 2522.0
+    sim.price = 2522.0
+    await tm._tick_once_account(ACCOUNT)
+
+    # The order_send failed, so peak_multiple must NOT have advanced and the
+    # real SL in MT5 must remain untouched at its post-BE level.
+    assert tm.trades[runner_leg.ticket].peak_multiple == 0.0
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.sl == sl_after_be
+
+    trailing_events = [kwargs for event, kwargs in notifier.events if event == "trailing_updated"]
+    assert len(trailing_events) == 0
+
+
+# --- TP2 partial close: runner takes 50% off at tp2, remainder keeps trailing ---
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_takes_half_volume_and_keeps_trailing_on_remainder():
+    """
+    New mechanic (product decision 2026-09-08): the first time the runner's
+    live price reaches tp2_price, half of its CURRENT volume is closed via
+    partial_close (same helper/pattern already used elsewhere for full
+    closes), once per group (tp2_partial_applied flag, same pattern as
+    be_applied). The remaining half keeps trailing exactly as before —
+    peak_multiple/SL are NOT reset and do not treat tp2 as a new anchor.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    original_vol = sim.positions[runner_leg.ticket]["volume"]
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+
+    # Price reaches tp2 exactly (multiple=1.0, unit=20).
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    await tm._tick_once_account(ACCOUNT)
+
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.volume - original_vol / 2.0) < 1e-9
+
+    # Trailing still applied in the SAME tick, on the same entry-anchored
+    # formula — tp2 is not a new anchor, peak_multiple/SL are unaffected by
+    # the partial close itself.
+    assert abs(tm.trades[runner_leg.ticket].peak_multiple - 1.0) < 1e-9
+    assert abs(runner_pos.sl - (2500.0 + (1.0*20.0)/3.0)) < 1e-6
+
+    partial_events = [kwargs for event, kwargs in notifier.events if event == "tp2_partial_closed"]
+    assert len(partial_events) == 1
+    assert partial_events[0]["group_id"] == group_id
+    assert partial_events[0]["ticket"] == runner_leg.ticket
+
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_fires_only_once_even_if_price_oscillates_around_tp2():
+    """
+    Simple trigger (price >= tp2, no confirmation threshold) fires once and
+    latches via tp2_partial_applied — a whipsaw around tp2 must not close
+    another 50% slice on a later re-cross, same pattern as be_applied.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2531.0  # crosses tp2
+    sim.price = 2531.0
+    await tm._tick_once_account(ACCOUNT)
+    vol_after_first_cross = sim.positions_get(ticket=runner_leg.ticket)[0].volume
+
+    # Retreats back below tp2, then crosses again — peak_multiple's own
+    # "never decreases" guard means the second crossing at the same price
+    # doesn't even attempt a new trailing move, but tp2_partial_applied must
+    # independently prevent a second partial_close regardless.
+    sim.positions[runner_leg.ticket]["price_current"] = 2525.0
+    sim.price = 2525.0
+    await tm._tick_once_account(ACCOUNT)
+    sim.positions[runner_leg.ticket]["price_current"] = 2535.0
+    sim.price = 2535.0
+    await tm._tick_once_account(ACCOUNT)
+
+    vol_final = sim.positions_get(ticket=runner_leg.ticket)[0].volume
+    assert vol_final == vol_after_first_cross  # no second partial_close happened
+
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_never_fires_for_sell_until_price_reaches_tp2():
+    """Direction-aware trigger: for SELL, tp2 sits below tp1/entry, so the
+    condition is price <= tp2, not price >= tp2."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    original_vol = sim.positions[runner_leg.ticket]["volume"]
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied
+
+    # Still above tp2 (2470) -- must not trigger yet.
+    sim.positions[runner_leg.ticket]["price_current"] = 2480.0
+    sim.price = 2480.0
+    await tm._tick_once_account(ACCOUNT)
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is False
+    assert sim.positions_get(ticket=runner_leg.ticket)[0].volume == original_vol
+
+    # Reaches tp2 -- triggers now.
+    sim.positions[runner_leg.ticket]["price_current"] = 2470.0
+    sim.price = 2470.0
+    await tm._tick_once_account(ACCOUNT)
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
+    assert abs(sim.positions_get(ticket=runner_leg.ticket)[0].volume - original_vol/2.0) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_persists_flag_and_reconciles_from_store():
+    """tp2_partial_applied must survive a persist/reconcile round trip, same
+    as be_applied and peak_multiple, so a restart doesn't re-fire the
+    partial close for a group that already took it."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    await tm._tick_once_account(ACCOUNT)
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
+
+    saved_doc = store.saved[-1]
+    assert saved_doc["legs"]["runner"]["tp2_partial_applied"] is True
+
+    # Reconcile a fresh TradeManager from that persisted doc + live MT5 state
+    # (same pattern as test_reconcile_recovers_full_state_from_store).
+    store.docs[group_id] = saved_doc
+    tm2 = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    summary = await tm2.reconcile_from_mt5([ACCOUNT])
+    assert summary["recovered_from_redis"] == 1
+    assert tm2.trades[runner_leg.ticket].tp2_partial_applied is True
 
 
 # --- Review fix 1: update_group_signal must not regress a trailed/BE'd SL ---
