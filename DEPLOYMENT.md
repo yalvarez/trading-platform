@@ -54,10 +54,11 @@ curl -X POST http://localhost:8200/mgmt/action \
   -H "Content-Type: application/json" \
   -d '{
     "action": "close_now",
-    "symbol": "XAUUSD",
+    "chat_id": "-1001234567890",
     "raw_text": "manual close from external n8n flow"
   }'
 ```
+This closes every active trade group opened from that `chat_id`, and returns a per-group result list, e.g. `{"status": "completed", "results": [{"group_id": 5, "status": "closed"}]}`.
 
 **Invoke /mgmt/action endpoint for signal_correction (with SL adjustment):**
 ```bash
@@ -66,7 +67,7 @@ curl -X POST http://localhost:8200/mgmt/action \
   -H "Content-Type: application/json" \
   -d '{
     "action": "signal_correction",
-    "symbol": "XAUUSD",
+    "chat_id": "-1001234567890",
     "raw_text": "false signal, adjust stop loss",
     "correction": {
       "field": "sl",
@@ -74,6 +75,7 @@ curl -X POST http://localhost:8200/mgmt/action \
     }
   }'
 ```
+This applies the correction to the most recent active group of that `chat_id` only, e.g. `{"status": "applied", "group_id": 5}`.
 
 ## Trade API Testing
 

@@ -183,7 +183,7 @@ ACCOUNTS_JSON=[
 ```json
 {
   "action": "close_now",
-  "symbol": "XAUUSD",
+  "chat_id": "-1001234567890",
   "raw_text": "manual close from external flow"
 }
 ```
@@ -192,7 +192,7 @@ ACCOUNTS_JSON=[
 ```json
 {
   "action": "signal_correction",
-  "symbol": "XAUUSD",
+  "chat_id": "-1001234567890",
   "raw_text": "false signal detected, adjust SL",
   "correction": {
     "field": "sl",
@@ -202,19 +202,38 @@ ACCOUNTS_JSON=[
 ```
 
 **Actions:**
-- `close_now`: close all positions in the active group for this symbol immediately
-- `move_sl_be_now`: move the runner leg's SL to breakeven (entry price)
+- `close_now`: close all positions in every active group opened from this chat immediately
+- `move_sl_be_now`: move the runner leg's SL to breakeven (entry price) for every active group of this chat
 - `note_sl_hit`: record that SL was hit (for external tracking; no position changes)
-- `signal_correction`: apply correction to active group (e.g., adjust SL/TP); requires `correction` object with `field` ("sl", "tp1", or "tp2") and `value` (float)
+- `signal_correction`: apply correction to the most recent active group of this chat (e.g., adjust SL/TP); requires `correction` object with `field` ("sl", "tp1", or "tp2") and `value` (float)
 - `ignore`: acknowledge but take no action
 
-**Note:** `group_id` is **not** supplied by the caller — the endpoint resolves the active group for `symbol` server-side. `raw_text` is **required** on all requests.
+**Note:** `group_id` is **not** supplied by the caller — the endpoint resolves ALL active trade groups opened from the same Telegram chat/channel that sent the management message (`chat_id`) server-side, not just one group or one symbol. `raw_text` is **required** on all requests.
 
-**Response:**
+**Response for `close_now` and `move_sl_be_now`** (a list of per-group results, since a chat can have multiple active groups):
 ```json
 {
-  "status": "closed",
-  "group_id": 12345
+  "status": "completed",
+  "results": [
+    {"group_id": 5, "status": "closed"},
+    {"group_id": 7, "status": "failed", "reason": "partial_close_rejected"}
+  ]
+}
+```
+
+**Response for `note_sl_hit`** (note-only; plural `group_ids`, no MT5 changes):
+```json
+{
+  "status": "noted",
+  "group_ids": [5, 7]
+}
+```
+
+**Response for `signal_correction`** (targets only the most recent active group of the chat):
+```json
+{
+  "status": "applied",
+  "group_id": 7
 }
 ```
 

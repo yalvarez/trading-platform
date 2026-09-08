@@ -142,23 +142,29 @@ n8n/Ollama Flow (external)
   ↓ POST to /mgmt/action with:
     {
       "action": "close_now" | "move_sl_be_now" | "note_sl_hit" | "signal_correction" | "ignore",
-      "symbol": "XAUUSD",
+      "chat_id": "-1001234567890",
       "raw_text": "the original channel message text",
       "correction": {"field": "sl" | "tp1" | "tp2", "value": 2495.0}  // only for signal_correction
     }
   ↓
 [trade_orchestrator]
   ↓ (validates auth X-N8N-Action-Key header)
-  ↓ (resolves active group for symbol server-side — caller does NOT supply group_id)
-  ↓ (applies action: close all positions, move SL, adjust TP, etc)
+  ↓ (resolves ALL active groups opened from this chat_id server-side — caller does NOT supply group_id)
+  ↓ (applies action: close all positions, move SL, adjust TP, etc, per matching group)
   ↓
-Response: {"status": "closed", "group_id": 12345}
+Response for close_now / move_sl_be_now (one result per active group of the chat):
+  {"status": "completed", "results": [{"group_id": 5, "status": "closed"}, {"group_id": 7, "status": "failed", "reason": "partial_close_rejected"}]}
+Response for note_sl_hit (note-only, plural group_ids):
+  {"status": "noted", "group_ids": [5, 7]}
+Response for signal_correction (only the most recent group of the chat):
+  {"status": "applied", "group_id": 7}
 ```
 
 **Auth is fail-closed:** Service refuses to start if `N8N_ACTION_API_KEY` is unset.
 
 **Key differences from naive API:**
-- `group_id` is **resolved server-side** by looking up the most recent active group for the symbol
+- `group_id` is **never supplied by the caller** — the endpoint resolves ALL active trade groups opened from the same Telegram chat/channel (`chat_id`) that sent the management message, not just one group or one symbol
+- `close_now` and `move_sl_be_now` act on every active group of the chat and return a per-group result list; `signal_correction` targets only the most recent group of the chat
 - `raw_text` is **required** on every request (audit trail for external decisions)
 - Only `signal_correction` action has a `correction` object; other actions ignore it
 
