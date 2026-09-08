@@ -10,6 +10,12 @@ def _no_real_sleep(monkeypatch):
     monkeypatch.setattr(a1_fast_only.asyncio, "sleep", AsyncMock(return_value=None))
 
 
+# tp1_leg always carries a real, nonzero tp; the runner leg is the one
+# open_group leaves at tp=0.0 -- see b1_be_variant1._find_runner.
+TP1_LEG = {"ticket": 1, "sl": 2470.0, "tp": 2530.0, "volume": 0.01}
+RUNNER_LEG = {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}
+
+
 def _ctx_with_open_position():
     price_reader = MagicMock()
     price_reader.read_price = AsyncMock(return_value=2500.0)
@@ -19,9 +25,8 @@ def _ctx_with_open_position():
     observer.positions_for_symbol = AsyncMock(
         side_effect=[
             [],  # preexisting_tickets snapshot
-            [{"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-             {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}],  # after fast open
-            [{"ticket": 2, "sl": 2500.0, "tp": 0.0, "volume": 0.01}],  # after BE applied
+            [TP1_LEG, RUNNER_LEG],  # after fast open
+            [TP1_LEG, {**RUNNER_LEG, "sl": 2500.0}],  # after BE applied
         ]
     )
     observer.grep_container_logs = MagicMock(return_value=["[TM][EVENT] mgmt_move_sl_be_applied {'group_id': 1}"])
@@ -53,18 +58,15 @@ async def test_b3_sets_shared_message_constant_on_b1_before_delegating():
 @pytest.mark.asyncio
 async def test_b3_reports_external_dependency_failure_on_timeout_without_error():
     ctx = _ctx_with_open_position()
-    setup_positions = [
-        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
-    ]
-    unchanged_runner = [{"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
+    setup_positions = [TP1_LEG, RUNNER_LEG]
+    unchanged = [TP1_LEG, RUNNER_LEG]
     calls = {"n": 0}
 
     async def _positions_for_symbol(_symbol):
         calls["n"] += 1
         if calls["n"] == 1:
             return []  # preexisting_tickets snapshot
-        return setup_positions if calls["n"] == 2 else unchanged_runner
+        return setup_positions if calls["n"] == 2 else unchanged
 
     ctx.observer.positions_for_symbol = _positions_for_symbol
     ctx.observer.grep_container_logs = MagicMock(return_value=[])

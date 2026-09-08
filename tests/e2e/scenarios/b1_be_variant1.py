@@ -31,6 +31,22 @@ MESSAGE = "Set BE for zero risk"
 PRE_MESSAGE_DELAY_SECONDS = 30.0
 
 
+def _find_runner(positions: list) -> dict | None:
+    """
+    The runner leg is the one open_group never gives a real MT5 tp to
+    (tp=0.0 -- it's the leg designed to run, its only mechanical exit is
+    the trailing SL). tp1_leg always carries a real, nonzero tp. Both legs
+    open with the SAME planned_sl, so picking "the first position" (as this
+    scenario used to do) can silently compare the wrong leg's SL across
+    polls whenever positions_get doesn't return them in a stable order --
+    a real bug found live (2026-09-08) once the pre-message delay (below)
+    started giving BE a real chance to succeed while tp1_leg was still
+    open: the poll kept reading tp1_leg's unchanged SL and never noticed
+    the runner's SL had actually moved.
+    """
+    return next((p for p in positions if p.get("tp") == 0.0), None)
+
+
 async def run(ctx: ScenarioContext) -> ScenarioResult:
     preexisting_tickets = await _preexisting_tickets(ctx, SYMBOL)
 
@@ -40,7 +56,14 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             name="b1_be_variant1", outcome=ScenarioOutcome.FAIL,
             evidence={}, detail="setup failed: fast signal did not open two legs",
         )
-    runner_sl_before = next(p["sl"] for p in positions)
+    runner_before = _find_runner(positions)
+    if runner_before is None:
+        return ScenarioResult(
+            name="b1_be_variant1", outcome=ScenarioOutcome.FAIL,
+            evidence={"positions": positions}, detail="setup failed: could not identify the runner leg (no position with tp=0.0)",
+        )
+    runner_sl_before = runner_before["sl"]
+    runner_ticket = runner_before["ticket"]
 
     await asyncio.sleep(PRE_MESSAGE_DELAY_SECONDS)
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
@@ -48,7 +71,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
     try:
         async def check_be_applied():
             current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
-            runner = next(iter(current), None)
+            runner = next((p for p in current if p["ticket"] == runner_ticket), None)
             if runner and runner["sl"] != runner_sl_before:
                 return runner
             return None
@@ -81,23 +104,26 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
                     evidence={}, detail="no mgmt_move_sl_be_applied event logged — n8n/Ollama likely did not act",
                 )
             # The event WAS logged (order_send succeeded), but polling never
-            # caught the position with a changed SL. Two very different
-            # explanations, disambiguated by whether the position still
+            # caught the RUNNER specifically with a changed SL. Two very
+            # different explanations, disambiguated by whether the runner
+            # (by ticket, not "any new position" -- tp1_leg can easily still
+            # be open here with its own unrelated, unchanged SL) still
             # exists: real market movement can touch a freshly-moved BE SL
-            # and close the position before the next 5s poll -- that's the
+            # and close the runner before the next 5s poll -- that's the
             # mechanism working correctly (zero-risk exit), not a defect.
-            # Only a position that's still OPEN with its original SL despite
+            # Only a runner that's still OPEN with its original SL despite
             # a logged success is a genuine bot FAIL.
-            still_open = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
-            if not still_open:
+            current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
+            runner_still_open = next((p for p in current if p["ticket"] == runner_ticket), None)
+            if runner_still_open is None:
                 return ScenarioResult(
                     name="b1_be_variant1", outcome=ScenarioOutcome.PASS,
                     evidence={"logs": logs},
-                    detail="SL was moved to BE and the position closed (price touched BE) before polling caught it — correct zero-risk exit, not a defect",
+                    detail="SL was moved to BE and the runner closed (price touched BE) before polling caught it — correct zero-risk exit, not a defect",
                 )
             return ScenarioResult(
                 name="b1_be_variant1", outcome=ScenarioOutcome.FAIL,
-                evidence={"logs": logs, "still_open": still_open}, detail="event was logged but SL did not change in MT5",
+                evidence={"logs": logs, "runner_still_open": runner_still_open}, detail="event was logged but runner's SL did not change in MT5",
             )
         return ScenarioResult(
             name="b1_be_variant1", outcome=ScenarioOutcome.PASS,
