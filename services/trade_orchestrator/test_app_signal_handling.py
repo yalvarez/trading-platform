@@ -214,3 +214,69 @@ async def test_full_signal_without_prior_fast_opens_group_directly():
     for t in tm.trades.values():
         assert t.tp1_price == 2510.0
         assert t.tp2_price == 2530.0
+
+
+# --- chat_id-scoping: handle_signal_fields must propagate chat_id to open_group ---
+
+@pytest.mark.asyncio
+async def test_fast_signal_propagates_chat_id_to_both_legs():
+    """router_parser already tags every parsed signal with chat_id
+    (services/router_parser/app.py: sig["chat_id"] = chat_id) -- this is the
+    one hop where trade_orchestrator must actually read and use it, so both
+    legs of the group opened from a fast signal are scoped to /mgmt/action's
+    chat_id-based resolution (chat_id-scoping spec section 3)."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": "",
+        "chat_id": "-1001234567890",
+    }
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+
+    assert len(tm.trades) == 2
+    for t in tm.trades.values():
+        assert t.chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
+async def test_full_signal_propagates_chat_id_to_both_legs():
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+        "chat_id": "-1001234567890",
+    }
+    await handle_signal_fields(full_fields, tm, ACCOUNTS)
+
+    assert len(tm.trades) == 2
+    for t in tm.trades.values():
+        assert t.chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
+async def test_signal_without_chat_id_field_leaves_chat_id_none():
+    """Backward compatibility: a fields dict without a "chat_id" key at all
+    (e.g. an older router_parser message, or a test double) must not raise --
+    it resolves to chat_id=None (orphan, per chat_id-scoping spec section 7),
+    the same default open_group already has."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, ACCOUNTS)
+
+    assert len(tm.trades) == 2
+    for t in tm.trades.values():
+        assert t.chat_id is None
