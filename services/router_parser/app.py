@@ -33,7 +33,7 @@ async def forward_to_n8n(text: str, chat_id: str, webhook_url: str) -> None:
     """
     payload = {
         "chat_id": chat_id,
-        "text": text,
+        "message": text,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     try:

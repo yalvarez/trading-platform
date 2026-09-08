@@ -72,7 +72,7 @@ async def test_forward_to_n8n_posts_expected_payload(monkeypatch):
 
     assert captured["url"] == "https://n8n.example.com/in"
     assert captured["json"]["chat_id"] == "-1003321565807"
-    assert captured["json"]["text"] == "HIT SL. GET READY FOR RECOVERY"
+    assert captured["json"]["message"] == "HIT SL. GET READY FOR RECOVERY"
     assert "timestamp" in captured["json"]
 
 
