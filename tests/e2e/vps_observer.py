@@ -43,7 +43,7 @@ class VpsObserver:
         client = build_mt5_client(self.mt5_host, self.mt5_port)
         positions = client.positions_get(symbol=symbol) or []
         return [
-            {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume}
+            {"ticket": p.ticket, "sl": p.sl, "tp": p.tp, "volume": p.volume, "price_open": p.price_open}
             for p in positions
         ]
 

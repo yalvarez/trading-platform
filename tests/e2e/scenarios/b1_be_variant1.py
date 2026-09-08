@@ -9,8 +9,6 @@ section 3.1). n8n/Ollama is the real test instance, not a mock (spec
 section 2) -- a timeout with no mgmt event logged is reported as an
 external dependency failure, not a bot FAIL (spec section 7).
 """
-import asyncio
-
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
 from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
@@ -20,15 +18,21 @@ MGMT_POLL_INTERVAL_SECONDS = 5
 MESSAGE = "Set BE for zero risk"
 
 # Real production behavior observed live (2026-09-08): MT5 enforces a
-# minimum distance (trade_stops_level) between any SL and the live price.
-# Right after opening, price is still essentially at entry, so a BE request
-# sent immediately almost always lands inside that minimum and gets
-# rejected -- not a bot defect (see INCONCLUSIVE_MT5_REJECTED_BE below),
-# but it defeats this scenario's actual purpose (confirming n8n correctly
-# classifies and executes "Set BE for zero risk") by hitting the same
-# market-timing edge case nearly every run. Give price real time to move
-# away from entry before asking for BE.
-PRE_MESSAGE_DELAY_SECONDS = 30.0
+# minimum distance (trade_stops_level, confirmed 0.20 price units on this
+# account/symbol) between any SL and the live price. Right after opening,
+# price is still essentially at entry, so a BE request sent immediately
+# almost always lands inside that minimum and gets rejected -- not a bot
+# defect (see INCONCLUSIVE_MT5_REJECTED_BE below), but it defeats this
+# scenario's actual purpose (confirming n8n correctly classifies and
+# executes "Set BE for zero risk") by hitting the same market-timing edge
+# case nearly every run. A fixed delay (tried: 30s) was NOT reliable
+# enough live -- the market can stay within that margin for longer than
+# any fixed guess. Actively poll the real price instead and only send the
+# message once it has genuinely moved away from entry, with a bounded
+# timeout so a truly stuck/lateral market still reports (not hangs).
+PRICE_CLEARANCE_MARGIN = 0.30  # comfortably above the confirmed 0.20 trade_stops_level
+PRICE_CLEARANCE_TIMEOUT_SECONDS = 90.0
+PRICE_CLEARANCE_POLL_INTERVAL_SECONDS = 3.0
 
 
 def _find_runner(positions: list) -> dict | None:
@@ -39,12 +43,29 @@ def _find_runner(positions: list) -> dict | None:
     open with the SAME planned_sl, so picking "the first position" (as this
     scenario used to do) can silently compare the wrong leg's SL across
     polls whenever positions_get doesn't return them in a stable order --
-    a real bug found live (2026-09-08) once the pre-message delay (below)
-    started giving BE a real chance to succeed while tp1_leg was still
-    open: the poll kept reading tp1_leg's unchanged SL and never noticed
-    the runner's SL had actually moved.
+    a real bug found live (2026-09-08) once BE started succeeding more
+    reliably while tp1_leg was still open: the poll kept reading tp1_leg's
+    unchanged SL and never noticed the runner's SL had actually moved.
     """
     return next((p for p in positions if p.get("tp") == 0.0), None)
+
+
+async def _wait_for_price_clearance(ctx: ScenarioContext, entry_price: float) -> bool:
+    """
+    Polls the real live price until it has moved at least
+    PRICE_CLEARANCE_MARGIN away from `entry_price` (either direction --
+    BE only needs distance from the current price, not a specific
+    direction), or PRICE_CLEARANCE_TIMEOUT_SECONDS elapses. Returns True
+    if clearance was reached, False on timeout (a genuinely
+    lateral/stuck market -- the caller reports INCONCLUSIVE_MT5_REJECTED_BE
+    for that case, same underlying cause as an actual MT5 rejection).
+    """
+    async def check_cleared():
+        price = await ctx.price_reader.read_price(SYMBOL)
+        return True if abs(price - entry_price) >= PRICE_CLEARANCE_MARGIN else None
+
+    result = await _poll_until(check_cleared, PRICE_CLEARANCE_TIMEOUT_SECONDS, PRICE_CLEARANCE_POLL_INTERVAL_SECONDS)
+    return bool(result)
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
@@ -64,11 +85,18 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         )
     runner_sl_before = runner_before["sl"]
     runner_ticket = runner_before["ticket"]
-
-    await asyncio.sleep(PRE_MESSAGE_DELAY_SECONDS)
-    await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
+    entry_price = runner_before["price_open"]  # BE target == the runner's own entry price
 
     try:
+        cleared = await _wait_for_price_clearance(ctx, entry_price)
+        if not cleared:
+            return ScenarioResult(
+                name="b1_be_variant1", outcome=ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE,
+                evidence={"entry_price": entry_price},
+                detail=f"price never moved {PRICE_CLEARANCE_MARGIN} away from entry within {PRICE_CLEARANCE_TIMEOUT_SECONDS}s — BE would be rejected by trade_stops_level regardless of n8n/bot behavior",
+            )
+        await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
+
         async def check_be_applied():
             current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
             runner = next((p for p in current if p["ticket"] == runner_ticket), None)

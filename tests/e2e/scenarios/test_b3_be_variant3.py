@@ -12,13 +12,15 @@ def _no_real_sleep(monkeypatch):
 
 # tp1_leg always carries a real, nonzero tp; the runner leg is the one
 # open_group leaves at tp=0.0 -- see b1_be_variant1._find_runner.
-TP1_LEG = {"ticket": 1, "sl": 2470.0, "tp": 2530.0, "volume": 0.01}
-RUNNER_LEG = {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}
+TP1_LEG = {"ticket": 1, "sl": 2470.0, "tp": 2530.0, "volume": 0.01, "price_open": 2500.0}
+RUNNER_LEG = {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01, "price_open": 2500.0}
 
 
 def _ctx_with_open_position():
     price_reader = MagicMock()
-    price_reader.read_price = AsyncMock(return_value=2500.0)
+    # Already PRICE_CLEARANCE_MARGIN away from entry (2500.0) so
+    # _wait_for_price_clearance succeeds on its first poll.
+    price_reader.read_price = AsyncMock(return_value=2500.0 + b1_be_variant1.PRICE_CLEARANCE_MARGIN)
     sender = MagicMock()
     sender.send = AsyncMock(return_value=1)
     observer = MagicMock()

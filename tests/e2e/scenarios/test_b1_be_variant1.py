@@ -23,14 +23,19 @@ def _no_real_sleep(monkeypatch):
 # use ticket 1 for tp1_leg (tp=2530.0) and ticket 2 for the runner
 # (tp=0.0), matching real open_group output, so _find_runner and the
 # by-ticket poll checks exercise the same identification logic B1 uses
-# for real.
-TP1_LEG = {"ticket": 1, "sl": 2470.0, "tp": 2530.0, "volume": 0.01}
-RUNNER_LEG = {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}
+# for real. price_open=2500.0 on both matches _ctx_with_open_position's
+# default price_reader.read_price return value, already PRICE_CLEARANCE_MARGIN
+# away from entry so _wait_for_price_clearance passes on its first poll.
+TP1_LEG = {"ticket": 1, "sl": 2470.0, "tp": 2530.0, "volume": 0.01, "price_open": 2500.0}
+RUNNER_LEG = {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01, "price_open": 2500.0}
 
 
 def _ctx_with_open_position():
     price_reader = MagicMock()
-    price_reader.read_price = AsyncMock(return_value=2500.0)
+    # Cleared price: entry is 2500.0 (see TP1_LEG/RUNNER_LEG), so returning
+    # something >= PRICE_CLEARANCE_MARGIN away lets _wait_for_price_clearance
+    # succeed immediately without any test needing to simulate a real wait.
+    price_reader.read_price = AsyncMock(return_value=2500.0 + b1_be_variant1.PRICE_CLEARANCE_MARGIN)
     sender = MagicMock()
     sender.send = AsyncMock(return_value=1)
     observer = MagicMock()
@@ -206,3 +211,28 @@ async def test_b1_reports_inconclusive_mt5_rejected_be_when_order_send_was_rejec
     result = await b1_be_variant1.run(ctx)
 
     assert result.outcome == ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE
+
+
+@pytest.mark.asyncio
+async def test_b1_reports_inconclusive_when_price_never_clears_entry():
+    """
+    A fixed pre-message delay (tried: 30s) was NOT reliable live -- the
+    market can stay within trade_stops_level's margin of entry for longer
+    than any fixed guess, wasting the whole run only to hit
+    INCONCLUSIVE_MT5_REJECTED_BE anyway. Waiting for the real price to
+    clear the margin (with a bounded timeout) should short-circuit to the
+    same INCONCLUSIVE_MT5_REJECTED_BE outcome WITHOUT ever sending the
+    message or entering the mgmt poll -- there's no point asking for BE
+    when the price genuinely never moved.
+    """
+    ctx = _ctx_with_open_position()
+    # Price never moves from entry (2500.0) — clearance never reached.
+    ctx.price_reader.read_price = AsyncMock(return_value=2500.0)
+
+    result = await b1_be_variant1.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE
+    # The setup's own "XAUUSD BUY NOW" still goes out, but the BE message
+    # itself must never be sent once clearance times out.
+    sent_texts = [c.args[1] for c in ctx.sender.send.await_args_list]
+    assert b1_be_variant1.MESSAGE not in sent_texts

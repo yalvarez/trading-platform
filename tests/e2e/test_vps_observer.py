@@ -56,7 +56,7 @@ def test_grep_container_logs_filters_matching_lines(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_positions_for_symbol_returns_position_dicts(monkeypatch):
-    fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01)
+    fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01, price_open=2500.0)
     fake_client = MagicMock()
     fake_client.positions_get.return_value = [fake_pos]
     monkeypatch.setattr(
@@ -67,13 +67,13 @@ async def test_positions_for_symbol_returns_position_dicts(monkeypatch):
 
     positions = await observer.positions_for_symbol("XAUUSD")
 
-    assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01}]
+    assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01, "price_open": 2500.0}]
     fake_client.positions_get.assert_called_once_with(symbol="XAUUSD")
 
 
 @pytest.mark.asyncio
 async def test_positions_for_symbol_calls_build_mt5_client_with_host_and_port(monkeypatch):
-    fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01)
+    fake_pos = MagicMock(ticket=555, sl=2490.0, tp=0.0, volume=0.01, price_open=2500.0)
     fake_client = MagicMock()
     fake_client.positions_get.return_value = [fake_pos]
     calls = []
@@ -87,7 +87,7 @@ async def test_positions_for_symbol_calls_build_mt5_client_with_host_and_port(mo
 
     positions = await observer.positions_for_symbol("XAUUSD")
 
-    assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01}]
+    assert positions == [{"ticket": 555, "sl": 2490.0, "tp": 0.0, "volume": 0.01, "price_open": 2500.0}]
     assert calls == [("mt5_acct1", 8001)]
 
 
