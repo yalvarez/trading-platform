@@ -312,7 +312,11 @@ class TradeManager:
                 log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s", leg, symbol, getattr(res, "retcode", None))
                 for t in tickets.values():
                     await self._call(client.partial_close, account, t, 100)
-                await self._notify("open_failed", symbol=symbol, leg=leg, group_id=group_id)
+                await self._notify(
+                    "open_failed", symbol=symbol, leg=leg, group_id=group_id,
+                    message=f"Grupo {group_id} ({symbol}): fallo abriendo la pierna '{leg}' en MT5 "
+                            f"(retcode={getattr(res, 'retcode', None)}). Se revirtieron las piernas ya abiertas del grupo.",
+                )
                 return None
             tickets[leg] = int(res.order)
 
@@ -333,8 +337,12 @@ class TradeManager:
         ACTIVE_TRADES.set(len(self.trades))
         log.info("[TM] group %s opened: tp1=%s runner=%s symbol=%s dir=%s sl=%s tp1_price=%s tp2_price=%s",
                   group_id, tickets["tp1"], tickets["runner"], symbol, direction, sl, tp1, tp2)
-        await self._notify("group_opened", group_id=group_id, symbol=symbol, direction=direction,
-                            tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2)
+        await self._notify(
+            "group_opened", group_id=group_id, symbol=symbol, direction=direction,
+            tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2,
+            message=f"Grupo {group_id} abierto: {direction.upper()} {symbol} — tp1 ticket={tickets['tp1']}, "
+                    f"runner ticket={tickets['runner']}, sl={sl}, tp1={tp1}, tp2={tp2}.",
+        )
         await self._persist_group(group_id)
         return group_id
 
@@ -416,7 +424,10 @@ class TradeManager:
                 log.error("[TM][UPDATE] fallo actualizando ticket=%s leg=%s", t.ticket, t.leg)
 
         log.info("[TM] group %s actualizado: sl=%s tp1=%s tp2=%s", group_id, sl, tp1, tp2)
-        await self._notify("group_updated", group_id=group_id, sl=sl, tp1=tp1, tp2=tp2)
+        await self._notify(
+            "group_updated", group_id=group_id, sl=sl, tp1=tp1, tp2=tp2,
+            message=f"Grupo {group_id} actualizado: sl={sl}, tp1={tp1}, tp2={tp2}.",
+        )
         await self._persist_group(group_id)
 
     def find_active_group_for_symbol(self, symbol: str) -> Optional[int]:
@@ -478,7 +489,13 @@ class TradeManager:
                 if closed_trade.leg == "tp1":
                     await self._on_tp1_leg_closed(account, client, closed_trade)
                 else:
-                    await self._notify("runner_closed", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol)
+                    close_price = await self._get_close_price(client, ticket)
+                    await self._notify(
+                        "runner_closed", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
+                        message=f"Runner del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) se cerro "
+                                f"(SL o cierre manual). Precio de apertura {self._fmt_price(closed_trade.entry_price)}, "
+                                f"precio de cierre {self._fmt_price(close_price)}.",
+                    )
                 remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
                 if not remaining:
                     await self._close_group_in_store(closed_trade.group_id)
@@ -521,7 +538,13 @@ class TradeManager:
                 await asyncio.sleep(0.2)
         if ok:
             runner.be_applied = True
-            await self._notify("tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket)
+            close_price = await self._get_close_price(client, tp1_leg.ticket)
+            await self._notify(
+                "tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
+                message=f"TP1 de {tp1_leg.symbol} (grupo {tp1_leg.group_id}) alcanzado "
+                        f"(apertura {self._fmt_price(tp1_leg.entry_price)}, cierre {self._fmt_price(close_price)}). "
+                        f"Runner (ticket={runner.ticket}) movido a breakeven.",
+            )
             await self._persist_group(tp1_leg.group_id)
         else:
             log.error("[TM] BE no se pudo aplicar tras 3 intentos, runner=%s group_id=%s queda con SL original",
@@ -530,6 +553,31 @@ class TradeManager:
                 "tp1_hit_be_failed", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
                 message=f"TP1 de {tp1_leg.symbol} (group {tp1_leg.group_id}) se cerro, pero el runner (ticket {runner.ticket}) NO pudo moverse a breakeven tras 3 intentos. Requiere revision manual — sigue con su SL original.",
             )
+
+    async def _get_close_price(self, client, ticket: int) -> Optional[float]:
+        """
+        Busca el precio real de cierre de `ticket` en el historial de deals de MT5
+        (DEAL_ENTRY_OUT=1). Usado solo para enriquecer el mensaje descriptivo que
+        se manda a n8n -- nunca debe tumbar el flujo de notificacion, asi que
+        cualquier fallo (de red, o simplemente que el deal aun no propago)
+        devuelve None y el mensaje cae a un placeholder ("N/D").
+        """
+        try:
+            deals = await self._call(client.history_deals_get, position=ticket)
+        except Exception as e:
+            log.warning("[TM] fallo obteniendo historial de deals para ticket=%s: %s", ticket, e)
+            return None
+        if not deals:
+            return None
+        out_deals = [d for d in deals if getattr(d, "entry", None) == 1]
+        if not out_deals:
+            return None
+        closing = max(out_deals, key=lambda d: getattr(d, "time", 0))
+        return float(closing.price)
+
+    @staticmethod
+    def _fmt_price(price: Optional[float]) -> str:
+        return f"{price:.5f}" if price is not None else "N/D"
 
     async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str) -> bool:
         # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida
@@ -565,7 +613,11 @@ class TradeManager:
         new_sl = runner.tp1_price + sl_offset if is_buy else runner.tp1_price - sl_offset
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
-            await self._notify("trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl)
+            await self._notify(
+                "trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl,
+                message=f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): "
+                        f"nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.",
+            )
             await self._persist_group(runner.group_id)
 
     async def apply_mgmt_action(self, *, action: str, symbol: str, raw_text: str, correction: Optional[dict]) -> dict:
@@ -586,10 +638,20 @@ class TradeManager:
         client = self.mt5._client_for(account)
 
         if action == "close_now":
+            leg_summaries = []
             for t in list(legs):
                 await self._call(client.partial_close, account, t.ticket, 100)
+                close_price = await self._get_close_price(client, t.ticket)
+                leg_summaries.append(
+                    f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
+                    f"cierre {self._fmt_price(close_price)})"
+                )
                 self.trades.pop(t.ticket, None)
-            await self._notify("mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text)
+            await self._notify(
+                "mgmt_close_now", group_id=group_id, symbol=symbol, raw_text=raw_text,
+                message=f"Grupo {group_id} ({symbol}) cerrado manualmente via /mgmt/action: "
+                        f"{', '.join(leg_summaries)}. Texto original: {raw_text!r}",
+            )
             await self._close_group_in_store(group_id)
             return {"status": "closed", "group_id": group_id}
 
@@ -607,18 +669,29 @@ class TradeManager:
             is_buy = runner.direction == "BUY"
             worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
             if not worse_than_be:
-                await self._notify("mgmt_move_sl_be_already_satisfied", group_id=group_id, symbol=symbol)
+                await self._notify(
+                    "mgmt_move_sl_be_already_satisfied", group_id=group_id, symbol=symbol,
+                    message=f"Grupo {group_id} ({symbol}): SL ya estaba en breakeven o mejor, no se aplico ningun cambio.",
+                )
                 return {"status": "already_satisfied", "group_id": group_id}
             ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
             if ok:
                 runner.be_applied = True
-                await self._notify("mgmt_move_sl_be_applied", group_id=group_id, symbol=symbol, raw_text=raw_text)
+                await self._notify(
+                    "mgmt_move_sl_be_applied", group_id=group_id, symbol=symbol, raw_text=raw_text,
+                    message=f"Grupo {group_id} ({symbol}): SL movido a breakeven manualmente via /mgmt/action. "
+                            f"Texto original: {raw_text!r}",
+                )
                 await self._persist_group(group_id)
                 return {"status": "applied", "group_id": group_id}
             return {"status": "failed", "group_id": group_id}
 
         if action == "note_sl_hit":
-            await self._notify("mgmt_note_sl_hit", group_id=group_id, symbol=symbol, raw_text=raw_text)
+            await self._notify(
+                "mgmt_note_sl_hit", group_id=group_id, symbol=symbol, raw_text=raw_text,
+                message=f"Grupo {group_id} ({symbol}): SL hit reportado via /mgmt/action (solo nota, sin accion en MT5). "
+                        f"Texto original: {raw_text!r}",
+            )
             return {"status": "noted", "group_id": group_id}
 
         if action == "signal_correction":
@@ -785,7 +858,12 @@ class TradeManager:
         log.info("[TM][RECONCILE] completado: recuperados_redis=%s recuperados_archivo=%s degradados=%s huerfanos=%s errores_store=%s",
                   summary["recovered_from_redis"], summary["recovered_from_file"], summary["degraded"],
                   len(summary["orphaned"]), summary["store_errors"])
-        await self._notify("reconciliation_summary", **summary)
+        await self._notify(
+            "reconciliation_summary", **summary,
+            message=f"Reconciliacion al arranque completada: recuperados_redis={summary['recovered_from_redis']}, "
+                    f"recuperados_archivo={summary['recovered_from_file']}, degradados={summary['degraded']}, "
+                    f"huerfanos={len(summary['orphaned'])}, errores_store={summary['store_errors']}.",
+        )
         return summary
 
     def _reconstruct_leg_from_doc(self, account, doc: dict, leg: str, mt5_pos) -> None:

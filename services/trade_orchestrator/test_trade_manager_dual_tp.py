@@ -988,6 +988,88 @@ async def test_reconcile_with_no_state_store_still_recovers_degraded():
 
 
 @pytest.mark.asyncio
+async def test_runner_closed_message_includes_entry_and_close_price():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # tp1 closes, BE applied to runner
+
+    sim.close_position_directly(runner_leg.ticket, close_price=2514.0)
+    await tm._tick_once_account(ACCOUNT)  # runner closes
+
+    runner_events = [kwargs for event, kwargs in notifier.events if event == "runner_closed"]
+    assert len(runner_events) == 1
+    message = runner_events[0]["message"]
+    assert str(runner_leg.entry_price) in message
+    assert "2514.0" in message or "2514.00000" in message
+
+
+@pytest.mark.asyncio
+async def test_runner_closed_message_falls_back_when_close_price_unavailable():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # tp1 closes, BE applied to runner
+
+    # No deal recorded for the runner's exit (e.g. history not yet propagated) —
+    # message must degrade gracefully instead of crashing the notify path.
+    del sim.positions[runner_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_events = [kwargs for event, kwargs in notifier.events if event == "runner_closed"]
+    assert len(runner_events) == 1
+    assert "N/D" in runner_events[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_tp1_hit_message_includes_entry_and_close_price():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    sim.close_position_directly(tp1_leg.ticket, close_price=2510.0)
+
+    await tm._tick_once_account(ACCOUNT)
+
+    tp1_events = [kwargs for event, kwargs in notifier.events if event == "tp1_hit"]
+    assert len(tp1_events) == 1
+    message = tp1_events[0]["message"]
+    assert str(tp1_leg.entry_price) in message
+    assert "2510.0" in message or "2510.00000" in message
+
+
+@pytest.mark.asyncio
+async def test_mgmt_close_now_message_includes_entry_and_close_price_per_leg():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="Close now", correction=None)
+
+    assert result["status"] == "closed"
+    close_events = [kwargs for event, kwargs in notifier.events if event == "mgmt_close_now"]
+    assert len(close_events) == 1
+    message = close_events[0]["message"]
+    assert "tp1" in message
+    assert "runner" in message
+    assert "2500.0" in message or "2500.00000" in message  # entry price for both legs
+
+
+@pytest.mark.asyncio
 async def test_notify_emits_log_line_for_every_event(caplog):
     import logging
     sim = SimuladorMT5()

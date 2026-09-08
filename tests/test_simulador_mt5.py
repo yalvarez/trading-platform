@@ -3,11 +3,24 @@ import pytest
 class SimuladorMT5:
     def __init__(self):
         self.positions = {}
+        self.deals_by_position = {}  # position ticket -> list of deal dicts (entry: 0=IN, 1=OUT)
         self.last_ticket = 1000
+        self.last_deal = 5000
         self.price = 2500.0
         self.spread = 0.2
         self.stops_level = 20  # en puntos
         self.point = 0.1
+
+    def _record_deal(self, ticket, *, entry, price):
+        self.last_deal += 1
+        self.deals_by_position.setdefault(ticket, []).append({
+            'ticket': self.last_deal,
+            'order': ticket,
+            'position_id': ticket,
+            'price': price,
+            'entry': entry,
+            'time': self.last_deal,  # monotonic stand-in for a real timestamp
+        })
 
     def order_send(self, req):
         action = req.get('action')
@@ -26,6 +39,7 @@ class SimuladorMT5:
                 'comment': req.get('comment', ''),
                 'magic': req.get('magic', 0),
             }
+            self._record_deal(ticket, entry=0, price=self.positions[ticket]['price_open'])
             return type('OrderSendResult', (), {'retcode': 10009, 'order': ticket, 'deal': ticket, 'comment': 'Request executed'})()
         elif action == 6:  # SL/TP update
             ticket = req.get('position')
@@ -65,11 +79,28 @@ class SimuladorMT5:
         pos = self.positions.get(ticket)
         if not pos:
             return False
+        self._record_deal(ticket, entry=1, price=pos.get('price_current', self.price))
         if percent >= 100:
             del self.positions[ticket]
         else:
             pos['volume'] = max(0.0, float(pos.get('volume', 0.0)) * (1 - percent / 100.0))
         return True
+
+    def history_deals_get(self, *args, position=None, ticket=None, **kwargs):
+        """Devuelve los deals registrados para `position` (o `ticket`, tratado como alias)."""
+        pos_ticket = position if position is not None else ticket
+        deals = self.deals_by_position.get(pos_ticket, [])
+        return [type('TradeDeal', (), d)() for d in deals]
+
+    def close_position_directly(self, ticket, *, close_price=None):
+        """Test helper: simula un cierre fuera de banda (SL/TP hit en el broker) —
+        registra el deal de salida y borra la posicion, sin pasar por partial_close."""
+        pos = self.positions.get(ticket)
+        if not pos:
+            return
+        price = close_price if close_price is not None else pos.get('price_current', self.price)
+        self._record_deal(ticket, entry=1, price=price)
+        del self.positions[ticket]
 
 # Ejemplo de test de gestión con el simulador
 

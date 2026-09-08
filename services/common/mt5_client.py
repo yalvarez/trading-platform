@@ -103,6 +103,9 @@ class MT5Client:
     def positions_get(self, *args, **kwargs):
         return self.mt5.positions_get(*args, **kwargs)
 
+    def history_deals_get(self, *args, **kwargs):
+        return self.mt5.history_deals_get(*args, **kwargs)
+
     def order_send(self, req: dict):
         return self.mt5.order_send(req)
 

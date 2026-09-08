@@ -20,18 +20,15 @@ log = logging.getLogger("trade_orchestrator.mgmt_api")
 
 _action_key_header = APIKeyHeader(name="X-N8N-Action-Key", auto_error=False)
 
-
 class Correction(BaseModel):
     field: str
     value: float
-
 
 class MgmtActionRequest(BaseModel):
     action: str
     symbol: str
     raw_text: str
     correction: Optional[Correction] = None
-
 
 def create_mgmt_app(trade_manager) -> FastAPI:
     app = FastAPI(title="trade_orchestrator-mgmt")
