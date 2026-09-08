@@ -133,3 +133,43 @@ async def test_b1_fails_when_event_logged_but_position_still_open_with_unchanged
     result = await b1_be_variant1.run(ctx)
 
     assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
+async def test_b1_reports_inconclusive_mt5_rejected_be_when_order_send_was_rejected():
+    """
+    Real production behavior observed live (2026-09-08): n8n correctly
+    classified the message and called /mgmt/action, but MT5 rejected the
+    order_send (BE requested too soon after opening, price still within
+    trade_stops_level of entry) -- so mgmt_move_sl_be_applied never gets
+    logged, only the generic "reason=mgmt-fallback-BE" rejection line. This
+    must NOT be conflated with "n8n/Ollama never called /mgmt/action at
+    all" (EXTERNAL_DEPENDENCY_FAILURE) -- it's a distinct, real system
+    limitation.
+    """
+    ctx = _ctx_with_open_position()
+    setup_positions = [
+        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+    ]
+    unchanged_runner = [{"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
+
+    calls = {"n": 0}
+
+    async def _positions_for_symbol(_symbol):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot
+        return setup_positions if calls["n"] == 2 else unchanged_runner  # SL never moves — order_send was rejected
+
+    def _grep(container, pattern, since="5m"):
+        if pattern == "reason=mgmt-fallback-BE":
+            return ["[TM] fallo moviendo SL runner=2 reason=mgmt-fallback-BE tras 3 intentos"]
+        return []  # no mgmt_move_sl_be_applied event -- it was never logged
+
+    ctx.observer.positions_for_symbol = _positions_for_symbol
+    ctx.observer.grep_container_logs = _grep
+
+    result = await b1_be_variant1.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE

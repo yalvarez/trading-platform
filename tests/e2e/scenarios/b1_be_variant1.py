@@ -44,6 +44,24 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
 
         if not runner_after:
             if not logs:
+                # No success event at all -- two very different causes,
+                # disambiguated by whether trade_orchestrator even attempted
+                # the order_send. Real production behavior observed live: MT5
+                # can reject move_sl_be_now's order_send (trade_stops_level --
+                # BE requested too soon after opening, price still too close
+                # to entry) even though n8n correctly called /mgmt/action.
+                # That's a real system limitation, not "n8n/Ollama didn't
+                # act" -- conflating the two hides a working n8n integration
+                # behind a misleading external-dependency label.
+                rejection_logs = ctx.observer.grep_container_logs(
+                    "atp-trade-orchestrator", "reason=mgmt-fallback-BE"
+                )
+                if rejection_logs:
+                    return ScenarioResult(
+                        name="b1_be_variant1", outcome=ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE,
+                        evidence={"rejection_logs": rejection_logs},
+                        detail="n8n called /mgmt/action correctly, but MT5 rejected the SL move (likely too close to entry right after opening) — not a bot defect, not an n8n failure",
+                    )
                 return ScenarioResult(
                     name="b1_be_variant1", outcome=ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE,
                     evidence={}, detail="no mgmt_move_sl_be_applied event logged — n8n/Ollama likely did not act",
