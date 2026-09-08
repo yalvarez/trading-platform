@@ -1300,6 +1300,48 @@ async def test_reconcile_applies_be_synchronously_when_tp1_closed_during_downtim
 
 
 @pytest.mark.asyncio
+async def test_reconcile_does_not_crash_when_doc_no_longer_has_tp1_leg():
+    """
+    Real production bug (found live on the VPS): a group whose tp1_leg
+    closed in a PREVIOUS process lifetime (not during the current
+    downtime) has its own persisted doc already missing "tp1" from
+    "legs" -- _group_doc only ever includes legs still in self.trades,
+    and _on_tp1_leg_closed already ran once, live, and re-persisted the
+    group without it. reconcile_from_mt5 must not assume doc["legs"]["tp1"]
+    exists just because mt5_tp1 is None -- that KeyError crash-looped
+    trade_orchestrator on every restart for a group in this state,
+    leaving it (and every other group on the account) with zero
+    mechanical management until fixed.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    # Only the runner exists in MT5 (as in the downtime case), but this
+    # doc's "legs" never had "tp1" at all -- it closed a while ago, in an
+    # earlier reconciliation/tick cycle, not during this restart's downtime.
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "chat_id": None, "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])  # must not raise KeyError
+
+    assert summary["recovered_from_redis"] == 1
+    assert runner_ticket in tm.trades
+    # No synchronous BE was attempted -- the runner's SL is untouched from
+    # what it already was, since there is no evidence tp1 closed just now.
+    runner_pos = sim.positions_get(ticket=runner_ticket)[0]
+    assert runner_pos.sl == 2490.0
+    assert tm.trades[runner_ticket].be_applied is False
+
+
+@pytest.mark.asyncio
 async def test_reconcile_sets_next_group_id_above_the_highest_seen():
     sim = SimuladorMT5()
     sim.price = 2500.0

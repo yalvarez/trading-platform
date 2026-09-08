@@ -948,7 +948,16 @@ class TradeManager:
             # normal _tick_once_account close-detection loop compares against
             # self.trades — tp1 was never inserted into it this run, so it would
             # NEVER be seen as "closed". Apply BE synchronously, right here.
-            if doc is not None and mt5_tp1 is None and mt5_runner is not None:
+            # Real production bug: doc["legs"] only still has "tp1" if THIS
+            # doc predates tp1's close (i.e. it closed during the current
+            # downtime). Once _on_tp1_leg_closed runs once (live, in a
+            # previous process lifetime) and re-persists the group, its own
+            # _group_doc only ever includes legs still in self.trades — "tp1"
+            # is gone from the doc for good. Without this guard, a restart
+            # any time after that permanently crash-loops reconcile_from_mt5
+            # with a KeyError, since doc["legs"]["tp1"] no longer exists even
+            # though mt5_tp1 is (correctly) still None.
+            if doc is not None and mt5_tp1 is None and mt5_runner is not None and "tp1" in doc["legs"]:
                 runner_trade = self.trades.get(mt5_runner.ticket)
                 if runner_trade is not None:
                     log.warning("[TM][RECONCILE] tp1_leg de group_id=%s cerro durante el downtime, aplicando BE ahora", group_id)
