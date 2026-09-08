@@ -2,10 +2,11 @@
 mgmt_api.py
 Endpoint HTTP /mgmt/action que recibe decisiones de gestion desde un
 flujo n8n/Ollama externo, para mensajes del canal que el parser de
-senales no reconoce (dual-TP spec seccion 5.2). Se monta junto al
+senales no reconoce (chat_id-scoping spec, seccion 6). Se monta junto al
 consumer de Redis Streams de trade_orchestrator, en el mismo proceso,
-porque necesita el TradeManager en memoria para resolver el grupo
-activo por simbolo.
+porque necesita el TradeManager en memoria para resolver los grupos
+activos por chat_id (todos los trades abiertos por el bot para el mismo
+canal de Telegram que mando el mensaje de gestion -- nunca por simbolo).
 """
 import hmac
 import os
@@ -28,7 +29,7 @@ class Correction(BaseModel):
 
 class MgmtActionRequest(BaseModel):
     action: str
-    symbol: str
+    chat_id: str
     raw_text: str
     correction: Optional[Correction] = None
 
@@ -54,10 +55,10 @@ def create_mgmt_app(trade_manager) -> FastAPI:
         correction = req.correction.model_dump() if req.correction else None
         try:
             result = await trade_manager.apply_mgmt_action(
-                action=req.action, symbol=req.symbol, raw_text=req.raw_text, correction=correction,
+                action=req.action, chat_id=req.chat_id, raw_text=req.raw_text, correction=correction,
             )
         except Exception as e:
-            log.exception("[MGMT_API] apply_mgmt_action fallo inesperadamente: action=%s symbol=%s", req.action, req.symbol)
+            log.exception("[MGMT_API] apply_mgmt_action fallo inesperadamente: action=%s chat_id=%s", req.action, req.chat_id)
             return {"status": "failed", "reason": "internal_error", "detail": str(e)}
         return result
 
