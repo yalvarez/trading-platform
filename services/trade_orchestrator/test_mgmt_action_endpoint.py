@@ -10,6 +10,7 @@ from services.trade_orchestrator.mgmt_api import create_mgmt_app
 
 HEADERS = {"X-N8N-Action-Key": "test-action-key"}
 ACCOUNT = {"name": "demo", "active": True, "host": "x", "port": 1}
+CHAT_ID = "-1001234567890"
 
 
 class DummyExecutor:
@@ -40,24 +41,49 @@ def tm_and_client():
 
 def test_mgmt_action_requires_api_key(tm_and_client):
     tm, client = tm_and_client
-    resp = client.post("/mgmt/action", json={"action": "close_now", "symbol": "XAUUSD", "raw_text": "close now", "correction": None})
+    resp = client.post("/mgmt/action", json={"action": "close_now", "chat_id": CHAT_ID, "raw_text": "close now", "correction": None})
     assert resp.status_code == 401
 
 
 def test_mgmt_action_no_active_trade_returns_200(tm_and_client):
     tm, client = tm_and_client
-    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "symbol": "XAUUSD", "raw_text": "close now", "correction": None})
+    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "chat_id": CHAT_ID, "raw_text": "close now", "correction": None})
     assert resp.status_code == 200
     assert resp.json()["status"] == "no_active_trade"
+
+
+def test_mgmt_action_rejects_request_missing_chat_id(tm_and_client):
+    """The old `symbol` field is no longer accepted in place of chat_id -- a
+    request without chat_id must fail Pydantic validation (422), not be
+    silently treated as chat_id=None."""
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "symbol": "XAUUSD", "raw_text": "close now", "correction": None})
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_mgmt_action_close_now_closes_group(tm_and_client):
     tm, client = tm_and_client
-    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
 
-    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "symbol": "XAUUSD", "raw_text": "close now", "correction": None})
+    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "chat_id": CHAT_ID, "raw_text": "close now", "correction": None})
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "closed"
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["results"][0]["status"] == "closed"
     assert len(tm.trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_mgmt_action_close_now_only_affects_the_matching_chat_id(tm_and_client):
+    tm, client = tm_and_client
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="other-chat")
+
+    resp = client.post("/mgmt/action", headers=HEADERS, json={"action": "close_now", "chat_id": CHAT_ID, "raw_text": "close now", "correction": None})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+    remaining_chats = {t.chat_id for t in tm.trades.values()}
+    assert remaining_chats == {"other-chat"}

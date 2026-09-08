@@ -53,6 +53,37 @@ async def test_open_group_opens_two_positions_with_shared_group_id():
 
 
 @pytest.mark.asyncio
+async def test_open_group_defaults_chat_id_to_none_when_not_passed():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+    for t in legs:
+        assert t.chat_id is None
+
+
+@pytest.mark.asyncio
+async def test_open_group_propagates_chat_id_to_both_legs():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0,
+        chat_id="-1001234567890",
+    )
+
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert len(legs) == 2
+    for t in legs:
+        assert t.chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
 async def test_open_group_aborts_when_tp2_not_above_tp1_for_buy():
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -134,6 +165,363 @@ async def test_update_group_signal_applies_real_sl_even_when_narrower_than_fast_
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
     assert tp1_pos.sl == 4410.0
     assert runner_pos.sl == 4410.0
+
+
+# --- apply_mgmt_action: chat_id-scoped resolution (chat_id-scoping spec section 5) ---
+
+CHAT_ID = "-1001234567890"
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_no_active_trade_for_chat_returns_no_active_trade_and_notifies():
+    sim = SimuladorMT5()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="Close now", correction=None)
+
+    assert result == {"status": "no_active_trade"}
+    events = [kwargs for event, kwargs in tm.notifier.events if event == "mgmt_no_active_trade"]
+    assert len(events) == 1
+    assert "Close now" in events[0]["message"]
+    assert events[0]["chat_id"] == CHAT_ID
+    assert events[0]["action"] == "close_now"
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_closes_single_group_before_tp1():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="Close now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "closed"}]}
+    remaining = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_closes_all_groups_of_the_same_chat():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    other_chat_group = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="other-chat")
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close both", correction=None)
+
+    assert result == {"status": "completed", "results": [
+        {"group_id": g1, "status": "closed"},
+        {"group_id": g2, "status": "closed"},
+    ]}
+    # The other chat's group must be untouched.
+    remaining_other = [t for t in tm.trades.values() if t.group_id == other_chat_group]
+    assert len(remaining_other) == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_isolates_a_real_exception_in_one_group():
+    """
+    A real exception (not just a failed retcode) while processing one
+    group must not abort the whole request -- the other group of the same
+    chat_id must still be processed and reported (chat_id-scoping spec
+    section 5, per-group isolation).
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    g1_ticket = next(t.ticket for t in tm.trades.values() if t.group_id == g1)
+    real_partial_close = sim.partial_close
+
+    def _boom(account, ticket, pct):
+        if ticket == g1_ticket:
+            raise RuntimeError("simulated RPyC network failure")
+        return real_partial_close(account, ticket, pct)
+
+    sim.partial_close = _boom
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close both", correction=None)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[g1] == {"group_id": g1, "status": "failed", "reason": "exception"}
+    assert results_by_group[g2] == {"group_id": g2, "status": "closed"}
+    # g2 must have actually been closed in spite of g1's exception.
+    remaining_g2 = [t for t in tm.trades.values() if t.group_id == g2]
+    assert remaining_g2 == []
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_one_group_fails_partial_close_other_still_closes():
+    """
+    partial_close returns a plain bool (SimuladorMT5.partial_close and the real
+    MT5Client.partial_close both do -- no .retcode involved). If the broker
+    rejects the close for a group's leg (returns False, no exception raised),
+    that leg must stay tracked in self.trades (still open, still needs
+    mechanical management) and the group's result must be "failed" with
+    reason "partial_close_rejected" instead of "closed" -- the group must
+    NOT be closed in the store either. A sibling group of the same chat_id
+    whose partial_close succeeds must still close normally and be reported
+    "closed", independent of the other group's failure (chat_id-scoping spec
+    section 5, per-group isolation -- this is a different failure mode than
+    a raised exception, and both must coexist).
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g_fail = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g_ok = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    fail_tickets = {t.ticket for t in tm.trades.values() if t.group_id == g_fail}
+    ok_tickets = {t.ticket for t in tm.trades.values() if t.group_id == g_ok}
+    real_partial_close = sim.partial_close
+
+    def _maybe_reject(account, ticket, pct):
+        if ticket in fail_tickets:
+            return False
+        return real_partial_close(account, ticket, pct)
+
+    sim.partial_close = _maybe_reject
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close both", correction=None)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[g_fail] == {"group_id": g_fail, "status": "failed", "reason": "partial_close_rejected"}
+    assert results_by_group[g_ok] == {"group_id": g_ok, "status": "closed"}
+
+    remaining_tickets = set(tm.trades.keys())
+    assert fail_tickets.issubset(remaining_tickets)
+    assert remaining_tickets.isdisjoint(ok_tickets)
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_applies_to_all_groups_with_mixed_outcomes():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    # Force g2's runner to already be at/above BE so it reports already_satisfied.
+    g2_tp1 = next(t for t in tm.trades.values() if t.group_id == g2 and t.leg == "tp1")
+    g2_runner = next(t for t in tm.trades.values() if t.group_id == g2 and t.leg == "runner")
+    del sim.positions[g2_tp1.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied to g2's runner at 2500
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="be now", correction=None)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[g1]["status"] == "applied"
+    assert results_by_group[g2]["status"] == "already_satisfied"
+    g1_runner = next(t for t in tm.trades.values() if t.group_id == g1 and t.leg == "runner")
+    assert tm.trades[g1_runner.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_reports_no_active_trade_for_a_group_without_runner_and_notifies():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del tm.trades[runner_leg.ticket]  # simulate the runner leg missing entirely
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="be now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "no_active_trade"}]}
+    events = [kwargs for event, kwargs in tm.notifier.events if event == "mgmt_no_runner_leg"]
+    assert len(events) == 1
+    assert events[0]["group_id"] == group_id
+    assert events[0]["chat_id"] == CHAT_ID
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_with_missing_entry_price_reports_failed_not_raise():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    runner_leg.entry_price = None
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="be now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "failed", "reason": "no_entry_price"}]}
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_note_sl_hit_notifies_once_per_group_without_touching_mt5():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs_before = {t.ticket: sim.positions_get(ticket=t.ticket)[0].sl for t in tm.trades.values()}
+
+    result = await tm.apply_mgmt_action(action="note_sl_hit", chat_id=CHAT_ID, raw_text="HIT SL", correction=None)
+
+    assert result == {"status": "noted", "group_ids": [g1, g2]}
+    for ticket, sl_before in legs_before.items():
+        assert sim.positions_get(ticket=ticket)[0].sl == sl_before
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_signal_correction_applies_only_to_the_most_recent_group():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(
+        action="signal_correction", chat_id=CHAT_ID, raw_text="TP2 IS 4687",
+        correction={"field": "tp2", "value": 4687.0},
+    )
+
+    assert result == {"status": "applied", "group_id": g2}
+    g1_runner = next(t for t in tm.trades.values() if t.group_id == g1 and t.leg == "runner")
+    g2_runner = next(t for t in tm.trades.values() if t.group_id == g2 and t.leg == "runner")
+    assert g1_runner.tp2_price == 2530.0  # untouched
+    assert g2_runner.tp2_price == 4687.0
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_signal_correction_with_invalid_field_notifies_and_returns_invalid_correction():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(
+        action="signal_correction", chat_id=CHAT_ID, raw_text="volume is 2 lots",
+        correction={"field": "volume", "value": 2.0},
+    )
+
+    assert result == {"status": "invalid_correction"}
+    events = [kwargs for event, kwargs in tm.notifier.events if event == "mgmt_invalid_correction"]
+    assert len(events) == 1
+    assert "volume" in events[0]["message"]
+    assert "volume is 2 lots" in events[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_ignore_is_a_noop_and_does_not_notify():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="ignore", chat_id=CHAT_ID, raw_text="spam your feedbacks", correction=None)
+
+    assert result == {"status": "ignored"}
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_unknown_action_notifies_and_returns_unknown_action():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="frobnicate", chat_id=CHAT_ID, raw_text="do the thing", correction=None)
+
+    assert result == {"status": "unknown_action"}
+    events = [kwargs for event, kwargs in tm.notifier.events if event == "mgmt_unknown_action"]
+    assert len(events) == 1
+    assert "frobnicate" in events[0]["message"]
+    assert "do the thing" in events[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_account_unresolved_notifies_per_group_and_reports_failed():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    for t in tm.trades.values():
+        if t.group_id == group_id:
+            t.account_name = "nonexistent-account"
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "failed", "reason": "account_unresolved"}]}
+    events = [kwargs for event, kwargs in tm.notifier.events if event == "mgmt_account_unresolved"]
+    assert len(events) == 1
+    assert events[0]["group_id"] == group_id
+    assert events[0]["chat_id"] == CHAT_ID
+
+
+@pytest.mark.asyncio
+async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing_still_progresses():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
+
+    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = 2510 + 10 = 2520
+    sim.positions[runner_leg.ticket]["price_current"] = 2540.0
+    sim.price = 2540.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_after_trailing = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert abs(sl_after_trailing - 2520.0) < 1e-6
+
+    # A signal_correction that only touches tp2 must NOT regress the live SL
+    # back down to the original planned_sl (2490).
+    result = await tm.apply_mgmt_action(
+        action="signal_correction", chat_id=CHAT_ID, raw_text="TP2 correction",
+        correction={"field": "tp2", "value": 4687.0},
+    )
+    assert result == {"status": "applied", "group_id": group_id}
+    sl_after_correction = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_after_correction == sl_after_trailing  # unchanged, never regressed
+    assert sl_after_correction >= 2500.0  # still at/above BE, not stranded below entry
+
+    # Trailing must still be able to progress afterward with a further price move.
+    sim.positions[runner_leg.ticket]["price_current"] = 2600.0
+    sim.price = 2600.0
+    await tm._tick_once_account(ACCOUNT)
+    sl_after_further_move = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert sl_after_further_move >= sl_after_correction  # trailing not dead/frozen
+
+
+@pytest.mark.asyncio
+async def test_mgmt_close_now_closes_the_group_in_the_store():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close it", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "closed"}]}
+    assert group_id in store.closed
+
+
+@pytest.mark.asyncio
+async def test_mgmt_close_now_message_includes_entry_and_close_price_per_leg():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="Close now", correction=None)
+
+    assert result["status"] == "completed"
+    close_events = [kwargs for event, kwargs in notifier.events if event == "mgmt_close_now"]
+    assert len(close_events) == 1
+    message = close_events[0]["message"]
+    assert "tp1" in message
+    assert "runner" in message
+    assert "2500.0" in message or "2500.00000" in message  # entry price for both legs
 
 
 @pytest.mark.asyncio
@@ -284,155 +672,7 @@ async def test_trailing_extrapolates_unit_beyond_tp2():
     assert abs(runner_pos.sl - 2520.0) < 1e-6
 
 
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_close_now_closes_both_legs_before_tp1():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-
-    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="Close now", correction=None)
-
-    assert result["status"] == "closed"
-    remaining = [t for t in tm.trades.values() if t.group_id == group_id]
-    assert remaining == []
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_no_active_trade_returns_no_active_trade():
-    sim = SimuladorMT5()
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-
-    result = await tm.apply_mgmt_action(action="close_now", symbol="EURUSD", raw_text="Close now", correction=None)
-
-    assert result["status"] == "no_active_trade"
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_move_sl_be_now_forces_be_when_worse():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
-    # SL still at original 2490 (TP1 not hit yet) — worse than BE (2500 entry)
-
-    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="adjust sl to entry", correction=None)
-
-    assert result["status"] == "applied"
-    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert abs(runner_pos.sl - 2500.0) < 1e-6
-    assert tm.trades[runner_leg.ticket].be_applied is True
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_move_sl_be_now_noop_when_already_better():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
-    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
-    del sim.positions[tp1_leg.ticket]
-    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
-    sim.positions[runner_leg.ticket]["price_current"] = 2522.0
-    sim.price = 2522.0
-    await tm._tick_once_account(ACCOUNT)  # trailing raises SL above BE
-    sl_before = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert sl_before > 2500.0
-
-    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="secure be", correction=None)
-
-    assert result["status"] == "already_satisfied"
-    sl_after = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert sl_after == sl_before  # unchanged, never reduced
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_note_sl_hit_does_not_touch_mt5():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    legs_before = {t.ticket: (sim.positions_get(ticket=t.ticket)[0].sl) for t in tm.trades.values() if t.group_id == group_id}
-
-    result = await tm.apply_mgmt_action(action="note_sl_hit", symbol="XAUUSD", raw_text="HIT SL, recovery incoming", correction=None)
-
-    assert result["status"] == "noted"
-    for ticket, sl_before in legs_before.items():
-        assert sim.positions_get(ticket=ticket)[0].sl == sl_before
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_signal_correction_updates_tp1_on_mt5_and_tp2_reference_only():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
-    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
-
-    result = await tm.apply_mgmt_action(action="signal_correction", symbol="XAUUSD", raw_text="TP 2 IS 4687 Correction", correction={"field": "tp2", "value": 4687.0})
-
-    assert result["status"] == "applied"
-    assert tm.trades[runner_leg.ticket].tp2_price == 4687.0
-    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert runner_pos.tp != 4687.0  # never sent to MT5 for the runner leg
-
-
-@pytest.mark.asyncio
-async def test_apply_mgmt_action_ignore_is_a_noop():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-
-    result = await tm.apply_mgmt_action(action="ignore", symbol="XAUUSD", raw_text="spam your feedbacks", correction=None)
-
-    assert result["status"] == "ignored"
-
-
 # --- Review fix 1: update_group_signal must not regress a trailed/BE'd SL ---
-
-@pytest.mark.asyncio
-async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing_still_progresses():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
-    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
-    del sim.positions[tp1_leg.ticket]
-    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
-
-    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = 2510 + 10 = 2520
-    sim.positions[runner_leg.ticket]["price_current"] = 2540.0
-    sim.price = 2540.0
-    await tm._tick_once_account(ACCOUNT)
-    sl_after_trailing = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert abs(sl_after_trailing - 2520.0) < 1e-6
-
-    # A signal_correction that only touches tp2 must NOT regress the live SL
-    # back down to the original planned_sl (2490).
-    result = await tm.apply_mgmt_action(
-        action="signal_correction", symbol="XAUUSD", raw_text="TP2 correction",
-        correction={"field": "tp2", "value": 4687.0},
-    )
-    assert result["status"] == "applied"
-    sl_after_correction = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert sl_after_correction == sl_after_trailing  # unchanged, never regressed
-    assert sl_after_correction >= 2500.0  # still at/above BE, not stranded below entry
-
-    # Trailing must still be able to progress afterward with a further price move.
-    # unit is now huge (tp2=4687, tp1=2510), so even a further advance keeps the
-    # multiple tiny — but peak_multiple must have been rescaled (not stuck at the
-    # old 1.5), so a genuine further advance still raises SL further.
-    sim.positions[runner_leg.ticket]["price_current"] = 2600.0
-    sim.price = 2600.0
-    await tm._tick_once_account(ACCOUNT)
-    sl_after_further_move = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert sl_after_further_move >= sl_after_correction  # trailing not dead/frozen
-
 
 @pytest.mark.asyncio
 async def test_update_group_signal_skips_sl_write_when_current_is_already_better():
@@ -474,22 +714,62 @@ async def test_find_active_group_for_symbol_tie_breaks_on_group_id_when_opened_t
     assert found == g2  # the higher group_id (the actually-newer group) wins
 
 
-# --- Review fix 3: entry_price=None must not raise ---
+# --- chat_id-scoping: find_active_groups_for_chat ---
 
 @pytest.mark.asyncio
-async def test_move_sl_be_now_with_missing_entry_price_returns_failed_not_raise():
+async def test_find_active_groups_for_chat_returns_all_groups_oldest_first():
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
-    runner_leg.entry_price = None
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+    g2 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatB")
 
-    result = await tm.apply_mgmt_action(action="move_sl_be_now", symbol="XAUUSD", raw_text="be now", correction=None)
+    found = tm.find_active_groups_for_chat("chatA")
 
-    assert result["status"] == "failed"
-    assert result.get("reason") == "no_entry_price"
+    assert found == [g1, g2]
 
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_returns_empty_list_for_unknown_chat():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+
+    found = tm.find_active_groups_for_chat("chatZ")
+
+    assert found == []
+
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_never_returns_orphaned_none_chat_id_groups():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    # Opened without chat_id (legacy / test default) -- an orphan.
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    found_for_none = tm.find_active_groups_for_chat(None)
+    found_for_real_chat = tm.find_active_groups_for_chat("chatA")
+
+    assert found_for_none == []  # querying with None must not match orphans either
+    assert found_for_real_chat == []
+
+
+@pytest.mark.asyncio
+async def test_find_active_groups_for_chat_deduplicates_group_ids_across_both_legs():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="chatA")
+
+    found = tm.find_active_groups_for_chat("chatA")
+
+    assert found == [g1]  # not [g1, g1] -- one entry per group, not per leg
+
+
+# --- Review fix 3: entry_price=None must not raise ---
 
 @pytest.mark.asyncio
 async def test_on_tp1_leg_closed_with_missing_entry_price_does_not_raise():
@@ -806,20 +1086,6 @@ async def test_both_legs_closing_closes_the_group_in_the_store():
 
 
 @pytest.mark.asyncio
-async def test_mgmt_close_now_closes_the_group_in_the_store():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    store = RecordingStore()
-    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-
-    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="close it", correction=None)
-
-    assert result["status"] == "closed"
-    assert group_id in store.closed
-
-
-@pytest.mark.asyncio
 async def test_no_state_store_is_a_safe_default():
     """TradeManager() without state_store (existing callers, all prior tests) must keep working unchanged."""
     sim = SimuladorMT5()
@@ -829,6 +1095,22 @@ async def test_no_state_store_is_a_safe_default():
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
     assert group_id is not None  # did not raise despite no store configured
+
+
+@pytest.mark.asyncio
+async def test_group_doc_includes_chat_id():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0,
+        chat_id="-1001234567890",
+    )
+
+    doc = tm._group_doc(group_id)
+    assert doc["chat_id"] == "-1001234567890"
 
 
 # --- Task 4: reconcile_from_mt5 startup recovery ---
@@ -871,6 +1153,73 @@ async def test_reconcile_recovers_full_state_from_store():
     assert runner.tp2_price == 2530.0
     assert runner.be_applied is True
     assert runner.peak_multiple == 0.35
+
+
+@pytest.mark.asyncio
+async def test_reconcile_inherits_chat_id_from_store_doc():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "chat_id": "-1001234567890",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": tp1_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": True, "peak_multiple": 0.35},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert tm.trades[tp1_ticket].chat_id == "-1001234567890"
+    assert tm.trades[runner_ticket].chat_id == "-1001234567890"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_chat_id_none_when_store_doc_predates_the_field():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP1-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP1-runner")
+    store.docs[1] = {
+        # Legacy doc persisted before chat_id existed -- no "chat_id" key at all.
+        "group_id": 1, "account_name": "demo", "symbol": "XAUUSD", "direction": "BUY",
+        "tp1_price": 2510.0, "tp2_price": 2530.0,
+        "legs": {
+            "tp1": {"ticket": tp1_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": False, "peak_multiple": 0.0},
+            "runner": {"ticket": runner_ticket, "planned_sl": 2490.0, "entry_price": 2500.0, "be_applied": True, "peak_multiple": 0.35},
+        },
+    }
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert tm.trades[tp1_ticket].chat_id is None
+    assert tm.trades[runner_ticket].chat_id is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_degraded_mode_leaves_chat_id_none():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()  # empty docs -- every group_id misses, forcing degraded mode
+
+    tp1_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=2510.0, comment="TM-GRP7-tp1")
+    runner_ticket = _open_raw_position(sim, ticket_price=2500.0, sl=2490.0, tp=0.0, comment="TM-GRP7-runner")
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+
+    summary = await tm.reconcile_from_mt5([ACCOUNT])
+
+    assert summary["degraded"] == 1
+    assert tm.trades[tp1_ticket].chat_id is None
+    assert tm.trades[runner_ticket].chat_id is None
 
 
 @pytest.mark.asyncio
@@ -1048,25 +1397,6 @@ async def test_tp1_hit_message_includes_entry_and_close_price():
     message = tp1_events[0]["message"]
     assert str(tp1_leg.entry_price) in message
     assert "2510.0" in message or "2510.00000" in message
-
-
-@pytest.mark.asyncio
-async def test_mgmt_close_now_message_includes_entry_and_close_price_per_leg():
-    sim = SimuladorMT5()
-    sim.price = 2500.0
-    notifier = DummyNotifier()
-    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
-    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
-
-    result = await tm.apply_mgmt_action(action="close_now", symbol="XAUUSD", raw_text="Close now", correction=None)
-
-    assert result["status"] == "closed"
-    close_events = [kwargs for event, kwargs in notifier.events if event == "mgmt_close_now"]
-    assert len(close_events) == 1
-    message = close_events[0]["message"]
-    assert "tp1" in message
-    assert "runner" in message
-    assert "2500.0" in message or "2500.00000" in message  # entry price for both legs
 
 
 @pytest.mark.asyncio
