@@ -25,7 +25,69 @@ async def test_send_event_posts_json_and_returns_true_on_success(monkeypatch):
 
     assert ok is True
     assert captured["url"] == "https://n8n.example.com/webhook/trades"
-    assert captured["json"] == {"event": "trade_opened", "ticket": 123, "symbol": "XAUUSD"}
+    # El payload siempre se ajusta al esquema de la tabla n8n: group_id, leg,
+    # symbol, action, message. "event" mapea a "action"; cualquier campo que
+    # no encaje en el esquema (aqui "ticket") se serializa dentro de "message".
+    assert captured["json"] == {
+        "group_id": None,
+        "leg": None,
+        "symbol": "XAUUSD",
+        "action": "trade_opened",
+        "message": '{"ticket": 123}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_event_fits_full_schema_fields_without_touching_message(monkeypatch):
+    captured = {}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse(200)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    notifier = N8nWebhookNotifier(webhook_url="https://n8n.example.com/webhook/trades")
+    ok = await notifier.send_event(
+        "group_opened", group_id=7, leg="tp1", symbol="XAUUSD", message="Grupo 7 abierto.",
+    )
+
+    assert ok is True
+    # Cuando todos los campos ya encajan en el esquema, el payload sale exacto,
+    # sin nada anexado a message.
+    assert captured["json"] == {
+        "group_id": 7,
+        "leg": "tp1",
+        "symbol": "XAUUSD",
+        "action": "group_opened",
+        "message": "Grupo 7 abierto.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_event_appends_extra_fields_to_existing_message(monkeypatch):
+    captured = {}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse(200)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    notifier = N8nWebhookNotifier(webhook_url="https://n8n.example.com/webhook/trades")
+    ok = await notifier.send_event(
+        "trailing_updated", group_id=3, ticket=999, peak_multiple=1.5, message="Trailing SL actualizado.",
+    )
+
+    assert ok is True
+    payload = captured["json"]
+    assert payload["group_id"] == 3
+    assert payload["leg"] is None
+    assert payload["symbol"] is None
+    assert payload["action"] == "trailing_updated"
+    assert payload["message"].startswith("Trailing SL actualizado. | extra=")
+    assert '"ticket": 999' in payload["message"]
+    assert '"peak_multiple": 1.5' in payload["message"]
 
 
 @pytest.mark.asyncio
