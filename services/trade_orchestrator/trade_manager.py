@@ -663,14 +663,29 @@ class TradeManager:
                         continue
                     client = self.mt5._client_for(account)
                     leg_summaries = []
+                    any_leg_failed = False
                     for t in list(legs):
-                        await self._call(client.partial_close, account, t.ticket, 100)
+                        ok = await self._call(client.partial_close, account, t.ticket, 100)
+                        if not ok:
+                            any_leg_failed = True
+                            log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
+                                      t.ticket, t.leg, group_id)
+                            continue
                         close_price = await self._get_close_price(client, t.ticket)
                         leg_summaries.append(
                             f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
                             f"cierre {self._fmt_price(close_price)})"
                         )
                         self.trades.pop(t.ticket, None)
+                    if any_leg_failed:
+                        await self._notify(
+                            "mgmt_close_now_partial_failure", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
+                            message=f"Grupo {group_id}: al menos una pierna no pudo cerrarse via /mgmt/action "
+                                    f"(partial_close rechazado por el broker). Piernas cerradas: "
+                                    f"{', '.join(leg_summaries) if leg_summaries else 'ninguna'}. Texto original: {raw_text!r}",
+                        )
+                        results.append({"group_id": group_id, "status": "failed", "reason": "partial_close_rejected"})
+                        continue
                     await self._notify(
                         "mgmt_close_now", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
                         message=f"Grupo {group_id} cerrado manualmente via /mgmt/action: "

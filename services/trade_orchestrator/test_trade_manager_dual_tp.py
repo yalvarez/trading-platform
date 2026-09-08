@@ -256,6 +256,49 @@ async def test_apply_mgmt_action_close_now_isolates_a_real_exception_in_one_grou
 
 
 @pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_one_group_fails_partial_close_other_still_closes():
+    """
+    partial_close returns a plain bool (SimuladorMT5.partial_close and the real
+    MT5Client.partial_close both do -- no .retcode involved). If the broker
+    rejects the close for a group's leg (returns False, no exception raised),
+    that leg must stay tracked in self.trades (still open, still needs
+    mechanical management) and the group's result must be "failed" with
+    reason "partial_close_rejected" instead of "closed" -- the group must
+    NOT be closed in the store either. A sibling group of the same chat_id
+    whose partial_close succeeds must still close normally and be reported
+    "closed", independent of the other group's failure (chat_id-scoping spec
+    section 5, per-group isolation -- this is a different failure mode than
+    a raised exception, and both must coexist).
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g_fail = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g_ok = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    fail_tickets = {t.ticket for t in tm.trades.values() if t.group_id == g_fail}
+    ok_tickets = {t.ticket for t in tm.trades.values() if t.group_id == g_ok}
+    real_partial_close = sim.partial_close
+
+    def _maybe_reject(account, ticket, pct):
+        if ticket in fail_tickets:
+            return False
+        return real_partial_close(account, ticket, pct)
+
+    sim.partial_close = _maybe_reject
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close both", correction=None)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[g_fail] == {"group_id": g_fail, "status": "failed", "reason": "partial_close_rejected"}
+    assert results_by_group[g_ok] == {"group_id": g_ok, "status": "closed"}
+
+    remaining_tickets = set(tm.trades.keys())
+    assert fail_tickets.issubset(remaining_tickets)
+    assert remaining_tickets.isdisjoint(ok_tickets)
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_move_sl_be_now_applies_to_all_groups_with_mixed_outcomes():
     sim = SimuladorMT5()
     sim.price = 2500.0
