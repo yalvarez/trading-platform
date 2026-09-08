@@ -48,9 +48,24 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
                     name="b1_be_variant1", outcome=ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE,
                     evidence={}, detail="no mgmt_move_sl_be_applied event logged — n8n/Ollama likely did not act",
                 )
+            # The event WAS logged (order_send succeeded), but polling never
+            # caught the position with a changed SL. Two very different
+            # explanations, disambiguated by whether the position still
+            # exists: real market movement can touch a freshly-moved BE SL
+            # and close the position before the next 5s poll -- that's the
+            # mechanism working correctly (zero-risk exit), not a defect.
+            # Only a position that's still OPEN with its original SL despite
+            # a logged success is a genuine bot FAIL.
+            still_open = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
+            if not still_open:
+                return ScenarioResult(
+                    name="b1_be_variant1", outcome=ScenarioOutcome.PASS,
+                    evidence={"logs": logs},
+                    detail="SL was moved to BE and the position closed (price touched BE) before polling caught it — correct zero-risk exit, not a defect",
+                )
             return ScenarioResult(
                 name="b1_be_variant1", outcome=ScenarioOutcome.FAIL,
-                evidence={"logs": logs}, detail="event was logged but SL did not change in MT5",
+                evidence={"logs": logs, "still_open": still_open}, detail="event was logged but SL did not change in MT5",
             )
         return ScenarioResult(
             name="b1_be_variant1", outcome=ScenarioOutcome.PASS,

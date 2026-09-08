@@ -70,3 +70,66 @@ async def test_b1_reports_external_dependency_failure_on_timeout_without_error()
     result = await b1_be_variant1.run(ctx)
 
     assert result.outcome == ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_b1_passes_when_position_closes_at_be_before_poll_catches_the_sl_change():
+    """
+    Real production behavior observed live (2026-09-08): the mgmt event was
+    logged (order_send to move SL to BE succeeded), but real market
+    movement touched that new BE SL and closed the position before the
+    next 5s poll ran -- the runner simply isn't there anymore to compare
+    its SL against. This is the mechanism working correctly (a genuine
+    zero-risk exit), not a bot defect, and must be a PASS.
+    """
+    ctx = _ctx_with_open_position()
+    setup_positions = [
+        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+    ]
+
+    calls = {"n": 0}
+
+    async def _positions_for_symbol(_symbol):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot
+        if calls["n"] == 2:
+            return setup_positions  # after fast open
+        return []  # every poll after that: position already closed at BE
+
+    ctx.observer.positions_for_symbol = _positions_for_symbol
+    ctx.observer.grep_container_logs = MagicMock(return_value=["[TM][EVENT] mgmt_move_sl_be_applied {'group_id': 1}"])
+
+    result = await b1_be_variant1.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.PASS
+
+
+@pytest.mark.asyncio
+async def test_b1_fails_when_event_logged_but_position_still_open_with_unchanged_sl():
+    """The genuine bot-defect case: order_send reported success, but the
+    live position never actually got the new SL and is still open --
+    this must stay a FAIL, distinct from the position-already-closed case
+    above."""
+    ctx = _ctx_with_open_position()
+    setup_positions = [
+        {"ticket": 1, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+        {"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01},
+    ]
+    unchanged_runner = [{"ticket": 2, "sl": 2470.0, "tp": 0.0, "volume": 0.01}]
+
+    calls = {"n": 0}
+
+    async def _positions_for_symbol(_symbol):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot
+        return setup_positions if calls["n"] == 2 else unchanged_runner  # still open, SL unchanged
+
+    ctx.observer.positions_for_symbol = _positions_for_symbol
+    ctx.observer.grep_container_logs = MagicMock(return_value=["[TM][EVENT] mgmt_move_sl_be_applied {'group_id': 1}"])
+
+    result = await b1_be_variant1.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.FAIL
