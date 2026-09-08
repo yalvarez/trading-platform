@@ -561,17 +561,11 @@ class TradeManager:
         # Bug real de produccion: marcarlo incondicionalmente dejaba el runner en
         # un estado inconsistente cuando el BE fallaba — el guard de _apply_trailing
         # (que exige be_applied) dejaba de bloquearlo, y el trailing intentaba
-        # correr sobre un SL que en realidad nunca se movio a breakeven. Reintenta
-        # unas pocas veces (mismo patron que _get_price_with_retry) antes de darse
-        # por vencido: este es el unico momento en que se dispara el BE — si se
-        # pierde aqui sin reintentar, el runner queda huerfano de BE para siempre.
-        ok = False
-        for attempt in range(1, 4):
-            ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
-            if ok:
-                break
-            if attempt < 3:
-                await asyncio.sleep(0.2)
+        # correr sobre un SL que en realidad nunca se movio a breakeven.
+        # _force_runner_sl ya reintenta internamente (este es el unico momento
+        # en que se dispara el BE — si se pierde aqui sin reintentar, el runner
+        # queda huerfano de BE para siempre).
+        ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
         if ok:
             runner.be_applied = True
             close_price = await self._get_close_price(client, tp1_leg.ticket)
@@ -615,16 +609,35 @@ class TradeManager:
     def _fmt_price(price: Optional[float]) -> str:
         return f"{price:.5f}" if price is not None else "N/D"
 
-    async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str) -> bool:
+    async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str, attempts: int = 3, retry_delay_seconds: float = 0.2) -> bool:
+        """
+        Mueve el SL del runner via order_send, reintentando unas pocas veces
+        antes de darse por vencido. Real production bug: un solo intento no
+        distinguia un rechazo transitorio de MT5 (el mas comun: el SL
+        candidato cae dentro de trade_stops_level, el minimo de distancia al
+        precio vivo que el broker exige — confirmado en logs reales sin
+        retcode, "[TM] fallo moviendo SL ... reason=trailing/TP1-BE/mgmt-fallback-BE")
+        de un fallo real. Cualquier caller de _force_runner_sl (BE automatico
+        al cerrar TP1, trailing mecanico, o move_sl_be_now via /mgmt/action)
+        se beneficia del mismo reintento sin duplicar su propio loop —
+        centralizado aqui en vez de en cada caller, mismo patron que
+        _get_price_with_retry ya usa para tick_price.
+        """
         # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida
         # mecanica es el trailing SL) -- omitir "tp" en un request action=6 puede
         # limpiar o preservar el TP existente segun el broker, asi que lo fijamos
         # explicitamente en vez de depender de ese comportamiento implicito.
         req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": 0.0}
-        res = await self._call(client.order_send, req)
-        ok = bool(res and getattr(res, "retcode", None) == 10009)
+        ok = False
+        for attempt in range(1, attempts + 1):
+            res = await self._call(client.order_send, req)
+            ok = bool(res and getattr(res, "retcode", None) == 10009)
+            if ok:
+                break
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay_seconds)
         if not ok:
-            log.error("[TM] fallo moviendo SL runner=%s reason=%s", runner.ticket, reason)
+            log.error("[TM] fallo moviendo SL runner=%s reason=%s tras %d intentos", runner.ticket, reason, attempts)
         return ok
 
     async def _apply_trailing(self, account, client, runner: ManagedTrade, pos) -> None:

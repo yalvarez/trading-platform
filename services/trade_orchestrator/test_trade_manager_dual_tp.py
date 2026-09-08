@@ -321,6 +321,47 @@ async def test_apply_mgmt_action_move_sl_be_now_applies_to_all_groups_with_mixed
 
 
 @pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_retries_a_transient_mt5_rejection():
+    """
+    Real production bug found live via the e2e suite (2026-09-08): n8n
+    correctly classified "Set BE for zero risk" and called /mgmt/action,
+    but MT5 rejected the order_send on the first attempt (price too close
+    to the candidate SL, per the broker's trade_stops_level) and
+    move_sl_be_now gave up after a single try -- unlike _on_tp1_leg_closed's
+    automatic BE, which already retried. _force_runner_sl now retries
+    internally (shared by every caller), so a transient rejection that
+    clears up a moment later (e.g. price ticks forward slightly) must
+    still succeed instead of being reported as a hard failure.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    real_order_send = sim.order_send
+    call_count = {"n": 0}
+
+    def flaky_order_send(req):
+        if req.get("action") == 6 and req.get("position") == runner_leg.ticket:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First attempt: broker rejects (too close to live price).
+                return type('OrderSendResult', (), {'retcode': 10016, 'order': 0, 'deal': 0, 'comment': 'Invalid stops'})()
+        return real_order_send(req)
+
+    sim.order_send = flaky_order_send
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="Set BE for zero risk", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "applied"}]}
+    assert call_count["n"] == 2  # failed once, succeeded on retry
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_move_sl_be_now_reports_no_active_trade_for_a_group_without_runner_and_notifies():
     sim = SimuladorMT5()
     sim.price = 2500.0
