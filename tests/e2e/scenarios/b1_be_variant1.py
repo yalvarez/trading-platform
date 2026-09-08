@@ -9,6 +9,8 @@ section 3.1). n8n/Ollama is the real test instance, not a mock (spec
 section 2) -- a timeout with no mgmt event logged is reported as an
 external dependency failure, not a bot FAIL (spec section 7).
 """
+import asyncio
+
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
 from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
@@ -16,6 +18,17 @@ from tests.e2e.scenarios._management_common import open_position_for_management_
 MGMT_POLL_TIMEOUT_SECONDS = 120
 MGMT_POLL_INTERVAL_SECONDS = 5
 MESSAGE = "Set BE for zero risk"
+
+# Real production behavior observed live (2026-09-08): MT5 enforces a
+# minimum distance (trade_stops_level) between any SL and the live price.
+# Right after opening, price is still essentially at entry, so a BE request
+# sent immediately almost always lands inside that minimum and gets
+# rejected -- not a bot defect (see INCONCLUSIVE_MT5_REJECTED_BE below),
+# but it defeats this scenario's actual purpose (confirming n8n correctly
+# classifies and executes "Set BE for zero risk") by hitting the same
+# market-timing edge case nearly every run. Give price real time to move
+# away from entry before asking for BE.
+PRE_MESSAGE_DELAY_SECONDS = 30.0
 
 
 async def run(ctx: ScenarioContext) -> ScenarioResult:
@@ -29,6 +42,7 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         )
     runner_sl_before = next(p["sl"] for p in positions)
 
+    await asyncio.sleep(PRE_MESSAGE_DELAY_SECONDS)
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, MESSAGE)
 
     try:
