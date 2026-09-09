@@ -173,3 +173,13 @@ class PooledMT5Client:
 
     def get_pip_size(self, symbol: str) -> float:
         return self._call("get_pip_size", symbol)
+
+    def history_deals_get(self, *args, **kwargs):
+        # Bug real de produccion: este passthrough faltaba, asi que todo
+        # llamador de TradeManager._get_close_price contra la cuenta real
+        # (PooledMT5Client, no el MT5Client directo que usan los tests)
+        # siempre fallaba con AttributeError, silenciado por el try/except
+        # de _get_close_price -- cada mensaje de cierre a n8n mostraba
+        # "N/D" en vez del precio real, y _tick_once_account no podia
+        # verificar si un cierre de tp1_leg realmente toco el TP1.
+        return self._call("history_deals_get", *args, **kwargs)

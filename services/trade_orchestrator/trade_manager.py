@@ -524,14 +524,27 @@ class TradeManager:
                 if ticket in pos_by_ticket:
                     continue
                 closed_trade = self.trades.pop(ticket)
-                if closed_trade.leg == "tp1":
+                # Real production bug: a tp1_leg disappearing from positions_get
+                # was ALWAYS treated as "TP1 reached", regardless of the real
+                # close price -- a SL hit, a manual close, or a test's own
+                # emergency cleanup on this same ticket all triggered the
+                # "TP1 alcanzado" flow (moving the runner to BE, incrementing
+                # TP1_HITS, and logging a false tp1_hit event to n8n). Confirmed
+                # live: a tp1_leg closed via partial_close (DEAL_REASON_CLIENT)
+                # at a loss, well below its own tp1_price, still got logged as
+                # a TP1 hit. Verify the real close price actually reached
+                # tp1_price (within half the entry->tp1 distance, to tolerate
+                # normal slippage) before treating this as a genuine TP1 event.
+                if closed_trade.leg == "tp1" and await self._closed_at_tp1(client, closed_trade):
                     await self._on_tp1_leg_closed(account, client, closed_trade)
                 else:
                     close_price = await self._get_close_price(client, ticket)
+                    leg_label = "Runner" if closed_trade.leg == "runner" else "tp1_leg"
                     await self._notify(
-                        "runner_closed", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
-                        message=f"Runner del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) se cerro "
-                                f"(SL o cierre manual). Precio de apertura {self._fmt_price(closed_trade.entry_price)}, "
+                        "runner_closed" if closed_trade.leg == "runner" else "tp1_leg_closed_not_at_tp1",
+                        group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
+                        message=f"{leg_label} del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) se cerro "
+                                f"(SL, cierre manual, u otra causa -- no fue TP1). Precio de apertura {self._fmt_price(closed_trade.entry_price)}, "
                                 f"precio de cierre {self._fmt_price(close_price)}.",
                     )
                 remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
@@ -553,6 +566,37 @@ class TradeManager:
 
         except Exception as e:
             log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)
+
+    async def _closed_at_tp1(self, client, tp1_leg: ManagedTrade) -> bool:
+        """
+        Verifica si tp1_leg realmente cerro en (o mas alla de) su propio
+        tp1_price, usando el precio real del deal de salida en MT5 -- no
+        solo el hecho de que la posicion ya no aparezca en positions_get.
+        Real production bug: cualquier cierre de tp1_leg (SL hit, cierre
+        manual via /mgmt/action o el cleanup de emergencia de una prueba,
+        un rechazo de broker, etc.) se trataba como "TP1 alcanzado" sin
+        esta verificacion.
+
+        Tolerancia: dentro de la mitad de la distancia entre entry_price y
+        tp1_price, para no rechazar un fill legitimo con slippage normal.
+        Si no hay tp1_price/entry_price registrados, o si el precio de
+        cierre no se pudo obtener (deal aun no propago, fallo de red),
+        se asume TP1 -- igual que el comportamiento anterior a este fix --
+        para no bloquear el BE automatico por un fallo transitorio de
+        verificacion en el caso comun (TP1 real).
+        """
+        if tp1_leg.tp1_price is None or tp1_leg.entry_price is None:
+            return True
+        close_price = await self._get_close_price(client, tp1_leg.ticket)
+        if close_price is None:
+            return True
+        is_buy = tp1_leg.direction == "BUY"
+        unit = (tp1_leg.tp1_price - tp1_leg.entry_price) if is_buy else (tp1_leg.entry_price - tp1_leg.tp1_price)
+        if unit <= 0:
+            return True
+        tolerance = unit / 2.0
+        advance = (close_price - tp1_leg.entry_price) if is_buy else (tp1_leg.entry_price - close_price)
+        return advance >= (unit - tolerance)
 
     async def _on_tp1_leg_closed(self, account, client, tp1_leg: ManagedTrade) -> None:
         """TP1 hit -> mueve el runner del mismo group_id a BE (dual-TP spec seccion 4)."""
@@ -795,31 +839,6 @@ class TradeManager:
             runner.peak_multiple = multiple
             log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")            
             await self._persist_group(runner.group_id)
-
-    @staticmethod
-    def _fmt_price(price: Optional[float]) -> str:
-        return f"{price:.5f}" if price is not None else "N/D"
-
-    async def _get_close_price(self, client, ticket: int) -> Optional[float]:
-        """
-        Busca el precio real de cierre de `ticket` en el historial de deals de MT5
-        (DEAL_ENTRY_OUT=1). Usado solo para enriquecer el mensaje descriptivo que
-        se manda a n8n -- nunca debe tumbar el flujo de notificacion, asi que
-        cualquier fallo (de red, o simplemente que el deal aun no propago)
-        devuelve None y el mensaje cae a un placeholder ("N/D").
-        """
-        try:
-            deals = await self._call(client.history_deals_get, position=ticket)
-        except Exception as e:
-            log.warning("[TM] fallo obteniendo historial de deals para ticket=%s: %s", ticket, e)
-            return None
-        if not deals:
-            return None
-        out_deals = [d for d in deals if getattr(d, "entry", None) == 1]
-        if not out_deals:
-            return None
-        closing = max(out_deals, key=lambda d: getattr(d, "time", 0))
-        return float(closing.price)
 
     async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict]) -> dict:
         """

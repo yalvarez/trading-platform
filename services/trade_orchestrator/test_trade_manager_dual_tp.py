@@ -664,6 +664,63 @@ async def test_tick_moves_runner_sl_to_be_when_tp1_leg_closes():
 
 
 @pytest.mark.asyncio
+async def test_tick_applies_be_when_tp1_leg_genuinely_closed_at_tp1_price():
+    """The real-deal-verified path: tp1_leg closes with a real out-deal
+    recorded exactly at (or beyond) tp1_price -- must still be treated as
+    a genuine TP1 hit and trigger BE, same as before this fix."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    sim.close_position_directly(tp1_leg.ticket, close_price=2510.0)  # closes exactly at tp1_price
+
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(runner_pos.sl - 2500.0) < 1e-6  # moved to entry price (BE)
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_tick_does_not_apply_be_when_tp1_leg_closed_at_a_loss_not_at_tp1():
+    """
+    Real production bug found live (2026-09-09): a tp1_leg closed via
+    partial_close (e.g. an e2e test's own emergency cleanup, or any other
+    out-of-band close) at a price BELOW entry -- a real loss, nowhere near
+    tp1_price -- and the system still logged it as "TP1 alcanzado" and
+    moved the runner to breakeven. The close price must actually reach
+    tp1_price (within tolerance) before triggering the BE flow; otherwise
+    this must be treated like any other non-TP1 closure (notify only, no
+    BE, no TP1_HITS increment).
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_sl_before = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+
+    # Closed at a small loss (entry=2500, close=2499.5) -- nowhere near tp1_price=2510.
+    sim.close_position_directly(tp1_leg.ticket, close_price=2499.5)
+
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.sl == runner_sl_before  # unchanged -- no BE applied
+    assert tm.trades[runner_leg.ticket].be_applied is False
+    tp1_hit_events = [kwargs for event, kwargs in notifier.events if event == "tp1_hit"]
+    assert tp1_hit_events == []
+    not_at_tp1_events = [kwargs for event, kwargs in notifier.events if event == "tp1_leg_closed_not_at_tp1"]
+    assert len(not_at_tp1_events) == 1
+    assert "2499.5" in not_at_tp1_events[0]["message"] or "2499.50000" in not_at_tp1_events[0]["message"]
+
+
+@pytest.mark.asyncio
 async def test_be_not_marked_applied_when_order_send_fails_after_all_retries():
     """
     Real production bug: be_applied was set True unconditionally after
