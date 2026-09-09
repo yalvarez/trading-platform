@@ -506,12 +506,13 @@ async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing
     del sim.positions[tp1_leg.ticket]
     await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
 
-    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> SL = entry(2500) + 10 = 2510
+    # Trail forward: price at 150% of unit past tp1 = 2510 + 30 = 2540 -> multiple=1.5,
+    # entry->tp1 dist=10 -> SL = entry(2500) + 1.5*10 = 2515
     sim.positions[runner_leg.ticket]["price_current"] = 2540.0
     sim.price = 2540.0
     await tm._tick_once_account(ACCOUNT)
     sl_after_trailing = sim.positions_get(ticket=runner_leg.ticket)[0].sl
-    assert abs(sl_after_trailing - 2510.0) < 1e-6
+    assert abs(sl_after_trailing - 2515.0) < 1e-6
 
     # A signal_correction that only touches tp2 must NOT regress the live SL
     # back down to the original planned_sl (2490).
@@ -530,6 +531,69 @@ async def test_signal_correction_after_trailing_does_not_regress_sl_and_trailing
     await tm._tick_once_account(ACCOUNT)
     sl_after_further_move = sim.positions_get(ticket=runner_leg.ticket)[0].sl
     assert sl_after_further_move >= sl_after_correction  # trailing not dead/frozen
+
+
+@pytest.mark.asyncio
+async def test_trailing_never_sends_a_candidate_worse_than_the_live_sl_after_unit_grows_a_lot():
+    """
+    Real production-shaped bug (2026-09-09), found re-testing the
+    signal_correction path after the offset was re-scaled by entry->tp1
+    instead of unit (see _apply_trailing's docstring). update_group_signal's
+    peak_multiple rescale correctly re-projects peak_multiple for the
+    "never decreases" GATE (multiple > peak_multiple) when tp1/tp2 change —
+    but that gate says nothing about the SL VALUE the next valid multiple
+    maps to via entry_to_tp1 (which the rescale doesn't touch). A large
+    enough correction to tp2 (growing unit a lot) can make a multiple that
+    legitimately clears the gate compute a new_sl, in absolute points,
+    BELOW the SL already sitting in MT5 — this test isolates that exact
+    mechanism: the candidate must be provably worse than the live SL, and
+    the guard must reject it without silently corrupting peak_multiple.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # BE applied at 2500
+
+    # Trail forward to multiple=1.5 -> SL = entry(2500) + 1.5*10 = 2515.
+    sim.positions[runner_leg.ticket]["price_current"] = 2540.0
+    sim.price = 2540.0
+    await tm._tick_once_account(ACCOUNT)
+    live_sl = sim.positions_get(ticket=runner_leg.ticket)[0].sl
+    assert abs(live_sl - 2515.0) < 1e-6
+    peak_before = tm.trades[runner_leg.ticket].peak_multiple
+
+    # A huge tp2 correction grows unit from 20 to 2177 — peak_multiple gets
+    # rescaled way down (still correctly gates future multiples), but
+    # entry_to_tp1 (10) is untouched.
+    await tm.apply_mgmt_action(
+        action="signal_correction", chat_id=CHAT_ID, raw_text="TP2 correction",
+        correction={"field": "tp2", "value": 4687.0},
+    )
+    rescaled_peak = tm.trades[runner_leg.ticket].peak_multiple
+    assert 0 < rescaled_peak < peak_before  # rescale did shrink it, as expected
+
+    # Price ticks up only slightly (2600) -- barely past tp1 relative to the
+    # new, much larger unit, but that's still enough multiple to clear the
+    # rescaled (tiny) peak_multiple gate.
+    sim.positions[runner_leg.ticket]["price_current"] = 2600.0
+    sim.price = 2600.0
+    new_tp1 = tm.trades[runner_leg.ticket].tp1_price
+    new_unit = tm.trades[runner_leg.ticket].tp2_price - new_tp1
+    new_multiple = (2600.0 - new_tp1) / new_unit
+    assert new_multiple > rescaled_peak  # confirms the gate WOULD clear
+    entry_to_tp1 = new_tp1 - 2500.0
+    raw_candidate = 2500.0 + new_multiple * entry_to_tp1
+    assert raw_candidate < live_sl  # confirms the candidate IS worse than live SL
+
+    await tm._tick_once_account(ACCOUNT)
+
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert runner_pos.sl == live_sl  # guard rejected the worse candidate, SL untouched
+    assert tm.trades[runner_leg.ticket].peak_multiple == rescaled_peak  # not corrupted by a rejected attempt
 
 
 @pytest.mark.asyncio
@@ -661,9 +725,9 @@ async def test_trailing_raises_runner_sl_proportionally_to_peak():
     sim.price = 2522.0
     await tm._tick_once_account(ACCOUNT)
 
-    # peak_multiple = 0.6, SL = entry + (0.6 * 20)/3 = 2500 + 4 = 2504
+    # peak_multiple = 0.6, entry->tp1 dist = 10, SL = entry + 0.6*10 = 2506
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert abs(runner_pos.sl - 2504.0) < 1e-6
+    assert abs(runner_pos.sl - 2506.0) < 1e-6
     assert abs(tm.trades[runner_leg.ticket].peak_multiple - 0.6) < 1e-9
 
 
@@ -697,8 +761,8 @@ async def test_trailing_at_peak_zero_equals_be_with_full_protective_margin():
     await tm._tick_once_account(ACCOUNT)
 
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    # multiple = 1/20 = 0.05 -> SL = entry + (0.05*20)/3 = 2500 + 0.333...
-    assert abs(runner_pos.sl - 2500.3333333333335) < 1e-6
+    # multiple = 1/20 = 0.05, entry->tp1 dist = 10 -> SL = entry + 0.05*10 = 2500.5
+    assert abs(runner_pos.sl - 2500.5) < 1e-6
     # The live price-to-SL distance is still close to the BE's own margin
     # (10 points), not collapsed to a couple of points like the old
     # tp1-anchored formula produced at this same price.
@@ -795,9 +859,10 @@ async def test_trailing_extrapolates_unit_beyond_tp2():
     sim.price = 2540.0
     await tm._tick_once_account(ACCOUNT)
 
-    # SL = entry + (1.5 * 20)/3 = 2500 + 10 = 2510
+    # multiple=1.5, entry->tp1 dist=10 -> SL = entry + 1.5*10 = 2515
+    # (already past tp1=2510 at this point, unlike the old unit-scaled offset)
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
-    assert abs(runner_pos.sl - 2510.0) < 1e-6
+    assert abs(runner_pos.sl - 2515.0) < 1e-6
 
 
 @pytest.mark.asyncio
@@ -810,12 +875,14 @@ async def test_trailing_peak_multiple_not_advanced_when_order_send_fails():
     real MT5 SL frozen at the last successfully-applied level while the
     orchestrator's internal peak kept climbing — so the next tick's
     "never decreases" guard silently discarded price levels that MT5
-    would have accepted, and a "trailing_updated" notification fired for
-    an SL that was never actually applied. The runner then got stopped
-    out by its stale real SL almost immediately after TP1, mirroring
-    _apply_be's already-fixed failure mode. peak_multiple must only
-    advance, and trailing_updated must only fire, when the order_send
-    attempt actually succeeds.
+    would have accepted. The runner then got stopped out by its stale
+    real SL almost immediately after TP1, mirroring _apply_be's
+    already-fixed failure mode. peak_multiple must only advance when the
+    order_send attempt actually succeeds — and (trailing_updated is now
+    logged only, not sent as a notify() event, to cut notification spam
+    from the ~100+ trailing ticks a single live trade can produce) no
+    "trailing_updated" event may reach the notifier for a failed attempt
+    either, since it's still gated by the same `if ok:` block.
     """
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -890,9 +957,12 @@ async def test_tp2_partial_close_takes_half_volume_and_keeps_trailing_on_remaind
 
     # Trailing still applied in the SAME tick, on the same entry-anchored
     # formula — tp2 is not a new anchor, peak_multiple/SL are unaffected by
-    # the partial close itself.
+    # the partial close itself. At multiple=1.0 (price exactly at tp2), the
+    # entry->tp1-scaled offset (2026-09-09 fix) makes SL land exactly on
+    # tp1_price (2510) — by design, this is what "reaching tp2" now means
+    # for the SL.
     assert abs(tm.trades[runner_leg.ticket].peak_multiple - 1.0) < 1e-9
-    assert abs(runner_pos.sl - (2500.0 + (1.0*20.0)/3.0)) < 1e-6
+    assert abs(runner_pos.sl - 2510.0) < 1e-6
 
     partial_events = [kwargs for event, kwargs in notifier.events if event == "tp2_partial_closed"]
     assert len(partial_events) == 1

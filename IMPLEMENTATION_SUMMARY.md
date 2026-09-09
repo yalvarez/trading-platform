@@ -96,8 +96,9 @@ Position 2 (ticket=12346): leg="runner", lot=0.01, group_id=12345
   - `current_advance = current_price - tp1_price` (BUY); reversed for SELL
   - `multiple = current_advance / unit` (ratio of how many "units" past tp1 the price has moved)
   - `peak_multiple = max(peak_multiple, multiple)` (only increases, never decreases)
-  - **New SL:** `new_sl = entry_price + (peak_multiple * unit) / 3` — anchored on the runner's entry/BE price, not tp1_price (revised 2026-09-08: anchoring on tp1_price left the SL only 0-3 points from the live price right after crossing TP1, tighter than BE's own margin, letting a normal pullback stop the runner almost simultaneously with the tp1 leg)
-- Example: if entry=2500, tp1=2515, tp2=2530 (unit=15), and price hits 2545 (multiple=2.0), then SL trails at 2500 + (2.0 * 15) / 3 = 2510 pips
+  - **New SL:** `new_sl = entry_price + peak_multiple * (tp1_price - entry_price)` — anchored on entry/BE, offset scaled by the entry→tp1 distance, not by unit (revised 2026-09-09: scaling by unit coupled two unrelated distances — the entry→tp1 span the SL actually has to cover vs. the tp1→tp2 span, an independent scale decision — leaving the SL far short of tp1 even at peak=1.0 in real cases; revised 2026-09-08: anchoring on tp1_price left the SL only 0-3 points from the live price right after crossing TP1, tighter than BE's own margin, letting a normal pullback stop the runner almost simultaneously with the tp1 leg)
+  - A guard compares the candidate against the SL already live in MT5 (`pos.sl`) and skips the update if it would be worse — needed because a large `signal_correction` to tp2 can grow `unit` enough that a newly-valid `peak_multiple` maps to a candidate below the live SL, even though the "never decreases" gate on `peak_multiple` itself is still correct
+- Example: if entry=2500, tp1=2515 (entry→tp1=15), and peak_multiple reaches 2.0, then SL trails at 2500 + 2.0 * 15 = 2530
 - **No cap:** If price runs far past tp2, peak_multiple can exceed 1.0 and the SL keeps trailing proportionally
 
 ---

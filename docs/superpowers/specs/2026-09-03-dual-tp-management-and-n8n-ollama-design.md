@@ -105,17 +105,43 @@ y `_maybe_addon_midpoint` de `trade_manager.py`.
   - `peak` = múltiplo máximo histórico de `unit` que el precio haya
     alcanzado desde TP1 (puede superar 1.0 indefinidamente; nunca
     disminuye).
-  - `SL_price = entry_price + (peak × unit) / 3` — el SL solo puede subir,
-    nunca baja, incluso si el precio retrocede desde el peak. **Revisado
-    2026-09-08:** la version original anclaba en `TP1_price` en vez de
-    `entry_price`. Como `peak` arranca cerca de 0 justo al cruzar TP1, esa
-    version dejaba el SL a solo 0-3 puntos del precio vivo en ese momento
-    — mas cerca que el propio colchon de BE — y un retroceso de precio
-    perfectamente normal alcanzaba para cerrar el runner casi junto con
-    `tp1_leg` (confirmado en produccion, grupo 60). Anclar en `entry_price`
-    hace que en `peak=0` el SL sea exactamente el BE ya aplicado, y sube
-    desde ahi con la misma pendiente (1/3 del avance) en vez de arrancar
-    pegado al precio.
+  - `SL_price = entry_price + peak × (TP1_price − entry_price)` — el SL
+    solo puede subir, nunca baja, incluso si el precio retrocede desde el
+    peak. **Revisado 2026-09-09:** la version anterior escalaba el offset
+    por `unit` (`SL = entry_price + (peak × unit) / 3`), acoplando dos
+    distancias sin relacion necesaria entre si — cuanto tiene que
+    "recorrer" el SL para llegar a `TP1_price` (`entry_price → TP1_price`,
+    determinado por el riesgo de la señal) vs. cuanto se separan TP1 y TP2
+    (`unit`, una decision de escala independiente). Caso real (grupo 61,
+    2026-09-08 en produccion): `entry→tp1`=34.87pts, `unit`=40pts — al
+    tocar TP2 exacto (`peak`=1.0) el SL viejo solo habia recorrido
+    `unit/3`=13.3pts de esos 34.87, quedando a 21.5pts de TP1 en vez de
+    cerca como intuitivamente se esperaria. Escalando el offset por
+    `(TP1_price − entry_price)` en vez de `unit`, el SL SIEMPRE alcanza
+    `TP1_price` exactamente en `peak=1.0` (precio en TP2), sin importar la
+    relacion entre `unit` y esa distancia — resuelve el acople de raiz.
+    `unit` sigue siendo la escala de `peak`/`multiple` (que tan lejos mas
+    alla de TP1, en "unidades TP2", esta el precio); solo el offset del SL
+    dejo de usarla. **Nota de implementacion:** el rescale de `peak` que
+    `signal_correction` ya aplicaba (para no perder progreso cuando TP1/TP2
+    cambian post-BE) sigue siendo correcto para su propio proposito —
+    mantener coherente el guard "nunca decrece" — pero un salto grande en
+    `unit` puede hacer que un `peak` recien habilitado por ese guard
+    mapee, via `(TP1_price − entry_price)` (que el rescale no toca), a un
+    SL en puntos absolutos por debajo del SL ya vigente en MT5.
+    `_apply_trailing` compara el candidato contra el SL real (`pos.sl`)
+    antes de enviarlo, mismo patron que `update_group_signal` y
+    `move_sl_be_now` ya usan, en vez de depender de que el rescale este
+    perfectamente calibrado a la formula del offset vigente.
+
+    **Revisado 2026-09-08 (nota historica):** antes de eso, la formula
+    original anclaba en `TP1_price` en vez de `entry_price`. Como `peak`
+    arranca cerca de 0 justo al cruzar TP1, esa version dejaba el SL a
+    solo 0-3 puntos del precio vivo en ese momento — mas cerca que el
+    propio colchon de BE — y un retroceso de precio perfectamente normal
+    alcanzaba para cerrar el runner casi junto con `tp1_leg` (confirmado
+    en produccion, grupo 60). Anclar en `entry_price` hace que en `peak=0`
+    el SL sea exactamente el BE ya aplicado.
   - Antes de que `tp1_leg` cierre, `runner_leg` no tiene trailing activo —
     corre con el mismo SL original que `tp1_leg`.
 - **TP2 partial close (agregado 2026-09-08):** la primera vez que el precio

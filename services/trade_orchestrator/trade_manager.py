@@ -695,22 +695,43 @@ class TradeManager:
 
     async def _apply_trailing(self, account, client, runner: ManagedTrade, pos) -> None:
         """
-        Trailing proporcional sin techo (dual-TP spec seccion 4, revisado):
-        unit = tp2_price - tp1_price (constante); peak = maximo multiplo de unit
-        alcanzado desde tp1_price (nunca decrece); SL = entry_price + (peak*unit)/3.
+        Trailing proporcional sin techo (dual-TP spec seccion 4, revisado
+        2026-09-09): unit = tp2_price - tp1_price (constante, mide el avance
+        del precio en "unidades de tp2" mas alla de tp1, multiple = avance/unit,
+        peak = maximo multiple historico, nunca decrece); SL = entry_price +
+        multiple * (tp1_price - entry_price).
 
-        Ancla en entry_price (BE), NO en tp1_price. La formula original del
-        spec anclaba en tp1_price, lo que dejaba el SL a 0-3 puntos del precio
-        vivo justo al cruzar TP1 (peak cerca de 0) -- mas cerca que el propio
-        BE (~10 puntos de colchon en valores tipicos), y ese colchon minimo
-        es tambien lo que hace mas probable el rechazo por trade_stops_level
+        Ancla en entry_price (BE), NO en tp1_price (fix 2026-09-08 — ver nota
+        vieja mas abajo). Y el offset del SL escala con (tp1_price -
+        entry_price), NO con unit (fix 2026-09-09): usar unit como escala del
+        offset acoplaba dos distancias sin relacion necesaria entre si —
+        cuanto tiene que "recorrer" el SL para llegar a tp1 (entry->tp1,
+        determinado por el riesgo de la señal) vs. cuanto se separan tp1 y
+        tp2 (unit, una decision de escala independiente de la señal). Caso
+        real (grupo 61, 2026-09-08 en produccion): entry->tp1=34.87pts,
+        unit=40pts — con el offset viejo (multiple*unit/3), al tocar tp2
+        exacto (multiple=1.0) el SL solo habia recorrido unit/3=13.3pts de
+        esos 34.87, quedando a 21.5pts de tp1 en vez de cerca como se
+        esperaria intuitivamente. Con unit mucho mas chico que entry->tp1
+        (tp1/tp2 muy juntos) el desacople es aun peor: el SL podia tardar
+        multiples de 20+ en alcanzar tp1. Escalando el offset por
+        (tp1_price - entry_price) en vez de unit, el SL SIEMPRE alcanza
+        tp1_price exactamente en multiple=1.0 (precio en tp2), sin importar
+        la relacion entre unit y la distancia entry->tp1 — resuelve el
+        acople de raiz. unit sigue siendo la escala de multiple (que tan
+        lejos mas alla de tp1, en "unidades tp2", esta el precio) — solo el
+        offset del SL dejo de usarla.
+
+        Nota vieja (2026-09-08): la formula original del spec anclaba el SL
+        en tp1_price, lo que dejaba el SL a 0-3 puntos del precio vivo justo
+        al cruzar TP1 (peak cerca de 0) -- mas cerca que el propio BE (~10
+        puntos de colchon en valores tipicos), y ese colchon minimo es
+        tambien lo que hace mas probable el rechazo por trade_stops_level
         que ya vimos en produccion (grupo 60). Un retroceso de precio del
         todo normal recien despues de TP1 bastaba para tocar ese SL y cerrar
-        el runner casi junto con tp1_leg -- el patron real reportado por el
-        usuario. Anclar en entry_price hace que en peak=0 el SL sea
-        exactamente el BE (mismo colchon que ya se gano al cerrar tp1_leg),
-        y sube desde ahi con la misma pendiente (1/3 del avance) en vez de
-        arrancar practicamente pegado al precio.
+        el runner casi junto con tp1_leg. Anclar en entry_price hace que en
+        peak=0 el SL sea exactamente el BE (mismo colchon que ya se gano al
+        cerrar tp1_leg).
         """
         if runner.tp1_price is None or runner.tp2_price is None or runner.entry_price is None:
             return
@@ -723,16 +744,42 @@ class TradeManager:
         multiple = advance / unit
         if multiple <= runner.peak_multiple:
             return  # never decreases
-        sl_offset = (multiple * unit) / 3.0
+        # Offset scaled by the entry->tp1 distance (the ground the SL actually
+        # has to cover to "reach" tp1), not by unit (tp1->tp2, an unrelated
+        # scale) — see docstring above. entry_to_tp1 can be 0 in a degenerate
+        # case (fill price landed exactly on tp1); guarded to avoid a SL that
+        # never advances silently masking as "trailing is working".
+        entry_to_tp1 = (runner.tp1_price - runner.entry_price) if is_buy else (runner.entry_price - runner.tp1_price)
+        if entry_to_tp1 <= 0:
+            return
+        sl_offset = multiple * entry_to_tp1
         new_sl = runner.entry_price + sl_offset if is_buy else runner.entry_price - sl_offset
-        # No explicit "never worse than BE" guard needed here: peak_multiple
-        # can never be negative (starts at 0.0; update_group_signal's rescale
-        # clamps it with max(0.0, ...)), and the "never decreases" guard above
-        # already requires multiple > peak_multiple >= 0 to reach this line —
-        # so sl_offset is always > 0 and new_sl is always strictly better than
-        # entry_price. Anchoring on entry_price is what makes this hold; it
-        # did NOT hold with the old tp1_price anchor (see git history / spec
-        # note), which is why that version needed (and had) a guard here.
+        # new_sl is always strictly better than entry_price (peak_multiple
+        # never negative, "never decreases" guard above already requires
+        # multiple > peak_multiple >= 0 here, sl_offset > 0) — but that does
+        # NOT mean new_sl is never worse than the SL already live in MT5.
+        # Real production bug (2026-09-09, found while re-testing the
+        # signal_correction path after the entry_to_tp1 rescale of the
+        # offset): update_group_signal's peak_multiple rescale (a few dozen
+        # lines up) re-projects peak_multiple correctly for the "never
+        # decreases" GATE (multiple > peak_multiple) when tp1/tp2 change —
+        # that part is still right. But once unit changes a lot (e.g. a
+        # signal_correction moving tp2 far away), a multiple that newly
+        # clears that gate can still map, through entry_to_tp1 (which the
+        # rescale does NOT touch), to a new_sl in absolute points BELOW the
+        # SL already sitting in MT5 (observed: SL=2515 live, next tick's
+        # "valid" multiple computed new_sl=2500.41 — a real regression the
+        # old tp1_price-anchored/unit-scaled formula never produced, because
+        # back then preserving peak_multiple*unit under rescale WAS
+        # preserving the SL). Guard directly against the live SL instead of
+        # trying to keep the rescale perfectly in sync with the offset
+        # formula — same pattern update_group_signal's own SL write and
+        # move_sl_be_now already use.
+        current_sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        if current_sl:
+            candidate_is_worse = (new_sl < current_sl) if is_buy else (new_sl > current_sl)
+            if candidate_is_worse:
+                return
         # peak_multiple must only advance once the SL move actually lands in MT5.
         # Real production bug (group 60, live): peak_multiple was bumped here
         # unconditionally, before knowing whether order_send succeeded. When MT5
@@ -746,11 +793,7 @@ class TradeManager:
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
             runner.peak_multiple = multiple
-            await self._notify(
-                "trailing_updated", group_id=runner.group_id, ticket=runner.ticket, peak_multiple=multiple, new_sl=new_sl,
-                message=f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): "
-                        f"nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.",
-            )
+            log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")            
             await self._persist_group(runner.group_id)
 
     @staticmethod
