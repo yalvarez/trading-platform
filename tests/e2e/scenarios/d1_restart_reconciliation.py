@@ -152,12 +152,25 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
                 detail="runner closed at its BE price shortly after the restart, before this check could compare its SL — "
                        "correct mechanism, but nothing left to verify SL preservation against in this run",
             )
-        if len(positions_after_restart) != 1:
+        # Real production bug found live (2026-09-10), group 103: tp1_leg and
+        # the runner both closed within 0.6s of each other right after the
+        # restart -- meaning both were genuinely still open, simultaneously,
+        # on this poll. Requiring exactly 1 position total flagged tp1_leg's
+        # legitimate continued existence as "reconciliation duplicated the
+        # group". tp1_leg is a distinct, real leg -- not a duplicate runner.
+        # A genuine duplicate is a SECOND position also carrying the
+        # runner's tp=0.0 marker (see _find_runner) with a different ticket.
+        duplicate_runners = [
+            p for p in positions_after_restart
+            if p["ticket"] != runner_ticket and p.get("tp", 0.0) == 0.0
+        ]
+        if duplicate_runners:
             return ScenarioResult(
                 name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
                 evidence={"positions_after_restart": positions_after_restart, "reconcile_logs": reconcile_logs},
-                detail=f"expected 1 position (the runner) after restart, found {len(positions_after_restart)} — "
-                       "reconciliation likely duplicated the group instead of recognizing the existing one",
+                detail=f"found {len(duplicate_runners)} extra position(s) carrying the runner's tp=0.0 marker "
+                       "besides the real runner — reconciliation likely duplicated the group instead of "
+                       "recognizing the existing one",
             )
         sl_after_restart = runner_after_restart["sl"]
         if sl_after_restart < sl_before_restart:

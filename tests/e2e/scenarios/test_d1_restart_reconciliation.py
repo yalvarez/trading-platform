@@ -92,6 +92,36 @@ async def test_d1_fails_when_restart_duplicates_the_group():
 
 
 @pytest.mark.asyncio
+async def test_d1_does_not_flag_a_still_open_tp1_leg_as_a_duplicate_runner():
+    """
+    Real production bug found live (2026-09-10), group 103: tp1_leg and the
+    runner both closed within 0.6s of each other right after the restart --
+    meaning both were genuinely still open, simultaneously, on D1's
+    post-restart poll. len(positions_after_restart) != 1 treated tp1_leg's
+    continued (legitimate) existence as "reconciliation duplicated the
+    group", when in fact there was no duplication at all -- tp1_leg is a
+    distinct, real leg of the same group, not a second runner. Only a
+    genuine duplicate runner (a second ticket also carrying tp=0.0) is a
+    real defect; tp1_leg being alongside the runner is not.
+    """
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [],  # preexisting_tickets snapshot
+            [TP1_LEG, RUNNER_LEG],  # after fast open
+            [{**RUNNER_LEG, "sl": 2500.0}],  # BE applied
+            # Post-restart: both tp1_leg (its own unrelated sl/tp, still
+            # open) and the runner (correctly BE'd) are alive at once.
+            [TP1_LEG, {**RUNNER_LEG, "sl": 2500.0}],
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.PASS
+
+
+@pytest.mark.asyncio
 async def test_d1_reports_inconclusive_when_runner_closes_before_restart_is_exercised():
     """
     Real production bug found live (2026-09-10): D1 used to identify the
