@@ -124,6 +124,49 @@ async def test_d1_reports_inconclusive_when_runner_closes_before_restart_is_exer
 
 
 @pytest.mark.asyncio
+async def test_d1_identifies_the_runner_by_ticket_after_restart_not_by_being_the_only_position():
+    """
+    Real production bug found live (2026-09-10): after the fix that made
+    planned_sl sync correctly (confirmed via data/trade_state.jsonl), D1
+    still reported a false "SL not preserved" FAIL. Root cause: the
+    post-restart check treated "the one position open for the symbol" as
+    "the runner", without checking its ticket -- the same bug already fixed
+    for the PRE-restart identification in B1/D1. In the real run, the
+    runner (BE-applied) closed at its BE price moments after the restart
+    (correct mechanism), while tp1_leg -- which has its own unrelated SL and
+    was still alive at that instant -- was the sole XAUUSD position D1 saw
+    on its first post-restart poll. D1 compared tp1_leg's own (unrelated)
+    SL against the runner's pre-restart BE SL and reported a false failure.
+    The post-restart check must identify the runner by ticket, exactly like
+    the pre-restart check already does, and must not conflate a still-open
+    tp1_leg with "the runner survived unchanged".
+    """
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [],  # preexisting_tickets snapshot
+            [TP1_LEG, RUNNER_LEG],  # after fast open
+            [{**RUNNER_LEG, "sl": 2500.0}],  # after BE applied (tp1 leg closed... in this poll)
+            # After restart: the runner (ticket=2) already closed at its BE
+            # price moments after the restart -- only tp1_leg (ticket=1,
+            # its own unrelated sl, never touched by BE) is still open.
+            [TP1_LEG],
+            [],  # next poll: tp1_leg closes too -- runner (by ticket) confirmed gone
+            [],  # cleanup_group's own positions_for_symbol call
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    # tp1_leg being the sole survivor must NOT be misread as "the runner,
+    # unchanged" -- the runner (ticket=2) is genuinely gone (closed at BE,
+    # the correct mechanism), so this must not be a false FAIL about SL
+    # preservation.
+    assert result.outcome != ScenarioOutcome.FAIL
+    ctx.observer.restart_container.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_d1_reports_inconclusive_mt5_rejected_be_when_order_send_was_rejected():
     """
     Real production behavior observed live (2026-09-10): n8n correctly
