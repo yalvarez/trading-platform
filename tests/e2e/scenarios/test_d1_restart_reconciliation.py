@@ -167,6 +167,58 @@ async def test_d1_identifies_the_runner_by_ticket_after_restart_not_by_being_the
 
 
 @pytest.mark.asyncio
+async def test_d1_accepts_a_sl_that_advanced_further_via_trailing_between_be_and_the_restart():
+    """
+    Real production bug found live (2026-09-10), group 93: TP1 was reached
+    for real, triggering automatic BE -- but trailing kept advancing the
+    runner's SL twice more (BUY, so higher is better) in the ~12s between
+    BE and D1 actually calling restart_container. check_be_applied captured
+    the SL at the FIRST change it saw after BE (the earliest, lowest value),
+    while the real SL at restart time -- and thus after restart, once
+    correctly identified by ticket -- was higher, from the extra trailing.
+    An exact "==" comparison flagged this legitimate improvement as "SL not
+    preserved". D1 must accept a post-restart SL that is the same or BETTER
+    (matching update_group_signal's own never-regress semantics for BUY:
+    higher is better), and must only fail on a genuine regression.
+    """
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [],  # preexisting_tickets snapshot
+            [TP1_LEG, RUNNER_LEG],  # after fast open
+            [{**RUNNER_LEG, "sl": 2500.0}],  # check_be_applied's first caught change (earliest BE value)
+            # Post-restart: the runner (ticket=2, found correctly) has a
+            # HIGHER sl -- trailing advanced it further between BE and the
+            # restart. This is an improvement, not a regression.
+            [{**RUNNER_LEG, "sl": 2503.5}],
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.PASS
+
+
+@pytest.mark.asyncio
+async def test_d1_still_fails_when_the_post_restart_sl_genuinely_regresses():
+    """Companion to the test above: a LOWER (worse, for BUY) SL after restart
+    is a genuine regression and must still FAIL."""
+    ctx = _ctx_with_be_applied_position()
+    ctx.observer.positions_for_symbol = AsyncMock(
+        side_effect=[
+            [],  # preexisting_tickets snapshot
+            [TP1_LEG, RUNNER_LEG],  # after fast open
+            [{**RUNNER_LEG, "sl": 2500.0}],  # BE applied
+            [{**RUNNER_LEG, "sl": 2470.0}],  # SL reverted to the pre-BE value after restart -- a real regression
+        ]
+    )
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.FAIL
+
+
+@pytest.mark.asyncio
 async def test_d1_reports_inconclusive_mt5_rejected_be_when_order_send_was_rejected():
     """
     Real production behavior observed live (2026-09-10): n8n correctly

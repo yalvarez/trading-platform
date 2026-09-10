@@ -159,10 +159,23 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
                 detail=f"expected 1 position (the runner) after restart, found {len(positions_after_restart)} — "
                        "reconciliation likely duplicated the group instead of recognizing the existing one",
             )
-        if runner_after_restart["sl"] != sl_before_restart:
+        sl_after_restart = runner_after_restart["sl"]
+        if sl_after_restart < sl_before_restart:
+            # Real production bug found live (2026-09-10), group 93: an
+            # exact "==" comparison here flagged a legitimate improvement as
+            # a failure. TP1 was reached for real (automatic BE), and
+            # trailing kept advancing the runner's SL further (this
+            # scenario is always BUY -- open_position_for_management_test
+            # sends "XAUUSD BUY NOW" -- so higher is better) in the seconds
+            # between BE and this scenario actually calling
+            # restart_container. sl_before_restart is a snapshot from the
+            # FIRST change check_be_applied caught after BE, which can be
+            # older than the SL at restart time. Only a genuine regression
+            # (a LOWER sl for BUY) is a real defect -- matching
+            # update_group_signal's own never-regress semantics.
             return ScenarioResult(
                 name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
-                evidence={"sl_before_restart": sl_before_restart, "sl_after_restart": runner_after_restart["sl"],
+                evidence={"sl_before_restart": sl_before_restart, "sl_after_restart": sl_after_restart,
                           "reconcile_logs": reconcile_logs},
                 detail="runner's BE-applied SL was not preserved across the restart",
             )
