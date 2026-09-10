@@ -92,6 +92,47 @@ async def test_d1_fails_when_restart_duplicates_the_group():
 
 
 @pytest.mark.asyncio
+async def test_d1_recognizes_the_runner_as_gone_even_while_tp1_leg_lingers_open():
+    """
+    Real production bug found live (2026-09-10), group 105: the runner
+    closed at its BE price only 3s after the restart, but tp1_leg (its own
+    unrelated position) stayed open for another 90+ seconds afterward --
+    well past D1's 60s post-restart poll timeout. check_runner_by_ticket's
+    "if after: return None" kept the poll waiting indefinitely as long as
+    ANY position was open, even though the runner (by ticket) was already
+    and genuinely gone from the very first post-restart poll. The poll
+    timed out entirely, producing a FAIL ("could not identify the runner")
+    instead of the correct INCONCLUSIVE_RUNNER_CLOSED_BEFORE_RESTART. The
+    runner being absent-by-ticket must resolve to "gone" immediately,
+    regardless of whether some other (non-runner-marked) position is still
+    open alongside it.
+    """
+    ctx = _ctx_with_be_applied_position()
+    calls = {"n": 0}
+
+    async def _positions_for_symbol(_symbol):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot
+        if calls["n"] == 2:
+            return [TP1_LEG, RUNNER_LEG]  # after fast open
+        if calls["n"] == 3:
+            return [{**RUNNER_LEG, "sl": 2500.0}]  # BE applied
+        # Post-restart, every poll for the full timeout: the runner
+        # (ticket=2) is gone (closed at BE), but tp1_leg (ticket=1, its
+        # own unrelated position, no tp=0.0 marker) lingers open the
+        # whole time.
+        return [TP1_LEG]
+
+    ctx.observer.positions_for_symbol = _positions_for_symbol
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.INCONCLUSIVE_RUNNER_CLOSED_BEFORE_RESTART
+    ctx.observer.restart_container.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_d1_does_not_flag_a_still_open_tp1_leg_as_a_duplicate_runner():
     """
     Real production bug found live (2026-09-10), group 103: tp1_leg and the

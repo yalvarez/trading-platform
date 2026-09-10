@@ -115,30 +115,29 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             runner = next((p for p in after if p["ticket"] == runner_ticket), None)
             if runner is not None:
                 return ("open", after, runner)
-            if after:
-                # Something is open, but it's not the runner (by ticket) --
-                # most likely tp1_leg, still alive independently. Keep
-                # polling; either it closes on its own and the runner stays
-                # gone (genuinely closed at BE), or this was a transient
-                # ordering artifact.
-                return None
+            # Real production bug found live (2026-09-10), group 105: the
+            # runner closed at BE only 3s after the restart, but tp1_leg (a
+            # distinct, unrelated position) stayed open for 90+ seconds
+            # afterward -- well past this poll's timeout. Waiting for
+            # "nothing at all is open" before accepting the runner is gone
+            # made the whole poll time out on tp1_leg alone, producing a
+            # false FAIL instead of recognizing the runner (by ticket) was
+            # already, genuinely gone from the very first post-restart poll.
+            # The runner's absence is conclusive on its own, regardless of
+            # what else (not carrying its tp=0.0 marker) is still open.
             return ("gone", after, None)
 
-        poll_result = await _poll_until(
+        # check_runner_by_ticket always resolves on its first call -- either
+        # the runner is found by ticket ("open") or it's conclusively absent
+        # ("gone"), regardless of what else is or isn't open alongside it --
+        # so this never actually waits out POST_RESTART_POLL_TIMEOUT_SECONDS.
+        # _poll_until is reused here (rather than calling it directly) only
+        # to keep the same "await once, check, return" shape as every other
+        # poll in this file.
+        status, positions_after_restart, runner_after_restart = await _poll_until(
             check_runner_by_ticket, POST_RESTART_POLL_TIMEOUT_SECONDS, POST_RESTART_POLL_INTERVAL_SECONDS
         )
         reconcile_logs = ctx.observer.grep_container_logs(CONTAINER_NAME, "[RECONCILE] al arranque")
-
-        if poll_result is None:
-            # Never resolved to either "runner found by ticket" or "nothing
-            # open at all" within the timeout -- e.g. tp1_leg stayed open
-            # the whole window. Genuinely inconclusive about the runner.
-            return ScenarioResult(
-                name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
-                evidence={"reconcile_logs": reconcile_logs},
-                detail="could not identify the runner (by ticket) among the positions open after restart within the timeout",
-            )
-        status, positions_after_restart, runner_after_restart = poll_result
 
         if status == "gone":
             # The runner (by ticket) is genuinely gone -- it closed at its
