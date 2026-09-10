@@ -1520,6 +1520,80 @@ async def test_trailing_update_persists_peak_multiple():
 
 
 @pytest.mark.asyncio
+async def test_tp1_leg_closing_syncs_planned_sl_to_the_new_be_price():
+    """
+    Real production bug found live (2026-09-10, e2e D1 scenario): BE was
+    applied to MT5 successfully (be_applied=True) but ManagedTrade.planned_sl
+    was never updated to match -- it stayed at the old, pre-BE value.
+    _group_doc persists planned_sl as-is, so reconcile_from_mt5 rebuilt the
+    runner with a stale baseline after any restart. planned_sl must now
+    track the real, just-applied BE price both in memory and in the
+    persisted doc.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+
+    await tm._tick_once_account(ACCOUNT)
+
+    assert tm.trades[runner_leg.ticket].be_applied is True
+    assert tm.trades[runner_leg.ticket].planned_sl == pytest.approx(runner_leg.entry_price)
+    runner_docs = [d for d in store.saved if d["group_id"] == group_id]
+    assert runner_docs[-1]["legs"]["runner"]["planned_sl"] == pytest.approx(runner_leg.entry_price)
+
+
+@pytest.mark.asyncio
+async def test_mgmt_move_sl_be_now_syncs_planned_sl_to_the_new_be_price():
+    """Same fix as above, for the manual /mgmt/action move_sl_be_now path."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="be now", correction=None)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[group_id]["status"] == "applied"
+    assert tm.trades[runner_leg.ticket].planned_sl == pytest.approx(runner_leg.entry_price)
+    runner_docs = [d for d in store.saved if d["group_id"] == group_id]
+    assert runner_docs[-1]["legs"]["runner"]["planned_sl"] == pytest.approx(runner_leg.entry_price)
+
+
+@pytest.mark.asyncio
+async def test_trailing_update_syncs_planned_sl_to_the_new_trailing_sl():
+    """Same fix as above, for the mechanical _apply_trailing path."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    store = RecordingStore()
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+    store.saved.clear()
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    sim.price = 2522.0  # 60% of unit=20 past tp1=2510
+    sim.positions[runner_leg.ticket]['price_current'] = sim.price
+
+    await tm._tick_once_account(ACCOUNT)
+
+    expected_sl = tm.trades[runner_leg.ticket].planned_sl
+    assert store.saved[-1]["legs"]["runner"]["peak_multiple"] == pytest.approx(0.6)
+    # The live SL that _apply_trailing actually sent to MT5 must equal the
+    # persisted planned_sl -- not the pre-BE value or entry_price alone.
+    assert sim.positions[runner_leg.ticket]["sl"] == pytest.approx(expected_sl)
+    runner_docs = [d for d in store.saved if d["group_id"] == group_id]
+    assert runner_docs[-1]["legs"]["runner"]["planned_sl"] == pytest.approx(expected_sl)
+
+
+@pytest.mark.asyncio
 async def test_both_legs_closing_closes_the_group_in_the_store():
     sim = SimuladorMT5()
     sim.price = 2500.0

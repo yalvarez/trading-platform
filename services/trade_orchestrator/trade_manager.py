@@ -619,6 +619,17 @@ class TradeManager:
         ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
         if ok:
             runner.be_applied = True
+            # Real production bug found live (2026-09-10, e2e D1 scenario):
+            # planned_sl was never updated to the new BE price here, only
+            # be_applied was set. MT5's real SL was correct, but the
+            # in-memory/persisted ManagedTrade.planned_sl stayed at the
+            # OLD, pre-BE value -- _group_doc persists it as-is, and a
+            # restart's reconcile_from_mt5 then rebuilds the runner with
+            # that stale planned_sl. A later signal_correction/
+            # update_group_signal call comparing against this field (its
+            # own never-regress guard, see update_group_signal) would
+            # compare against the wrong baseline.
+            runner.planned_sl = runner.entry_price
             close_price = await self._get_close_price(client, tp1_leg.ticket)
             await self._notify(
                 "tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
@@ -837,7 +848,13 @@ class TradeManager:
         ok = await self._force_runner_sl(account, client, runner, new_sl, reason="trailing")
         if ok:
             runner.peak_multiple = multiple
-            log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")            
+            # Same fix as _on_tp1_leg_closed/move_sl_be_now: planned_sl was
+            # never kept in sync with the SL actually applied here either --
+            # only peak_multiple advanced. MT5's real SL was correct, but
+            # _group_doc persists the stale planned_sl, and reconcile_from_mt5
+            # rebuilds the runner with it after any restart.
+            runner.planned_sl = new_sl
+            log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")
             await self._persist_group(runner.group_id)
 
     async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict]) -> dict:
@@ -955,6 +972,11 @@ class TradeManager:
                     ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
                     if ok:
                         runner.be_applied = True
+                        # Same fix as _on_tp1_leg_closed: keep planned_sl in
+                        # sync with the real, just-applied BE price -- see
+                        # that call site's comment for why this matters
+                        # across a restart's reconcile_from_mt5.
+                        runner.planned_sl = be_price
                         await self._notify(
                             "mgmt_move_sl_be_applied", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
                             message=f"Grupo {group_id}: SL movido a breakeven manualmente via /mgmt/action. "
