@@ -121,3 +121,41 @@ async def test_d1_reports_inconclusive_when_runner_closes_before_restart_is_exer
 
     assert result.outcome == ScenarioOutcome.INCONCLUSIVE_RUNNER_CLOSED_BEFORE_RESTART
     ctx.observer.restart_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_d1_reports_inconclusive_mt5_rejected_be_when_order_send_was_rejected():
+    """
+    Real production behavior observed live (2026-09-10): n8n correctly
+    called /mgmt/action with move_sl_be_now, but MT5 rejected the
+    order_send (BE requested too soon after opening, price still within
+    trade_stops_level of entry) -- so mgmt_move_sl_be_applied never gets
+    logged, only the generic "reason=mgmt-fallback-BE" rejection line.
+    This must NOT be conflated with "n8n/Ollama never called /mgmt/action
+    at all" (EXTERNAL_DEPENDENCY_FAILURE) -- same fix already applied to
+    B1. restart_container must never be called in this case either.
+    """
+    ctx = _ctx_with_be_applied_position()
+    calls = {"n": 0}
+
+    async def _positions_for_symbol(_symbol):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []  # preexisting_tickets snapshot
+        if calls["n"] == 2:
+            return [TP1_LEG, RUNNER_LEG]  # after fast open
+        return [TP1_LEG, RUNNER_LEG]  # SL never moves -- order_send was rejected
+
+    ctx.observer.positions_for_symbol = _positions_for_symbol
+
+    def _grep(container, pattern, since="5m"):
+        if pattern == "reason=mgmt-fallback-BE":
+            return ["[TM] fallo moviendo SL runner=2 reason=mgmt-fallback-BE tras 3 intentos"]
+        return []  # no mgmt_move_sl_be_applied event -- it was never logged
+
+    ctx.observer.grep_container_logs = _grep
+
+    result = await d1_restart_reconciliation.run(ctx)
+
+    assert result.outcome == ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE
+    ctx.observer.restart_container.assert_not_awaited()

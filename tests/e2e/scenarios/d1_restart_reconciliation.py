@@ -53,6 +53,23 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
         be_logs = ctx.observer.grep_container_logs(CONTAINER_NAME, "[TM][EVENT] mgmt_move_sl_be_applied")
         if not runner_before_restart:
             if not be_logs:
+                # No success event at all -- disambiguate the same way B1
+                # does: n8n can call /mgmt/action correctly and still have
+                # MT5 reject the order_send (trade_stops_level -- BE
+                # requested too soon after opening, price still too close
+                # to entry). That's a real system limitation, not "n8n/
+                # Ollama didn't act" -- conflating the two mislabels a
+                # working n8n integration as EXTERNAL_DEPENDENCY_FAILURE.
+                rejection_logs = ctx.observer.grep_container_logs(
+                    CONTAINER_NAME, "reason=mgmt-fallback-BE"
+                )
+                if rejection_logs:
+                    return ScenarioResult(
+                        name="d1_restart_reconciliation", outcome=ScenarioOutcome.INCONCLUSIVE_MT5_REJECTED_BE,
+                        evidence={"rejection_logs": rejection_logs},
+                        detail="setup failed: n8n called /mgmt/action correctly, but MT5 rejected the SL move "
+                               "(likely too close to entry right after opening) — not a bot defect, not an n8n failure",
+                    )
                 return ScenarioResult(
                     name="d1_restart_reconciliation", outcome=ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE,
                     evidence={}, detail="setup failed: no mgmt_move_sl_be_applied before restart — n8n/Ollama likely did not act",
