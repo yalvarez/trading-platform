@@ -87,6 +87,10 @@ El usuario necesita dos cosas que hoy no existen:
   gestión al detectar (vía `deal.reason == DEAL_REASON_SL`) que una
   pierna se cerró por stop loss, sin depender de que el usuario avise
   manualmente.
+- Nuevo evento automático `external_close_detected`, disparado cuando el
+  loop de gestión detecta que una pierna se cerró sin que el sistema lo
+  haya ordenado y sin ser TP/SL — típicamente alguien cerrando a mano
+  directamente en MT5/el broker. Se notifica como alerta de seguridad.
 - Mapeo simple `chat_id → nombre de canal` vía config
   (`CHANNEL_NAMES_JSON` o similar), con fallback al `chat_id` crudo.
 - Nueva acción `close_partial_now` en `/mgmt/action`: cierre parcial
@@ -121,7 +125,8 @@ El usuario necesita dos cosas que hoy no existen:
 
 ```
 TradeManager (evento de negocio: open, tp1_hit, tp2_partial, sl_hit_detected,
-              close_now, close_partial_now, be_applied, ...)
+              external_close_detected, close_now, close_partial_now,
+              be_applied, ...)
         │
         ▼
    EventBus.emit(event_type, channel, message, payload)
@@ -209,15 +214,23 @@ en `history_deals_get`. MT5 expone `DEAL_REASON_SL`, `DEAL_REASON_TP`,
     `_on_tp1_leg_closed` como hoy.
   - `reason == DEAL_REASON_SL` → nuevo evento `sl_hit_detected`, con P&L
     real, para **cualquier** pierna (tp1 o runner).
-  - `reason == DEAL_REASON_CLIENT` (o cualquier otra causa) → cierre
-    manual/externo no capturado por `apply_mgmt_action` (ej. cerrado a
-    mano directamente en la plataforma) → evento `audit`-only, sin
-    mensaje a Telegram (no hay contexto de "por qué" para armar un
-    mensaje útil).
+  - `reason == DEAL_REASON_CLIENT` (o cualquier otra causa) cuando el
+    ticket **no** fue removido de forma síncrona por `apply_mgmt_action`
+    (es decir, nadie desde Telegram pidió este cierre) → nuevo evento
+    `external_close_detected`, `channel: "both"`, con P&L real. Es
+    información de seguridad: alguien tocó la posición directamente en
+    MT5/el broker, por fuera del sistema — se avisa igual que un SL o TP,
+    con un tono de alerta explícito ("cierre no originado por el
+    sistema").
 - Los cierres que el propio `TradeManager` origina de forma síncrona
   (`close_now`, `close_partial_now`, TP2 partial) **no cambian** — ya
   conocen su causa con certeza porque el código la originó; no dependen
-  de esta detección pasiva.
+  de esta detección pasiva. Concretamente: `close_now`/`close_partial_now`
+  ya remueven el ticket de `self.trades` de forma síncrona dentro de la
+  misma llamada (como hoy hace `close_now`, `trade_manager.py:908`) antes
+  de que `_tick_once_account` pueda verlo "desaparecido" — por eso la
+  detección pasiva por `reason` nunca compite con estos casos ni los
+  reclasifica erróneamente como `external_close_detected`.
 - `SimuladorMT5` (`tests/test_simulador_mt5.py`, `_record_deal`) se
   extiende para incluir `reason`, `profit`, `volume`, `commission`,
   `swap` en los deals sintéticos que genera, para poder ejercitar esta
@@ -236,11 +249,13 @@ Todos con `payload` incluyendo como mínimo: `group_id`, `chat_id`,
 | `tp1_hit_be_failed` | both | igual que `tp1_hit` + `be_error` | ✅ TP1 alcanzado pero ⚠️ BE no se pudo aplicar (revisar manualmente) |
 | `tp2_partial_closed` | both | `close_price`, `close_volume` (50%), `pnl_money`, `remaining_volume` | ✅ TP2 alcanzado — 50% cerrado, ganancia, runner sigue con trailing |
 | `sl_hit_detected` (nuevo) | both | `leg`, `close_price`, `close_volume`, `pnl_money` | 🔴 Stop Loss — precio, volumen, pérdida/ganancia real |
+| `external_close_detected` (nuevo) | both | `leg`, `close_price`, `close_volume`, `pnl_money`, `deal_reason` | 🚨 Cierre externo detectado — pierna cerrada por fuera del sistema (no fue TP/SL/orden de Telegram), revisar la cuenta |
 | `mgmt_close_now` | both | por leg: `close_price`, `close_volume`, `pnl_money`; `total_pnl_money`; `raw_text` | ⚠️ Cierre manual — motivo (raw_text), piernas cerradas, total |
 | `mgmt_close_partial_now` (nuevo) | both | `percent_requested`, por leg: `close_price`, `close_volume`, `pnl_money`; `raw_text` | ⚠️ Cierre parcial manual — % solicitado, piernas afectadas, ganancia parcial |
 | `mgmt_move_sl_be_applied` | both | `new_sl`, `raw_text` | 🛡️ SL movido a breakeven manualmente |
 | `mgmt_move_sl_be_already_satisfied` | audit | — | (sin mensaje, es un no-op informativo) |
 | `mgmt_close_now_partial_failure` | both | `leg_summaries` | ⚠️ Cierre incompleto — al menos una pierna fue rechazada por el broker, revisar manualmente (posición puede seguir abierta) |
+| `mgmt_close_partial_now_failure` (nuevo) | both | `percent_requested`, `leg_summaries` | ⚠️ Cierre parcial incompleto — al menos una pierna fue rechazada por el broker al aplicar el % solicitado, revisar manualmente |
 | `mgmt_no_active_trade`, `mgmt_account_unresolved`, `mgmt_no_runner_leg`, `mgmt_invalid_correction`, `mgmt_unknown_action` | audit | los que ya existen hoy | — (ruido operativo, solo auditoría) |
 | `mgmt_note_sl_hit` | audit | los que ya existen hoy | — (ahora redundante con `sl_hit_detected` automático, se mantiene para compatibilidad pero deja de ser la vía principal) |
 | `reconciliation_summary` | audit | los que ya existen hoy | — |
@@ -266,9 +281,9 @@ Nueva rama en `apply_mgmt_action`, paralela a `close_now`:
 - Se aplica a **todas** las piernas activas del grupo (tp1_leg si aún no
   se cerró, y/o runner) — cada una recibe `partial_close(account, ticket,
   percent)` con el mismo porcentaje.
-- Si una pierna falla el `partial_close`, se reporta igual que
-  `mgmt_close_now_partial_failure` (mismo patrón de manejo de error), sin
-  abortar las demás piernas.
+- Si una pierna falla el `partial_close`, se reporta como
+  `mgmt_close_partial_now_failure` (mismo patrón de manejo de error que
+  `mgmt_close_now_partial_failure`), sin abortar las demás piernas.
 - El grupo permanece activo (a diferencia de `close_now`, que sí lo
   cierra en el store) porque queda volumen remanente en cada pierna
   parcialmente cerrada.
@@ -295,9 +310,12 @@ Nueva rama en `apply_mgmt_action`, paralela a `close_now`:
   `commission`/`swap` en deals sintéticos (necesario para ejercitar §5).
 - Tests para: escritura del JSONL en cada evento nuevo/existente, el
   worker de reintento (éxito, fallo transitorio, dead-letter tras agotar
-  intentos), la detección de `sl_hit_detected` vía `reason`, y la nueva
-  rama `close_partial_now` (con y sin `percent` explícito, con una y con
-  dos piernas activas).
+  intentos), la detección de `sl_hit_detected` y `external_close_detected`
+  vía `reason` (incluyendo el caso borde de distinguir "cerrado por
+  `apply_mgmt_action`, no debe disparar `external_close_detected`" vs.
+  "cerrado por fuera del sistema, sí debe dispararlo"), y la nueva rama
+  `close_partial_now` (con y sin `percent` explícito, con una y con dos
+  piernas activas, y su fallo parcial `mgmt_close_partial_now_failure`).
 - Verificar que `tests/test_orchestrator.py` no tenga el import roto
   documentado en una memoria anterior — confirmar antes de sumarle
   casos nuevos.
