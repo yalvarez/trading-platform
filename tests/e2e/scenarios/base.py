@@ -21,6 +21,7 @@ class ScenarioOutcome(str, Enum):
     INCONCLUSIVE_ENTRY_RANGE_TIMEOUT = "inconclusive_entry_range_timeout"
     EXTERNAL_DEPENDENCY_FAILURE = "external_dependency_failure"
     INCONCLUSIVE_MT5_REJECTED_BE = "inconclusive_mt5_rejected_be"
+    INCONCLUSIVE_RUNNER_CLOSED_BEFORE_RESTART = "inconclusive_runner_closed_before_restart"
 
 
 @dataclass

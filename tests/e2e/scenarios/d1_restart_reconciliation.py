@@ -13,7 +13,7 @@ silently dropping management of an open group.
 from tests.e2e.scenarios.base import ScenarioContext, ScenarioOutcome, ScenarioResult, cleanup_group
 from tests.e2e.scenarios.a1_fast_only import _poll_until, _preexisting_tickets, _new_positions
 from tests.e2e.scenarios._management_common import open_position_for_management_test, SYMBOL
-from tests.e2e.scenarios.b1_be_variant1 import MESSAGE as BE_MESSAGE
+from tests.e2e.scenarios.b1_be_variant1 import MESSAGE as BE_MESSAGE, _find_runner
 
 RESTART_SETTLE_SECONDS = 30
 POST_RESTART_POLL_TIMEOUT_SECONDS = 60
@@ -30,15 +30,22 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
             name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
             evidence={}, detail="setup failed: fast signal did not open two legs",
         )
+    runner_at_setup = _find_runner(positions)
+    if runner_at_setup is None:
+        return ScenarioResult(
+            name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
+            evidence={"positions": positions}, detail="setup failed: could not identify the runner leg (no position with tp=0.0)",
+        )
+    runner_ticket = runner_at_setup["ticket"]
+    runner_sl_before_be = runner_at_setup["sl"]
 
     await ctx.sender.send(ctx.cfg.tg_test_chat_id, BE_MESSAGE)
 
     try:
         async def check_be_applied():
             current = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
-            runner = next(iter(current), None)
-            entry_sl = positions[0]["sl"]
-            if runner and runner["sl"] != entry_sl:
+            runner = next((p for p in current if p["ticket"] == runner_ticket), None)
+            if runner and runner["sl"] != runner_sl_before_be:
                 return runner
             return None
 
@@ -50,9 +57,27 @@ async def run(ctx: ScenarioContext) -> ScenarioResult:
                     name="d1_restart_reconciliation", outcome=ScenarioOutcome.EXTERNAL_DEPENDENCY_FAILURE,
                     evidence={}, detail="setup failed: no mgmt_move_sl_be_applied before restart — n8n/Ollama likely did not act",
                 )
+            # The event WAS logged (order_send succeeded), but the runner
+            # closed (e.g. price touched the freshly-moved BE SL) before the
+            # next 5s poll caught it with a changed SL -- same false-positive
+            # pattern already fixed in B1. If the runner (by ticket) is gone,
+            # that's the mechanism working correctly, not a defect worth
+            # aborting D1's real purpose (the restart) over. Since there's no
+            # position left to carry across the restart, this scenario can't
+            # proceed -- report it as inconclusive rather than a bot FAIL.
+            still_open = _new_positions(await ctx.observer.positions_for_symbol(SYMBOL), preexisting_tickets)
+            runner_still_open = next((p for p in still_open if p["ticket"] == runner_ticket), None)
+            if runner_still_open is None:
+                return ScenarioResult(
+                    name="d1_restart_reconciliation", outcome=ScenarioOutcome.INCONCLUSIVE_RUNNER_CLOSED_BEFORE_RESTART,
+                    evidence={"be_logs": be_logs},
+                    detail="BE was applied and the runner closed (price touched BE) before a restart could be exercised — "
+                           "correct mechanism, but nothing left to test reconciliation against this run",
+                )
             return ScenarioResult(
                 name="d1_restart_reconciliation", outcome=ScenarioOutcome.FAIL,
-                evidence={"be_logs": be_logs}, detail="setup failed: BE was logged but SL did not change before restart",
+                evidence={"be_logs": be_logs, "runner_still_open": runner_still_open},
+                detail="setup failed: BE was logged but runner's SL did not change before restart",
             )
 
         sl_before_restart = runner_before_restart["sl"]
