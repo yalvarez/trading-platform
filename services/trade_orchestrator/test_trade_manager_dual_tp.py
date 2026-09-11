@@ -665,9 +665,11 @@ async def test_tick_moves_runner_sl_to_be_when_tp1_leg_closes():
 
 @pytest.mark.asyncio
 async def test_tick_applies_be_when_tp1_leg_genuinely_closed_at_tp1_price():
-    """The real-deal-verified path: tp1_leg closes with a real out-deal
-    recorded exactly at (or beyond) tp1_price -- must still be treated as
-    a genuine TP1 hit and trigger BE, same as before this fix."""
+    """The real-deal-verified path: tp1_leg closes with a real TP out-deal
+    (deal.reason == DEAL_REASON_TP) -- must be treated as a genuine TP1 hit
+    and trigger BE (2026-09-10: classification now uses deal.reason
+    directly instead of a price-tolerance heuristic -- see
+    _classify_leg_closure)."""
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
@@ -675,7 +677,7 @@ async def test_tick_applies_be_when_tp1_leg_genuinely_closed_at_tp1_price():
     runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
     tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
 
-    sim.close_position_directly(tp1_leg.ticket, close_price=2510.0)  # closes exactly at tp1_price
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)  # closes exactly at tp1_price
 
     await tm._tick_once_account(ACCOUNT)
 
@@ -685,16 +687,20 @@ async def test_tick_applies_be_when_tp1_leg_genuinely_closed_at_tp1_price():
 
 
 @pytest.mark.asyncio
-async def test_tick_does_not_apply_be_when_tp1_leg_closed_at_a_loss_not_at_tp1():
+async def test_tick_does_not_apply_be_when_tp1_leg_closed_externally_not_at_tp1():
     """
     Real production bug found live (2026-09-09): a tp1_leg closed via
     partial_close (e.g. an e2e test's own emergency cleanup, or any other
     out-of-band close) at a price BELOW entry -- a real loss, nowhere near
     tp1_price -- and the system still logged it as "TP1 alcanzado" and
-    moved the runner to breakeven. The close price must actually reach
-    tp1_price (within tolerance) before triggering the BE flow; otherwise
-    this must be treated like any other non-TP1 closure (notify only, no
-    BE, no TP1_HITS increment).
+    moved the runner to breakeven.
+
+    2026-09-10: classification now uses deal.reason directly instead of a
+    price-tolerance heuristic (see _classify_leg_closure) -- an out-of-band
+    close like this records DEAL_REASON_CLIENT, which is neither TP nor SL,
+    so it must be treated as an external closure (notify only via
+    external_close_detected, no BE, no TP1_HITS increment) rather than a
+    genuine TP1 hit.
     """
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -715,9 +721,9 @@ async def test_tick_does_not_apply_be_when_tp1_leg_closed_at_a_loss_not_at_tp1()
     assert tm.trades[runner_leg.ticket].be_applied is False
     tp1_hit_events = [kwargs for event, kwargs in notifier.events if event == "tp1_hit"]
     assert tp1_hit_events == []
-    not_at_tp1_events = [kwargs for event, kwargs in notifier.events if event == "tp1_leg_closed_not_at_tp1"]
-    assert len(not_at_tp1_events) == 1
-    assert "2499.5" in not_at_tp1_events[0]["message"] or "2499.50000" in not_at_tp1_events[0]["message"]
+    external_events = [kwargs for event, kwargs in notifier.events if event == "external_close_detected"]
+    assert len(external_events) == 1
+    assert external_events[0]["close_price"] == 2499.5
 
 
 @pytest.mark.asyncio
@@ -1905,7 +1911,14 @@ async def test_reconcile_with_no_state_store_still_recovers_degraded():
 
 
 @pytest.mark.asyncio
-async def test_runner_closed_message_includes_entry_and_close_price():
+async def test_runner_closed_externally_message_includes_close_price():
+    """
+    2026-09-10: a runner leg disappearing from positions_get with a real
+    deal recorded under DEAL_REASON_CLIENT (close_position_directly) is now
+    classified as an external closure (deal.reason-based classification,
+    see _classify_leg_closure) and reported via external_close_detected --
+    not the old undifferentiated runner_closed event.
+    """
     sim = SimuladorMT5()
     sim.price = 2500.0
     notifier = DummyNotifier()
@@ -1920,10 +1933,12 @@ async def test_runner_closed_message_includes_entry_and_close_price():
     await tm._tick_once_account(ACCOUNT)  # runner closes
 
     runner_events = [kwargs for event, kwargs in notifier.events if event == "runner_closed"]
-    assert len(runner_events) == 1
-    message = runner_events[0]["message"]
-    assert str(runner_leg.entry_price) in message
-    assert "2514.0" in message or "2514.00000" in message
+    assert runner_events == []
+    external_events = [kwargs for event, kwargs in notifier.events if event == "external_close_detected"]
+    assert len(external_events) == 1
+    assert external_events[0]["leg"] == "runner"
+    assert external_events[0]["close_price"] == 2514.0
+    assert "2514.0" in external_events[0]["message"] or "2514.00000" in external_events[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -1938,14 +1953,17 @@ async def test_runner_closed_message_falls_back_when_close_price_unavailable():
     del sim.positions[tp1_leg.ticket]
     await tm._tick_once_account(ACCOUNT)  # tp1 closes, BE applied to runner
 
-    # No deal recorded for the runner's exit (e.g. history not yet propagated) —
-    # message must degrade gracefully instead of crashing the notify path.
+    # No deal recorded for the runner's exit at all (e.g. history not yet
+    # propagated) -- _get_close_deal_info returns None, so the closure is
+    # classified "unknown" (2026-09-10: deal.reason-based classification)
+    # and reported via the audit-only fallback event with no close-price
+    # detail to fall back to.
     del sim.positions[runner_leg.ticket]
     await tm._tick_once_account(ACCOUNT)
 
     runner_events = [kwargs for event, kwargs in notifier.events if event == "runner_closed"]
     assert len(runner_events) == 1
-    assert "N/D" in runner_events[0]["message"]
+    assert "sin poder determinar la causa" in runner_events[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -1956,7 +1974,7 @@ async def test_tp1_hit_message_includes_entry_and_close_price():
     tm = TradeManager(DummyExecutor(sim), notifier=notifier)
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
     tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
-    sim.close_position_directly(tp1_leg.ticket, close_price=2510.0)
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
 
     await tm._tick_once_account(ACCOUNT)
 
@@ -1965,6 +1983,92 @@ async def test_tp1_hit_message_includes_entry_and_close_price():
     message = tp1_events[0]["message"]
     assert str(tp1_leg.entry_price) in message
     assert "2510.0" in message or "2510.00000" in message
+
+
+@pytest.mark.asyncio
+async def test_tp1_leg_closed_by_real_tp_reason_triggers_tp1_hit():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+    await tm._tick_once_account(ACCOUNT)
+
+    events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit"]
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_tp1_leg_closed_by_sl_reason_does_not_trigger_tp1_hit():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    sim.close_position_by_sl(tp1_leg.ticket, close_price=2490.0, profit=-20.0)
+    await tm._tick_once_account(ACCOUNT)
+
+    tp1_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit"]
+    sl_events = [kwargs for event, kwargs in tm.notifier.events if event == "sl_hit_detected"]
+    assert len(tp1_events) == 0
+    assert len(sl_events) == 1
+    assert sl_events[0]["pnl_money"] == -20.0
+
+
+@pytest.mark.asyncio
+async def test_runner_closed_by_sl_reason_triggers_sl_hit_detected():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    sim.close_position_by_sl(runner.ticket, close_price=2495.0, profit=-5.0)
+    await tm._tick_once_account(ACCOUNT)
+
+    sl_events = [kwargs for event, kwargs in tm.notifier.events if event == "sl_hit_detected"]
+    assert len(sl_events) == 1
+    assert sl_events[0]["leg"] == "runner"
+
+
+@pytest.mark.asyncio
+async def test_leg_closed_by_unknown_external_cause_triggers_external_close_detected():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    # Closed directly in MT5 by the user, outside the system -- not via
+    # close_now/close_partial_now (which would have removed the ticket from
+    # tm.trades synchronously before this tick ever ran).
+    sim.close_position_directly(runner.ticket, close_price=2505.0)
+    await tm._tick_once_account(ACCOUNT)
+
+    external_events = [kwargs for event, kwargs in tm.notifier.events if event == "external_close_detected"]
+    assert len(external_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_now_does_not_trigger_external_close_detected():
+    """Real bug class this guards against: apply_mgmt_action's close_now
+    removes the ticket from tm.trades synchronously (trade_manager.py:908)
+    before any _tick_once_account runs, so the passive detection loop must
+    never see that ticket as 'closed' -- confirming no spurious
+    external_close_detected fires for a close the system itself ordered."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="cierra todo", correction=None)
+    await tm._tick_once_account(ACCOUNT)
+
+    external_events = [event for event, kwargs in tm.notifier.events if event == "external_close_detected"]
+    assert len(external_events) == 0
 
 
 @pytest.mark.asyncio

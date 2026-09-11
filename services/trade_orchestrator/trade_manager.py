@@ -1,4 +1,6 @@
 from .trade_utils import safe_comment, parse_group_comment
+from .channel_names import resolve_channel_name
+from .event_messages import build_sl_hit_message, build_external_close_message
 import asyncio
 import inspect
 import os
@@ -535,18 +537,48 @@ class TradeManager:
                 # a TP1 hit. Verify the real close price actually reached
                 # tp1_price (within half the entry->tp1 distance, to tolerate
                 # normal slippage) before treating this as a genuine TP1 event.
-                if closed_trade.leg == "tp1" and await self._closed_at_tp1(client, closed_trade):
+                classification = await self._classify_leg_closure(client, closed_trade)
+                cause = classification["cause"]
+                if cause == "tp1":
                     await self._on_tp1_leg_closed(account, client, closed_trade)
-                else:
-                    close_price = await self._get_close_price(client, ticket)
-                    leg_label = "Runner" if closed_trade.leg == "runner" else "tp1_leg"
-                    await self._notify(
-                        "runner_closed" if closed_trade.leg == "runner" else "tp1_leg_closed_not_at_tp1",
-                        group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
-                        message=f"{leg_label} del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) se cerro "
-                                f"(SL, cierre manual, u otra causa -- no fue TP1). Precio de apertura {self._fmt_price(closed_trade.entry_price)}, "
-                                f"precio de cierre {self._fmt_price(close_price)}.",
+                elif cause == "sl":
+                    channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
+                    message = build_sl_hit_message(
+                        channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
+                        direction=closed_trade.direction, close_price=classification["price"],
+                        close_volume=classification["volume"], pnl_money=classification["profit"],
                     )
+                    await self._notify(
+                        "sl_hit_detected", channel="both", group_id=closed_trade.group_id, chat_id=closed_trade.chat_id,
+                        channel_name=channel_name, symbol=closed_trade.symbol, direction=closed_trade.direction,
+                        leg=closed_trade.leg, close_price=classification["price"], close_volume=classification["volume"],
+                        pnl_money=classification["profit"], message=message,
+                    )
+                else:
+                    channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
+                    if cause == "external":
+                        message = build_external_close_message(
+                            channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
+                            direction=closed_trade.direction, leg=closed_trade.leg,
+                            close_price=classification["price"], close_volume=classification["volume"],
+                            pnl_money=classification["profit"],
+                        )
+                        await self._notify(
+                            "external_close_detected", channel="both", group_id=closed_trade.group_id,
+                            chat_id=closed_trade.chat_id, channel_name=channel_name, symbol=closed_trade.symbol,
+                            direction=closed_trade.direction, leg=closed_trade.leg,
+                            close_price=classification["price"], close_volume=classification["volume"],
+                            pnl_money=classification["profit"], message=message,
+                        )
+                    else:
+                        leg_label = "Runner" if closed_trade.leg == "runner" else "tp1_leg"
+                        await self._notify(
+                            "runner_closed" if closed_trade.leg == "runner" else "tp1_leg_closed_not_at_tp1",
+                            channel="audit", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
+                            message=f"{leg_label} del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) "
+                                    f"se cerro sin poder determinar la causa. Precio de apertura "
+                                    f"{self._fmt_price(closed_trade.entry_price)}.",
+                        )
                 remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
                 if not remaining:
                     await self._close_group_in_store(closed_trade.group_id)
@@ -567,36 +599,45 @@ class TradeManager:
         except Exception as e:
             log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)
 
-    async def _closed_at_tp1(self, client, tp1_leg: ManagedTrade) -> bool:
-        """
-        Verifica si tp1_leg realmente cerro en (o mas alla de) su propio
-        tp1_price, usando el precio real del deal de salida en MT5 -- no
-        solo el hecho de que la posicion ya no aparezca en positions_get.
-        Real production bug: cualquier cierre de tp1_leg (SL hit, cierre
-        manual via /mgmt/action o el cleanup de emergencia de una prueba,
-        un rechazo de broker, etc.) se trataba como "TP1 alcanzado" sin
-        esta verificacion.
+    DEAL_REASON_TP = 5
+    DEAL_REASON_SL = 4
 
-        Tolerancia: dentro de la mitad de la distancia entre entry_price y
-        tp1_price, para no rechazar un fill legitimo con slippage normal.
-        Si no hay tp1_price/entry_price registrados, o si el precio de
-        cierre no se pudo obtener (deal aun no propago, fallo de red),
-        se asume TP1 -- igual que el comportamiento anterior a este fix --
-        para no bloquear el BE automatico por un fallo transitorio de
-        verificacion en el caso comun (TP1 real).
+    async def _classify_leg_closure(self, client, closed_trade: "ManagedTrade") -> dict:
         """
-        if tp1_leg.tp1_price is None or tp1_leg.entry_price is None:
-            return True
-        close_price = await self._get_close_price(client, tp1_leg.ticket)
-        if close_price is None:
-            return True
-        is_buy = tp1_leg.direction == "BUY"
-        unit = (tp1_leg.tp1_price - tp1_leg.entry_price) if is_buy else (tp1_leg.entry_price - tp1_leg.tp1_price)
-        if unit <= 0:
-            return True
-        tolerance = unit / 2.0
-        advance = (close_price - tp1_leg.entry_price) if is_buy else (tp1_leg.entry_price - close_price)
-        return advance >= (unit - tolerance)
+        Clasifica por que se cerro una pierna que desaparecio de
+        positions_get, usando deal.reason directamente (no heuristica de
+        tolerancia de precio -- ver spec 2026-09-10, seccion 5). Los
+        cierres que el propio TradeManager origina de forma sincrona
+        (close_now, close_partial_now, TP2 partial) ya remueven el ticket
+        de self.trades ANTES de que este metodo se llame -- por eso
+        cualquier otra causa detectada aqui (fuera de TP genuino y SL) se
+        trata como 'external': nadie del sistema lo pidio.
+        """
+        info = await self._get_close_deal_info(client, closed_trade.ticket)
+        if info is None:
+            # Deal aun no propago o fallo de red -- comportamiento previo:
+            # asumir TP1 para no bloquear el BE automatico en el caso comun.
+            return {"cause": "tp1" if closed_trade.leg == "tp1" else "unknown", "price": None,
+                    "reason": None, "profit": None, "volume": None, "commission": None, "swap": None}
+        reason = info["reason"]
+        if reason == self.DEAL_REASON_TP and closed_trade.leg == "tp1":
+            cause = "tp1"
+        elif reason == self.DEAL_REASON_SL:
+            cause = "sl"
+        elif reason is not None:
+            # A real deal was found with a real reason that's neither TP nor
+            # SL (typically DEAL_REASON_CLIENT) -- since close_now/
+            # close_partial_now/TP2-partial already remove the ticket from
+            # self.trades synchronously before this code ever runs (see the
+            # module docstring note above), this really is an outside close.
+            cause = "external"
+        else:
+            # reason is None: the deal was found but MT5 didn't report a
+            # reason (or the simulator/test double left it unset). Too
+            # uncertain to raise a security alert over -- fall back to the
+            # old undifferentiated audit-only event instead of guessing.
+            cause = "unknown"
+        return {"cause": cause, **info}
 
     async def _on_tp1_leg_closed(self, account, client, tp1_leg: ManagedTrade) -> None:
         """TP1 hit -> mueve el runner del mismo group_id a BE (dual-TP spec seccion 4)."""
@@ -646,13 +687,13 @@ class TradeManager:
                 message=f"TP1 de {tp1_leg.symbol} (group {tp1_leg.group_id}) se cerro, pero el runner (ticket {runner.ticket}) NO pudo moverse a breakeven tras 3 intentos. Requiere revision manual — sigue con su SL original.",
             )
 
-    async def _get_close_price(self, client, ticket: int) -> Optional[float]:
+    async def _get_close_deal_info(self, client, ticket: int) -> Optional[dict]:
         """
-        Busca el precio real de cierre de `ticket` en el historial de deals de MT5
-        (DEAL_ENTRY_OUT=1). Usado solo para enriquecer el mensaje descriptivo que
-        se manda a n8n -- nunca debe tumbar el flujo de notificacion, asi que
-        cualquier fallo (de red, o simplemente que el deal aun no propago)
-        devuelve None y el mensaje cae a un placeholder ("N/D").
+        Busca el deal real de salida (DEAL_ENTRY_OUT=1) de `ticket` en el
+        historial de MT5, con toda la informacion necesaria para
+        auditoria/notificacion: precio, causa (reason), P&L real, volumen
+        cerrado, comision y swap. Nunca debe tumbar el flujo de notificacion
+        -- cualquier fallo (de red, o el deal aun no propago) devuelve None.
         """
         try:
             deals = await self._call(client.history_deals_get, position=ticket)
@@ -665,7 +706,22 @@ class TradeManager:
         if not out_deals:
             return None
         closing = max(out_deals, key=lambda d: getattr(d, "time", 0))
-        return float(closing.price)
+        return {
+            "price": float(closing.price),
+            "reason": getattr(closing, "reason", None),
+            "profit": float(getattr(closing, "profit", 0.0) or 0.0),
+            "volume": float(getattr(closing, "volume", 0.0) or 0.0),
+            "commission": float(getattr(closing, "commission", 0.0) or 0.0),
+            "swap": float(getattr(closing, "swap", 0.0) or 0.0),
+        }
+
+    async def _get_close_price(self, client, ticket: int) -> Optional[float]:
+        """Compat: varios call sites solo necesitan el precio de cierre."""
+        info = await self._get_close_deal_info(client, ticket)
+        return info["price"] if info else None
+
+    def _channel_names(self) -> dict:
+        return getattr(self, "channel_names", {}) or {}
 
     @staticmethod
     def _fmt_price(price: Optional[float]) -> str:
