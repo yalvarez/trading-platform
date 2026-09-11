@@ -15,6 +15,11 @@ class SimuladorMT5:
         self.spread = 0.2
         self.stops_level = 20  # en puntos
         self.point = 0.1
+        # Mismos defaults que el broker real de produccion (fixed_lot=0.01 ==
+        # volume_min=0.01). Configurables por test para poder reproducir un
+        # simbolo con minimo/step mas finos.
+        self.volume_min = 0.01
+        self.volume_step = 0.01
 
     def _record_deal(self, ticket, *, entry, price, reason=DEAL_REASON_CLIENT, profit=0.0,
                       volume=None, commission=0.0, swap=0.0):
@@ -75,8 +80,8 @@ class SimuladorMT5:
             'spread': self.spread,
             'point': self.point,
             'stops_level': self.stops_level,
-            'volume_step': 0.01,
-            'volume_min': 0.01,
+            'volume_step': self.volume_step,
+            'volume_min': self.volume_min,
         })()
 
     def symbol_select(self, symbol, enable=True):
@@ -87,17 +92,35 @@ class SimuladorMT5:
         return float(self.price)
 
     def partial_close(self, account, ticket, percent, *, reason=DEAL_REASON_CLIENT, profit=0.0):
-        """Cierra (parcial o totalmente) una posicion simulada. Si percent>=100, elimina la posicion."""
+        """
+        Cierra (parcial o totalmente) una posicion simulada, reproduciendo
+        EXACTAMENTE la misma matematica de redondeo/clamp que
+        services/common/mt5_client.py's partial_close usa contra MT5 real
+        (volume_step/volume_min del symbol_info, con el clamp hacia min_vol o
+        hacia el volumen completo). Antes este doble hacia float math exacta
+        sin clamp alguno, lo que hacia que todo test pasara mientras
+        produccion (fixed_lot=0.01 == volume_min=0.01) cerraba el 100% de la
+        posicion ante CUALQUIER pedido de cierre parcial.
+        """
         pos = self.positions.get(ticket)
         if not pos:
             return False
-        closed_volume = float(pos.get('volume', 0.0)) * (percent / 100.0)
+        volume = float(pos.get('volume', 0.0))
+        step = float(self.volume_step)
+        min_vol = float(self.volume_min)
+        raw_close = volume * (float(percent) / 100.0)
+        close_vol = step * int(raw_close / step)
+        if close_vol < min_vol:
+            close_vol = min_vol if volume > min_vol else volume
+        if close_vol > volume:
+            close_vol = volume
         self._record_deal(ticket, entry=1, price=pos.get('price_current', self.price),
-                           reason=reason, profit=profit, volume=closed_volume)
-        if percent >= 100:
+                           reason=reason, profit=profit, volume=close_vol)
+        remaining = volume - close_vol
+        if remaining <= 1e-9:
             del self.positions[ticket]
         else:
-            pos['volume'] = max(0.0, float(pos.get('volume', 0.0)) * (1 - percent / 100.0))
+            pos['volume'] = remaining
         return True
 
     def history_deals_get(self, *args, position=None, ticket=None, **kwargs):

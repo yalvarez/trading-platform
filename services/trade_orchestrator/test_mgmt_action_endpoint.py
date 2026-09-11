@@ -87,3 +87,38 @@ async def test_mgmt_action_close_now_only_affects_the_matching_chat_id(tm_and_cl
     assert resp.json()["status"] == "completed"
     remaining_chats = {t.chat_id for t in tm.trades.values()}
     assert remaining_chats == {"other-chat"}
+
+
+# --- Final fix wave (2026-09-11), Fix 2: percent bounds at the HTTP boundary ---
+# percent originates from an LLM (Ollama) extraction of free-form Telegram
+# text, so a garbage value is a realistic input and must never reach
+# apply_mgmt_action.
+
+
+@pytest.mark.parametrize("bad_percent", [-50.0, 0.0, 100.0, 150.0])
+def test_mgmt_action_rejects_out_of_range_percent(tm_and_client, bad_percent):
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_partial_now", "chat_id": CHAT_ID,
+        "raw_text": "cierra algo", "correction": None, "percent": bad_percent,
+    })
+    assert resp.status_code == 422
+
+
+def test_mgmt_action_accepts_a_valid_percent(tm_and_client):
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_partial_now", "chat_id": CHAT_ID,
+        "raw_text": "cierra 30%", "correction": None, "percent": 30.0,
+    })
+    assert resp.status_code == 200
+
+
+def test_mgmt_action_still_accepts_an_omitted_percent(tm_and_client):
+    """percent unset means 'use the 50% default' and must stay valid."""
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_partial_now", "chat_id": CHAT_ID,
+        "raw_text": "cierra parte", "correction": None,
+    })
+    assert resp.status_code == 200

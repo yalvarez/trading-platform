@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 log = logging.getLogger("trade_orchestrator.mgmt_api")
 
@@ -30,7 +30,14 @@ class MgmtActionRequest(BaseModel):
     chat_id: str
     raw_text: str
     correction: Optional[Correction] = None
-    percent: Optional[float] = None
+    # percent llega de una extraccion LLM (Ollama) sobre texto libre de
+    # Telegram, asi que un valor basura (negativo, 0, >100) es una entrada
+    # realista -- no un caso teorico. Un cierre parcial es por definicion
+    # estrictamente mayor a 0% y estrictamente menor a 100% (para 100% existe
+    # la accion close_now), asi que se rechaza con 422 antes de llegar a
+    # apply_mgmt_action. None sigue siendo valido: significa "sin especificar,
+    # usar el default de 50%".
+    percent: Optional[float] = Field(default=None, gt=0, lt=100)
 
 def create_mgmt_app(trade_manager) -> FastAPI:
     app = FastAPI(title="trade_orchestrator-mgmt")

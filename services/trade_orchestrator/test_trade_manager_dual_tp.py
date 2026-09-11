@@ -34,6 +34,10 @@ class DummyNotifier:
 
 
 ACCOUNT = {"name": "demo", "active": True, "host": "x", "port": 1}
+# fixed_lot=0.10: un cierre parcial real (p.ej. 50% -> 0.05/0.05) es
+# honrable por MT5. El ACCOUNT default usa fixed_lot=0.01 == volume_min,
+# donde NINGUN cierre parcial es posible (ver el fix wave de 2026-09-11).
+ACCOUNT_BIG_LOT = {"name": "demo", "active": True, "host": "x", "port": 1, "fixed_lot": 0.10}
 
 
 @pytest.mark.asyncio
@@ -306,7 +310,11 @@ async def test_close_partial_now_applies_default_50_percent_when_no_percent_give
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    # fixed_lot=0.10: un 50% real (0.05/0.05) es honrable por MT5. Con el
+    # default de 0.01 (== volume_min) un cierre parcial es imposible por
+    # definicion y ahora se rechaza -- ver
+    # test_close_partial_now_rejects_when_min_volume_would_force_a_full_close.
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
     legs_before = [t for t in tm.trades.values() if t.group_id == group_id]
     tickets_before = {t.ticket for t in legs_before}
 
@@ -318,7 +326,7 @@ async def test_close_partial_now_applies_default_50_percent_when_no_percent_give
     assert remaining_tickets == tickets_before
     for ticket in tickets_before:
         pos = sim.positions[ticket]
-        assert pos["volume"] == pytest.approx(0.005)  # 50% of the 0.01 default fixed_lot
+        assert pos["volume"] == pytest.approx(0.05)  # 50% of the 0.10 fixed_lot
 
 
 @pytest.mark.asyncio
@@ -326,14 +334,15 @@ async def test_close_partial_now_applies_explicit_percent():
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
     legs = [t for t in tm.trades.values() if t.group_id == group_id]
 
     await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
 
     for t in legs:
         pos = sim.positions[t.ticket]
-        assert pos["volume"] == pytest.approx(0.01 * 0.7)
+        # 30% de 0.10 = 0.03 exacto (multiplo de volume_step=0.01) -> quedan 0.07.
+        assert pos["volume"] == pytest.approx(0.07)
 
 
 @pytest.mark.asyncio
@@ -341,7 +350,7 @@ async def test_close_partial_now_notifies_success_event_with_both_channel():
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
 
     await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
 
@@ -1072,17 +1081,21 @@ async def test_tp2_partial_close_takes_half_volume_and_keeps_trailing_on_remaind
     sim.price = 2500.0
     notifier = DummyNotifier()
     tm = TradeManager(DummyExecutor(sim), notifier=notifier)
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    # ACCOUNT_BIG_LOT (0.10): el 50% de TP2 (0.05/0.05) es honrable por MT5.
+    # Con el default 0.01 == volume_min, MT5 cerraria el 100% del runner, asi
+    # que ese parcial ahora se omite -- ver
+    # test_tp2_partial_close_is_skipped_when_it_would_close_the_whole_runner.
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
     tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
     runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
     original_vol = sim.positions[runner_leg.ticket]["volume"]
     del sim.positions[tp1_leg.ticket]
-    await tm._tick_once_account(ACCOUNT)  # applies BE
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)  # applies BE
 
     # Price reaches tp2 exactly (multiple=1.0, unit=20).
     sim.positions[runner_leg.ticket]["price_current"] = 2530.0
     sim.price = 2530.0
-    await tm._tick_once_account(ACCOUNT)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
 
     assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
     runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
@@ -1146,24 +1159,24 @@ async def test_tp2_partial_close_never_fires_for_sell_until_price_reaches_tp2():
     sim = SimuladorMT5()
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0)
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0)
     tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
     runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
     original_vol = sim.positions[runner_leg.ticket]["volume"]
     del sim.positions[tp1_leg.ticket]
-    await tm._tick_once_account(ACCOUNT)  # BE applied
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)  # BE applied
 
     # Still above tp2 (2470) -- must not trigger yet.
     sim.positions[runner_leg.ticket]["price_current"] = 2480.0
     sim.price = 2480.0
-    await tm._tick_once_account(ACCOUNT)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
     assert tm.trades[runner_leg.ticket].tp2_partial_applied is False
     assert sim.positions_get(ticket=runner_leg.ticket)[0].volume == original_vol
 
     # Reaches tp2 -- triggers now.
     sim.positions[runner_leg.ticket]["price_current"] = 2470.0
     sim.price = 2470.0
-    await tm._tick_once_account(ACCOUNT)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
     assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
     assert abs(sim.positions_get(ticket=runner_leg.ticket)[0].volume - original_vol/2.0) < 1e-9
 
@@ -1177,15 +1190,15 @@ async def test_tp2_partial_close_persists_flag_and_reconciles_from_store():
     sim.price = 2500.0
     store = RecordingStore()
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
-    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
     tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
     runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
     del sim.positions[tp1_leg.ticket]
-    await tm._tick_once_account(ACCOUNT)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
 
     sim.positions[runner_leg.ticket]["price_current"] = 2530.0
     sim.price = 2530.0
-    await tm._tick_once_account(ACCOUNT)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
     assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
 
     saved_doc = store.saved[-1]
@@ -1195,7 +1208,7 @@ async def test_tp2_partial_close_persists_flag_and_reconciles_from_store():
     # (same pattern as test_reconcile_recovers_full_state_from_store).
     store.docs[group_id] = saved_doc
     tm2 = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(), state_store=store)
-    summary = await tm2.reconcile_from_mt5([ACCOUNT])
+    summary = await tm2.reconcile_from_mt5([ACCOUNT_BIG_LOT])
     assert summary["recovered_from_redis"] == 1
     assert tm2.trades[runner_leg.ticket].tp2_partial_applied is True
 
@@ -2237,3 +2250,300 @@ async def test_notify_falls_back_to_old_notifier_when_no_event_bus_configured():
 
     events = [event for event, kwargs in tm.notifier.events if event == "group_opened"]
     assert len(events) == 1
+
+
+# =====================================================================
+# Final fix wave (2026-09-11) — whole-branch review findings
+# =====================================================================
+
+# --- Fix 1: close_partial_now must reject a request that MT5 would round
+#     into closing MORE (or less) than what was actually asked ---
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_rejects_when_min_volume_would_force_a_full_close():
+    """
+    Real production bug (money): with the documented production default
+    fixed_lot=0.01 == volume_min=0.01, mt5_client.partial_close's clamp turns
+    ANY percent request into a 100% close (close_vol rounds to 0.0, which is
+    < min_vol, and `volume > min_vol` is False, so it falls through to
+    close_vol = volume). A user asking to close 50% would have their WHOLE
+    position closed. Reject before touching MT5 instead.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert all(sim.positions[t.ticket]["volume"] == pytest.approx(0.01) for t in legs)
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    # Nothing was closed: both legs still open at their FULL original volume.
+    for t in legs:
+        assert t.ticket in sim.positions, "la pierna fue cerrada pese a ser un pedido invalido"
+        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.01)
+    assert result["results"][0]["status"] == "failed"
+    assert result["results"][0]["reason"] == "partial_close_rejected"
+
+    failures = [kwargs for event, kwargs in tm.notifier.events
+                if event == "mgmt_close_partial_now_failure"]
+    assert len(failures) == 1
+    summaries = " ".join(failures[0]["leg_summaries"])
+    assert "rechazado" in summaries
+    assert "minimo operable" in summaries
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_still_succeeds_when_both_halves_clear_the_minimum():
+    """Regression guard: the new validation must not over-reject a request
+    that MT5 would honour exactly as asked (0.10 lots, 50% -> 0.05/0.05,
+    both above volume_min=0.01)."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] == "applied"
+    for t in legs:
+        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.05)
+    successes = [e for e, _ in tm.notifier.events if e == "mgmt_close_partial_now"]
+    assert len(successes) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_allows_a_request_whose_both_sides_stay_tradeable():
+    """Documents the deliberate boundary of the new check: it guards
+    volume_min on BOTH sides, it does not try to guard MT5's step rounding.
+    0.02 lots at 80% rounds down to a 0.01 close leaving 0.01 -- both sides
+    tradeable, so it is allowed through."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    account = {"name": "demo", "active": True, "host": "x", "port": 1, "fixed_lot": 0.02}
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(account, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra 80%", correction=None, percent=80.0)
+
+    assert result["results"][0]["status"] == "applied"
+    for t in legs:
+        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.01)
+
+
+# --- Fix 2: percent must be validated to (0, 100) ---
+
+@pytest.mark.asyncio
+async def test_close_partial_now_rejects_a_negative_percent_without_touching_mt5():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra -50%", correction=None, percent=-50.0)
+
+    assert result["status"] == "invalid_percent"
+    for t in legs:
+        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.10)
+    events = [e for e, _ in tm.notifier.events if e == "mgmt_invalid_percent"]
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_rejects_a_percent_over_100_without_touching_mt5():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra 150%", correction=None, percent=150.0)
+
+    assert result["status"] == "invalid_percent"
+    for t in legs:
+        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.10)
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_rejects_exactly_100_percent_as_out_of_range():
+    """100% is not a PARTIAL close -- close_now is the action for that."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                        tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra todo", correction=None, percent=100.0)
+
+    assert result["status"] == "invalid_percent"
+
+
+# --- Fix 4: tp1_hit_be_failed must be a channel="both" event with a real message ---
+
+@pytest.mark.asyncio
+async def test_tp1_hit_be_failed_is_a_both_channel_event_with_a_telegram_message():
+    """
+    Spec section 6 lists tp1_hit_be_failed as a `both`-channel event: TP1 was
+    hit but the runner could NOT be moved to breakeven, so it sits unprotected
+    at its original SL. The plan wrongly left it audit-only.
+    """
+    from services.trade_orchestrator.event_bus import EventBus
+
+    with tempfile.TemporaryDirectory() as d:
+        audit_path = os.path.join(d, "audit_log.jsonl")
+        bus = EventBus(audit_path, redis_client=None)
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), event_bus=bus,
+                          channel_names={CHAT_ID: "Oro Premium"})
+        group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                       tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+        tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+        # Make every SL-move order_send fail so _force_runner_sl exhausts its retries.
+        original_order_send = sim.order_send
+
+        def failing_order_send(req):
+            if req.get("action") == 6:
+                return type('OrderSendResult', (), {'retcode': 10016, 'order': 0,
+                                                    'deal': 0, 'comment': 'Invalid stops'})()
+            return original_order_send(req)
+
+        sim.order_send = failing_order_send
+
+        sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+        await tm._tick_once_account(ACCOUNT)
+
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f.readlines()]
+        be_failed = next(l for l in lines if l["event_type"] == "tp1_hit_be_failed")
+        assert be_failed["channel"] == "both"
+        assert "Oro Premium" in be_failed["message"]
+        assert "breakeven" in be_failed["message"].lower()
+        assert be_failed["payload"]["channel_name"] == "Oro Premium"
+
+
+# --- Fix 5: mgmt_close_now's payload must carry leg_results and total_pnl_money ---
+
+@pytest.mark.asyncio
+async def test_mgmt_close_now_event_payload_includes_leg_results_and_total_pnl():
+    from services.trade_orchestrator.event_bus import EventBus
+
+    with tempfile.TemporaryDirectory() as d:
+        audit_path = os.path.join(d, "audit_log.jsonl")
+        bus = EventBus(audit_path, redis_client=None)
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), event_bus=bus)
+        group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                       tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+        legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+        # Give each leg a real, non-zero P&L on its closing deal.
+        original_partial_close = sim.partial_close
+
+        def partial_close_with_profit(account, ticket, percent):
+            return original_partial_close(account, ticket, percent, profit=7.5)
+
+        sim.partial_close = partial_close_with_profit
+
+        await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID,
+                                   raw_text="cierren todo", correction=None)
+
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f.readlines()]
+        close_now = next(l for l in lines if l["event_type"] == "mgmt_close_now")
+        assert close_now["channel"] == "both"
+        assert "leg_results" in close_now["payload"]
+        assert len(close_now["payload"]["leg_results"]) == len(legs)
+        assert {lr["leg"] for lr in close_now["payload"]["leg_results"]} == {"tp1", "runner"}
+        for lr in close_now["payload"]["leg_results"]:
+            assert lr["pnl_money"] == 7.5
+            assert lr["close_volume"] is not None
+        assert close_now["payload"]["total_pnl_money"] == pytest.approx(15.0)
+
+
+# --- Fix 6: TP2's remaining_volume must be the POST-close volume ---
+
+@pytest.mark.asyncio
+async def test_tp2_partial_closed_message_reports_the_post_close_remaining_volume():
+    """
+    The message was built from a position snapshot captured BEFORE
+    partial_close ran, producing self-contradictory output like
+    "Cerrado 50%: 0.05 lots ... 0.1 lots restantes" when 0.05 actually
+    remained.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)  # applies BE
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
+
+    # MT5 really left 0.05 open.
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)
+
+    partial = next(kwargs for event, kwargs in notifier.events if event == "tp2_partial_closed")
+    assert partial["remaining_volume"] == pytest.approx(0.05)
+    assert "0.05 lots restantes" in partial["message"]
+    assert "0.1 lots restantes" not in partial["message"]
+
+
+# --- Fix 1 (extended): the TP2 automatic partial close has the SAME bug ---
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_is_skipped_when_it_would_close_the_whole_runner():
+    """
+    Found while reproducing Fix 1: _apply_tp2_partial_close calls
+    partial_close(..., 50) on a runner that, on the production default
+    fixed_lot=0.01 (== volume_min), MT5 clamps into a 100% close. The runner
+    would silently vanish at TP2 instead of keeping half open with trailing.
+    Same money bug as Fix 1, second code path -- skip the partial instead,
+    and leave the runner trailing on its full volume.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    await tm._tick_once_account(ACCOUNT)
+
+    # The runner must STILL be open, at its full original volume.
+    assert runner_leg.ticket in sim.positions
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.01)
+    # No tp2_partial_closed event was emitted -- nothing was closed.
+    assert not [e for e, _ in notifier.events if e == "tp2_partial_closed"]
+    # Trailing still ran on the (unreduced) runner in that same tick.
+    assert tm.trades[runner_leg.ticket].peak_multiple == pytest.approx(1.0)
+    assert sim.positions[runner_leg.ticket]["sl"] == pytest.approx(2510.0)

@@ -10,6 +10,7 @@ from .event_messages import (
     build_move_sl_be_applied_message,
     build_partial_failure_message,
     build_close_partial_now_message,
+    build_tp1_hit_be_failed_message,
 )
 import asyncio
 import inspect
@@ -714,9 +715,20 @@ class TradeManager:
         else:
             log.error("[TM] BE no se pudo aplicar tras 3 intentos, runner=%s group_id=%s queda con SL original",
                       runner.ticket, tp1_leg.group_id)
+            # channel="both": spec seccion 6 lista este evento como `both`. Es
+            # el unico del catalogo donde el runner queda MAS expuesto de lo
+            # normal (sigue vivo con su SL original, sin el BE que ya se
+            # gano), asi que es discutiblemente la notificacion mas urgente
+            # de todas — dejarla audit-only significaba que nadie se enteraba.
+            channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
+            message = build_tp1_hit_be_failed_message(
+                channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                direction=tp1_leg.direction, runner_ticket=runner.ticket,
+            )
             await self._notify(
-                "tp1_hit_be_failed", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
-                message=f"TP1 de {tp1_leg.symbol} (group {tp1_leg.group_id}) se cerro, pero el runner (ticket {runner.ticket}) NO pudo moverse a breakeven tras 3 intentos. Requiere revision manual — sigue con su SL original.",
+                "tp1_hit_be_failed", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                direction=tp1_leg.direction, runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id,
+                channel_name=channel_name, message=message,
             )
 
     async def _get_close_deal_info(self, client, ticket: int) -> Optional[dict]:
@@ -790,6 +802,51 @@ class TradeManager:
             log.error("[TM] fallo moviendo SL runner=%s reason=%s tras %d intentos", runner.ticket, reason, attempts)
         return ok
 
+    async def _check_partial_close_is_honourable(self, client, ticket: int, symbol: str, percent: float) -> Optional[dict]:
+        """
+        Predice si MT5 cerraria EXACTAMENTE la fraccion pedida de `ticket`, o
+        si su clamp de volumen minimo terminaria cerrando algo distinto.
+        Devuelve None si el pedido es honrable tal cual; si no, un dict con
+        {volume, close_vol, volume_min, reason} describiendo por que no lo es.
+
+        Bug real de produccion (dinero): services/common/mt5_client.py's
+        partial_close calcula close_vol = step * int(raw_close / step) y, si
+        eso queda por debajo de volume_min, lo SUBE a min_vol — o, cuando la
+        posicion entera no supera min_vol, al VOLUMEN COMPLETO. Con el default
+        documentado de produccion (fixed_lot=0.01 == volume_min=0.01),
+        `volume > min_vol` es siempre False, asi que CUALQUIER pedido de
+        cierre parcial cerraba el 100% de la posicion sin que nadie lo pidiera.
+
+        La matematica de aqui replica linea por linea la de mt5_client.py a
+        proposito: si divergiera, la validacion dejaria de predecir lo que MT5
+        realmente haria, que es justamente lo que la hace util. La decision de
+        producto (confirmada con el usuario) es rechazar antes de tocar MT5,
+        nunca cerrar silenciosamente mas ni menos de lo pedido.
+        """
+        pos_list = await self._call(client.positions_get, ticket=ticket)
+        if not pos_list:
+            return {"volume": None, "close_vol": None, "volume_min": None, "reason": "position_not_found"}
+        volume = float(getattr(pos_list[0], "volume", 0.0) or 0.0)
+        info = await self._call(client.symbol_info, symbol)
+        step = float(getattr(info, "volume_step", 0.01)) if info else 0.01
+        min_vol = float(getattr(info, "volume_min", 0.01)) if info else 0.01
+        if volume <= 0:
+            return {"volume": volume, "close_vol": None, "volume_min": min_vol, "reason": "invalid_volume"}
+        raw_close = volume * (float(percent) / 100.0)
+        close_vol = step * int(raw_close / step)
+        # Tolerancia de 1e-9: raw_close/step en floats puede dar 4.999999999
+        # para lo que conceptualmente es 5 pasos exactos, y int() truncaria
+        # un paso de mas — el mismo riesgo existe en MT5, pero aqui preferimos
+        # no rechazar un pedido valido por ruido de punto flotante.
+        if abs(round(raw_close / step) - (raw_close / step)) < 1e-9:
+            close_vol = step * round(raw_close / step)
+        remaining = volume - close_vol
+        if close_vol < min_vol - 1e-9:
+            return {"volume": volume, "close_vol": close_vol, "volume_min": min_vol, "reason": "close_below_min"}
+        if remaining < min_vol - 1e-9:
+            return {"volume": volume, "close_vol": close_vol, "volume_min": min_vol, "reason": "remainder_below_min"}
+        return None
+
     async def _apply_tp2_partial_close(self, account, client, runner: ManagedTrade, pos) -> None:
         """
         TP2 partial close (product decision 2026-09-08, dual-TP spec seccion 4
@@ -823,6 +880,20 @@ class TradeManager:
         reached_tp2 = (current >= runner.tp2_price) if is_buy else (current <= runner.tp2_price)
         if not reached_tp2:
             return
+        # Mismo bug de dinero que Fix 1, en el segundo camino de codigo que
+        # llama partial_close con un porcentaje: con el default de produccion
+        # (fixed_lot=0.01 == volume_min=0.01), el clamp de mt5_client.py
+        # convierte este 50% en un cierre del 100% y el runner desaparece
+        # entero al tocar TP2, en vez de quedarse con la mitad haciendo
+        # trailing. Si el parcial no se puede honrar exactamente, se omite y
+        # el runner sigue con su volumen completo bajo trailing — nunca se
+        # cierra mas de lo que la mecanica pide.
+        problem = await self._check_partial_close_is_honourable(client, runner.ticket, runner.symbol, 50)
+        if problem is not None:
+            log.warning("[TM] TP2 partial close omitido: cerrar 50%% de %s dejaria un volumen menor al minimo "
+                        "operable %s (runner=%s group_id=%s motivo=%s) — el runner sigue completo con trailing",
+                        problem["volume"], problem["volume_min"], runner.ticket, runner.group_id, problem["reason"])
+            return
         ok = await self._call(client.partial_close, account, runner.ticket, 50)
         if not ok:
             log.error("[TM] fallo aplicando partial close en tp2 runner=%s group_id=%s",
@@ -834,7 +905,15 @@ class TradeManager:
         close_price = deal_info["price"] if deal_info else None
         pnl_money = deal_info["profit"] if deal_info else None
         close_volume = deal_info["volume"] if deal_info else None
-        remaining_volume = getattr(pos, "volume", None)
+        # Fix 6: `pos` es un snapshot tomado ANTES de partial_close, asi que su
+        # .volume es el volumen PRE-cierre. Usarlo producia un mensaje
+        # auto-contradictorio ("Cerrado 50%: 0.05 lots ... 0.1 lots restantes"
+        # cuando en realidad quedaban 0.05). Se re-lee la posicion viva
+        # despues del cierre — mismo patron que usa _tick_once_account tras
+        # llamar a este metodo. Se prefiere la re-lectura sobre calcular
+        # volume*0.5 para no atarse a que el 50% de arriba nunca cambie.
+        post_close = await self._call(client.positions_get, ticket=runner.ticket)
+        remaining_volume = float(post_close[0].volume) if post_close else getattr(pos, "volume", None)
         message = build_tp2_partial_closed_message(
             channel_name=channel_name, group_id=runner.group_id, symbol=runner.symbol, direction=runner.direction,
             close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, remaining_volume=remaining_volume,
@@ -1031,7 +1110,13 @@ class TradeManager:
                     )
                     await self._notify(
                         "mgmt_close_now", channel="both", group_id=group_id, chat_id=chat_id,
-                        channel_name=channel_name, raw_text=raw_text, message=message,
+                        channel_name=channel_name, raw_text=raw_text,
+                        # Fix 5: sin estos kwargs, leg_results/total_pnl_money solo
+                        # sobrevivian como prosa dentro de `message` y nunca llegaban
+                        # al payload de auditoria ni a la Data Table de n8n.
+                        # mgmt_close_partial_now ya lo hacia bien; este no.
+                        leg_results=leg_results, total_pnl_money=total_pnl_money,
+                        message=message,
                     )
                     await self._close_group_in_store(group_id)
                     results.append({"group_id": group_id, "status": "closed"})
@@ -1041,6 +1126,22 @@ class TradeManager:
             return {"status": "completed", "results": results}
 
         if action == "close_partial_now":
+            # Fix 2: `percent` viene de una extraccion LLM (Ollama) sobre texto
+            # libre, asi que un valor basura es una entrada realista. mgmt_api
+            # ya lo valida con Pydantic, pero apply_mgmt_action es parte de la
+            # API interna publica (tests y cualquier caller futuro la llaman
+            # directo): nunca confiar en una validacion que solo vive en el
+            # borde de red para una funcion que tambien se invoca por dentro.
+            if percent is not None and not (0 < percent < 100):
+                log.error("[TM][MGMT] close_partial_now con percent invalido=%s chat_id=%s text=%r",
+                          percent, chat_id, raw_text[:80])
+                await self._notify(
+                    "mgmt_invalid_percent", chat_id=chat_id, action=action, percent=percent, raw_text=raw_text,
+                    message=f"Cierre parcial solicitado con un porcentaje invalido ({percent}). "
+                            f"Debe ser mayor a 0 y menor a 100. No se toco ninguna posicion. "
+                            f"Texto: {raw_text!r}",
+                )
+                return {"status": "invalid_percent", "percent": percent}
             effective_percent = percent if percent is not None else 50.0
             results = []
             for group_id in group_ids:
@@ -1062,6 +1163,25 @@ class TradeManager:
                     any_leg_failed = False
                     leg_summaries = []
                     for t in list(legs):
+                        # Fix 1: validar POR PIERNA (cada una tiene su propio
+                        # volumen vivo) antes de tocar MT5 — ver
+                        # _check_partial_close_is_honourable para el bug de
+                        # dinero que esto evita.
+                        problem = await self._check_partial_close_is_honourable(
+                            client, t.ticket, t.symbol, effective_percent,
+                        )
+                        if problem is not None:
+                            any_leg_failed = True
+                            leg_summaries.append(
+                                f"{t.leg} (ticket={t.ticket}, rechazado: {effective_percent:.0f}% de "
+                                f"{problem['volume']} resultaria en un volumen menor al minimo operable "
+                                f"{problem['volume_min']})"
+                            )
+                            log.error("[TM][MGMT] close_partial_now rechazado por volumen | ticket=%s leg=%s "
+                                      "group_id=%s percent=%s volume=%s close_vol=%s volume_min=%s motivo=%s",
+                                      t.ticket, t.leg, group_id, effective_percent, problem["volume"],
+                                      problem["close_vol"], problem["volume_min"], problem["reason"])
+                            continue
                         ok = await self._call(client.partial_close, account, t.ticket, effective_percent)
                         if not ok:
                             any_leg_failed = True
