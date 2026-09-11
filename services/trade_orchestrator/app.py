@@ -17,6 +17,16 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=log_fmt)
 log = logging.getLogger("trade_orchestrator")
 
 
+def parse_channel_names_json(raw: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        log.warning("CHANNEL_NAMES_JSON invalido, usando mapeo vacio: %s", e)
+        return {}
+
+
 async def handle_signal_fields(fields: dict, tradeManager: TradeManager, accounts: list[dict]) -> None:
     """
     Procesa un mensaje de Streams.SIGNALS (senal fast o completa de TradePulse)
@@ -120,22 +130,28 @@ async def main():
     r = await redis_client(s["redis_url"])
     accounts = Settings.accounts()
 
-    from services.common.n8n_notifier import N8nWebhookNotifier
-    from .notifications.n8n import N8nNotifierAdapter
+    from services.trade_orchestrator.event_bus import EventBus
+    from services.trade_orchestrator.n8n_event_client import N8nEventClient
+    from services.trade_orchestrator.n8n_retry_worker import run_retry_worker
 
-    notifier_adapter = None
-    webhook_url = _config.get("N8N_WEBHOOK_URL", "")
-    if webhook_url:
-        n8n_notifier = N8nWebhookNotifier(webhook_url, token=_config.get("N8N_WEBHOOK_TOKEN", ""))
-        notifier_adapter = N8nNotifierAdapter(n8n_notifier)
-        log.info("N8nNotifierAdapter initialized (webhook_url=%s)", webhook_url)
+    audit_log_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "audit_log.jsonl")
+    event_webhook_url = _config.get("N8N_EVENT_WEBHOOK_URL", "")
+    event_bus = None
+    n8n_event_client = None
+    if event_webhook_url:
+        n8n_event_client = N8nEventClient(event_webhook_url, token=_config.get("N8N_EVENT_WEBHOOK_TOKEN", ""))
+        event_bus = EventBus(audit_log_path, redis_client=r)
+        log.info("EventBus initialized (event_webhook_url=%s)", event_webhook_url)
     else:
-        log.warning("N8N_WEBHOOK_URL not configured — trade notifications disabled")
+        event_bus = EventBus(audit_log_path, redis_client=None)
+        log.warning("N8N_EVENT_WEBHOOK_URL not configured — audit log still writes locally, n8n delivery disabled")
+
+    channel_names = parse_channel_names_json(_config.get("CHANNEL_NAMES_JSON", ""))
 
     tradeExecutor = MT5Executor(
         accounts,
         magic=987654,
-        notifier=notifier_adapter,
+        notifier=None,
         trading_windows=s["trading_windows"],
         entry_wait_seconds=int(s["entry_wait_seconds"]),
         entry_poll_ms=int(s["entry_poll_ms"]),
@@ -143,7 +159,10 @@ async def main():
         config_provider=_config,
     )
     state_store = TradeStateStore(r, os.path.join(os.path.dirname(__file__), "..", "..", "data", "trade_state.jsonl"))
-    tradeManager = TradeManager(tradeExecutor, notifier=notifier_adapter, config_provider=_config, state_store=state_store)
+    tradeManager = TradeManager(
+        tradeExecutor, event_bus=event_bus, config_provider=_config, state_store=state_store,
+        channel_names=channel_names,
+    )
 
     reconciliation_summary = await tradeManager.reconcile_from_mt5(accounts)
     log.info("[RECONCILE] al arranque: %s", reconciliation_summary)
@@ -167,7 +186,10 @@ async def main():
                 log.exception("[SIGNAL] error procesando senal: %s", fields)
 
     asyncio.create_task(tradeManager.run_forever())
-    await asyncio.gather(loop_signals(), uvicorn_server.serve())
+    tasks = [loop_signals(), uvicorn_server.serve()]
+    if n8n_event_client is not None:
+        tasks.append(run_retry_worker(r, n8n_event_client, audit_log_path))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
