@@ -39,29 +39,35 @@ async def _requeue_due_delayed(redis_client) -> None:
 
 async def run_retry_worker(redis_client, n8n_client, audit_log_path: str, *, poll_interval_seconds: float = 1.0) -> None:
     while True:
-        await _requeue_due_delayed(redis_client)
+        try:
+            await _requeue_due_delayed(redis_client)
 
-        raw = await redis_client.lpop(QUEUE_KEY)
-        if raw is None:
+            raw = await redis_client.lpop(QUEUE_KEY)
+            if raw is None:
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+
+            item = json.loads(raw)
+            envelope = item["envelope"]
+            attempt = item["attempt"]
+
+            ok = await n8n_client.post_event(envelope)
+            if ok:
+                continue
+
+            if attempt >= len(BACKOFF_SECONDS) - 1:
+                log.error("[N8N_RETRY] evento agoto reintentos, marcado dead_letter event_id=%s", envelope.get("event_id"))
+                mark_dead_letter(audit_log_path, envelope.get("event_id"))
+                continue
+
+            delay = BACKOFF_SECONDS[attempt]
+            next_attempt = attempt + 1
+            due_at = time.time() + delay
+            next_item = json.dumps({"envelope": envelope, "attempt": next_attempt}, ensure_ascii=False)
+            await redis_client.zadd(_DELAYED_KEY, {next_item: due_at})
+            log.warning("[N8N_RETRY] evento fallo, reintento %s en %ss event_id=%s", next_attempt, delay, envelope.get("event_id"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("[N8N_RETRY] error inesperado en el loop del worker, se continua en la siguiente iteracion: %s", e)
             await asyncio.sleep(poll_interval_seconds)
-            continue
-
-        item = json.loads(raw)
-        envelope = item["envelope"]
-        attempt = item["attempt"]
-
-        ok = await n8n_client.post_event(envelope)
-        if ok:
-            continue
-
-        if attempt >= len(BACKOFF_SECONDS) - 1:
-            log.error("[N8N_RETRY] evento agoto reintentos, marcado dead_letter event_id=%s", envelope.get("event_id"))
-            mark_dead_letter(audit_log_path, envelope.get("event_id"))
-            continue
-
-        next_attempt = attempt + 1
-        delay = BACKOFF_SECONDS[next_attempt]
-        due_at = time.time() + delay
-        next_item = json.dumps({"envelope": envelope, "attempt": next_attempt}, ensure_ascii=False)
-        await redis_client.zadd(_DELAYED_KEY, {next_item: due_at})
-        log.warning("[N8N_RETRY] evento fallo, reintento %s en %ss event_id=%s", next_attempt, delay, envelope.get("event_id"))
