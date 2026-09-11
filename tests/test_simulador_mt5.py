@@ -1,5 +1,10 @@
 import pytest
 
+DEAL_REASON_CLIENT = 0
+DEAL_REASON_SL = 4
+DEAL_REASON_TP = 5
+
+
 class SimuladorMT5:
     def __init__(self):
         self.positions = {}
@@ -11,8 +16,10 @@ class SimuladorMT5:
         self.stops_level = 20  # en puntos
         self.point = 0.1
 
-    def _record_deal(self, ticket, *, entry, price):
+    def _record_deal(self, ticket, *, entry, price, reason=DEAL_REASON_CLIENT, profit=0.0,
+                      volume=None, commission=0.0, swap=0.0):
         self.last_deal += 1
+        pos = self.positions.get(ticket, {})
         self.deals_by_position.setdefault(ticket, []).append({
             'ticket': self.last_deal,
             'order': ticket,
@@ -20,6 +27,11 @@ class SimuladorMT5:
             'price': price,
             'entry': entry,
             'time': self.last_deal,  # monotonic stand-in for a real timestamp
+            'reason': reason,
+            'profit': profit,
+            'volume': volume if volume is not None else pos.get('volume', 0.0),
+            'commission': commission,
+            'swap': swap,
         })
 
     def order_send(self, req):
@@ -74,12 +86,14 @@ class SimuladorMT5:
         """Devuelve el precio simulado actual (ask/bid no se distinguen en este simulador)."""
         return float(self.price)
 
-    def partial_close(self, account, ticket, percent):
+    def partial_close(self, account, ticket, percent, *, reason=DEAL_REASON_CLIENT, profit=0.0):
         """Cierra (parcial o totalmente) una posicion simulada. Si percent>=100, elimina la posicion."""
         pos = self.positions.get(ticket)
         if not pos:
             return False
-        self._record_deal(ticket, entry=1, price=pos.get('price_current', self.price))
+        closed_volume = float(pos.get('volume', 0.0)) * (percent / 100.0)
+        self._record_deal(ticket, entry=1, price=pos.get('price_current', self.price),
+                           reason=reason, profit=profit, volume=closed_volume)
         if percent >= 100:
             del self.positions[ticket]
         else:
@@ -100,6 +114,24 @@ class SimuladorMT5:
             return
         price = close_price if close_price is not None else pos.get('price_current', self.price)
         self._record_deal(ticket, entry=1, price=price)
+        del self.positions[ticket]
+
+    def close_position_by_sl(self, ticket, *, close_price=None, profit=0.0):
+        """Test helper: simula que el broker cerro la posicion por stop loss."""
+        pos = self.positions.get(ticket)
+        if not pos:
+            return
+        price = close_price if close_price is not None else pos.get('sl', self.price)
+        self._record_deal(ticket, entry=1, price=price, reason=DEAL_REASON_SL, profit=profit)
+        del self.positions[ticket]
+
+    def close_position_by_tp(self, ticket, *, close_price=None, profit=0.0):
+        """Test helper: simula que el broker cerro la posicion por take profit."""
+        pos = self.positions.get(ticket)
+        if not pos:
+            return
+        price = close_price if close_price is not None else pos.get('tp', self.price)
+        self._record_deal(ticket, entry=1, price=price, reason=DEAL_REASON_TP, profit=profit)
         del self.positions[ticket]
 
 # Ejemplo de test de gestión con el simulador
@@ -132,3 +164,54 @@ def test_be_aplicado():
     assert abs(pos.sl - 2500.0) < 1e-4
 
 # Puedes agregar más tests para TP, cierre parcial, etc.
+
+
+def test_record_deal_defaults_keep_backward_compatible_shape():
+    sim = SimuladorMT5()
+    sim.positions[1] = {"ticket": 1, "symbol": "XAUUSD", "volume": 0.02, "price_open": 2500.0,
+                         "sl": 0.0, "tp": 0.0, "price_current": 2500.0, "type": 0, "comment": "", "magic": 0}
+    sim._record_deal(1, entry=1, price=2510.0)
+
+    deals = sim.history_deals_get(position=1)
+    assert deals[0].reason == 0  # DEAL_REASON_CLIENT default
+    assert deals[0].profit == 0.0
+    assert deals[0].commission == 0.0
+    assert deals[0].swap == 0.0
+
+
+def test_close_position_by_sl_sets_reason_and_profit():
+    sim = SimuladorMT5()
+    sim.positions[1] = {"ticket": 1, "symbol": "XAUUSD", "volume": 0.02, "price_open": 2500.0,
+                         "sl": 2490.0, "tp": 0.0, "price_current": 2490.0, "type": 0, "comment": "", "magic": 0}
+
+    sim.close_position_by_sl(1, close_price=2490.0, profit=-20.0)
+
+    deals = sim.history_deals_get(position=1)
+    assert deals[-1].reason == 4  # DEAL_REASON_SL
+    assert deals[-1].price == 2490.0
+    assert deals[-1].profit == -20.0
+    assert 1 not in sim.positions
+
+
+def test_close_position_by_tp_sets_reason_and_profit():
+    sim = SimuladorMT5()
+    sim.positions[1] = {"ticket": 1, "symbol": "XAUUSD", "volume": 0.02, "price_open": 2500.0,
+                         "sl": 0.0, "tp": 2510.0, "price_current": 2510.0, "type": 0, "comment": "", "magic": 0}
+
+    sim.close_position_by_tp(1, close_price=2510.0, profit=20.0)
+
+    deals = sim.history_deals_get(position=1)
+    assert deals[-1].reason == 5  # DEAL_REASON_TP
+    assert deals[-1].profit == 20.0
+    assert 1 not in sim.positions
+
+
+def test_partial_close_still_defaults_to_client_reason():
+    sim = SimuladorMT5()
+    sim.positions[1] = {"ticket": 1, "symbol": "XAUUSD", "volume": 0.02, "price_open": 2500.0,
+                         "sl": 0.0, "tp": 0.0, "price_current": 2505.0, "type": 0, "comment": "", "magic": 0}
+
+    sim.partial_close(None, 1, 100)
+
+    deals = sim.history_deals_get(position=1)
+    assert deals[-1].reason == 0  # DEAL_REASON_CLIENT
