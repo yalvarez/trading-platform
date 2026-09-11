@@ -215,3 +215,16 @@ def test_partial_close_still_defaults_to_client_reason():
 
     deals = sim.history_deals_get(position=1)
     assert deals[-1].reason == 0  # DEAL_REASON_CLIENT
+
+
+def test_partial_close_records_fractional_volume_correctly():
+    sim = SimuladorMT5()
+    sim.positions[1] = {"ticket": 1, "symbol": "XAUUSD", "volume": 0.02, "price_open": 2500.0,
+                         "sl": 0.0, "tp": 0.0, "price_current": 2505.0, "type": 0, "comment": "", "magic": 0}
+
+    sim.partial_close(None, 1, 50)  # cierre parcial del 50%
+
+    deals = sim.history_deals_get(position=1)
+    assert deals[-1].volume == pytest.approx(0.01)  # 50% de 0.02
+    # la posicion sigue existiendo con el volumen restante
+    assert sim.positions[1]["volume"] == pytest.approx(0.01)
