@@ -128,3 +128,34 @@ def test_direction_none_handled_gracefully_in_all_functions():
     )
     assert "N/D" in msg
     assert "EXTERNO" in msg.upper()
+
+
+# --- Final fix wave (2026-09-11), Fix 4: tp1_hit_be_failed message ---
+
+def test_tp1_hit_be_failed_message_conveys_the_runner_is_unprotected():
+    from services.trade_orchestrator.event_messages import build_tp1_hit_be_failed_message
+
+    msg = build_tp1_hit_be_failed_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD",
+        direction="BUY", runner_ticket=123456,
+    )
+    assert "Oro Premium" in msg
+    assert "61" in msg
+    assert "EURUSD" in msg
+    assert "BUY" in msg
+    assert "123456" in msg
+    assert "breakeven" in msg.lower()
+    # This is the one event where the runner is MORE exposed than normal --
+    # the text must say so and ask for manual review.
+    assert "manual" in msg.lower()
+    assert "NO" in msg
+
+
+def test_tp1_hit_be_failed_message_handles_direction_none():
+    from services.trade_orchestrator.event_messages import build_tp1_hit_be_failed_message
+
+    msg = build_tp1_hit_be_failed_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD",
+        direction=None, runner_ticket=123456,
+    )
+    assert "N/D" in msg

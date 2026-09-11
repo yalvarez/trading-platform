@@ -50,6 +50,23 @@ def build_tp1_hit_message(*, channel_name, group_id, symbol, direction, close_pr
     )
 
 
+def build_tp1_hit_be_failed_message(*, channel_name, group_id, symbol, direction, runner_ticket) -> str:
+    """
+    TP1 se alcanzo pero el runner NO pudo moverse a breakeven tras 3 intentos:
+    queda vivo con su SL ORIGINAL, es decir MAS expuesto que en cualquier otro
+    evento del catalogo (en todos los demas el riesgo baja o la posicion se
+    cierra). Por eso el tono es de alerta explicita y pide revision manual —
+    nadie mas va a reintentar el BE por su cuenta.
+    """
+    return (
+        f"\U0001F6A8 ATENCION — TP1 alcanzado pero BE NO aplicado — Canal: {channel_name} (grupo {group_id})\n"
+        f"{symbol} {_fmt_direction(direction)}\n"
+        f"El runner (ticket {runner_ticket}) NO pudo moverse a breakeven tras 3 intentos.\n"
+        f"Sigue abierto con su SL ORIGINAL — el riesgo NO se redujo.\n"
+        f"Requiere revision manual inmediata."
+    )
+
+
 def build_tp2_partial_closed_message(*, channel_name, group_id, symbol, direction, close_price, close_volume, pnl_money, remaining_volume) -> str:
     return (
         f"✅ TP2 ALCANZADO — Canal: {channel_name} (grupo {group_id})\n"
