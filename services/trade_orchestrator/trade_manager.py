@@ -43,9 +43,24 @@ class ManagedTrade:
     entry_price: Optional[float] = None
     be_applied: bool = False
     tp2_partial_applied: bool = False
+    # Latch del guard de TP2: volumen con el que ya se determino que el cierre
+    # parcial del 50% NO era honrable (ver _apply_tp2_partial_close). Existe
+    # SOLO para no repetir esa consulta a MT5 y su WARNING en cada tick del
+    # loop (10 veces por segundo, indefinidamente) — no es estado de negocio.
+    # Guarda el volumen evaluado, no un bool, para que el veredicto deje de
+    # aplicarse por si solo si el volumen vivo llegara a cambiar. Deliberadamente
+    # NO se persiste en _group_doc: tras un restart, re-evaluarlo una vez es
+    # correcto y barato.
+    tp2_partial_skipped_volume: Optional[float] = None
     peak_multiple: float = 0.0
     opened_ts: float = field(default_factory=lambda: time.time())
     chat_id: Optional[str] = None
+
+    @property
+    def tp2_partial_skipped(self) -> bool:
+        """True si el guard de TP2 ya descarto el cierre parcial para esta
+        pierna (lectura conveniente del latch tp2_partial_skipped_volume)."""
+        return self.tp2_partial_skipped_volume is not None
 
 
 class TradeManager:
@@ -880,6 +895,28 @@ class TradeManager:
         reached_tp2 = (current >= runner.tp2_price) if is_buy else (current <= runner.tp2_price)
         if not reached_tp2:
             return
+        # Latch: si ya se determino que el parcial no es honrable PARA ESTE
+        # MISMO volumen, no se vuelve a consultar a MT5 ni se re-loguea.
+        #
+        # Bug real introducido por el propio fix de TP2 (encontrado en la
+        # re-revision): tp2_partial_applied se queda en False a proposito
+        # (nada paso en MT5), asi que sin este latch el guard se re-evaluaba
+        # en CADA tick — LOOP_INTERVAL=0.1s, o sea 10 veces por segundo — por
+        # el resto de la vida del runner. En la cuenta de produccion
+        # (fixed_lot=0.01, donde el skip SIEMPRE se dispara) eso son ~36k
+        # llamadas extra a positions_get y ~36k lineas WARNING por hora, por
+        # runner. positions_get toma el lock de PooledMT5Client, que tiene un
+        # bug conocido en vivo (el lock no se libera si la llamada hace
+        # timeout), asi que esto aumentaba la exposicion a ese bug
+        # justamente en el camino de produccion por defecto.
+        #
+        # Se compara contra el volumen del snapshot `pos` que ya tenemos en
+        # mano (gratis, sin RPC): si el volumen no cambio, el veredicto
+        # anterior sigue siendo valido y no hay nada que reconsiderar.
+        current_volume = getattr(pos, "volume", None)
+        if runner.tp2_partial_skipped_volume is not None and current_volume is not None \
+                and abs(float(current_volume) - runner.tp2_partial_skipped_volume) < 1e-9:
+            return
         # Mismo bug de dinero que Fix 1, en el segundo camino de codigo que
         # llama partial_close con un porcentaje: con el default de produccion
         # (fixed_lot=0.01 == volume_min=0.01), el clamp de mt5_client.py
@@ -890,10 +927,20 @@ class TradeManager:
         # cierra mas de lo que la mecanica pide.
         problem = await self._check_partial_close_is_honourable(client, runner.ticket, runner.symbol, 50)
         if problem is not None:
+            # Latchear ANTES de loguear, sobre el volumen que realmente se
+            # evaluo (el que vio el helper), cayendo al del snapshot si el
+            # helper no pudo leerlo (posicion ya inexistente).
+            evaluated_volume = problem["volume"]
+            if evaluated_volume is None:
+                evaluated_volume = float(current_volume) if current_volume is not None else -1.0
+            runner.tp2_partial_skipped_volume = float(evaluated_volume)
             log.warning("[TM] TP2 partial close omitido: cerrar 50%% de %s dejaria un volumen menor al minimo "
-                        "operable %s (runner=%s group_id=%s motivo=%s) — el runner sigue completo con trailing",
+                        "operable %s (runner=%s group_id=%s motivo=%s) — el runner sigue completo con trailing. "
+                        "No se repetira este chequeo mientras el volumen no cambie.",
                         problem["volume"], problem["volume_min"], runner.ticket, runner.group_id, problem["reason"])
             return
+        # El parcial es honrable: cualquier latch previo quedo obsoleto.
+        runner.tp2_partial_skipped_volume = None
         ok = await self._call(client.partial_close, account, runner.ticket, 50)
         if not ok:
             log.error("[TM] fallo aplicando partial close en tp2 runner=%s group_id=%s",
@@ -1172,12 +1219,22 @@ class TradeManager:
                         )
                         if problem is not None:
                             any_leg_failed = True
-                            leg_summaries.append(
-                                f"{t.leg} (ticket={t.ticket}, rechazado: {effective_percent:.0f}% de "
-                                f"{problem['volume']} resultaria en un volumen menor al minimo operable "
-                                f"{problem['volume_min']})"
-                            )
-                            log.error("[TM][MGMT] close_partial_now rechazado por volumen | ticket=%s leg=%s "
+                            # El texto debe nombrar la causa REAL. Antes decia
+                            # siempre "volumen menor al minimo operable" con
+                            # volumen/minimo en None cuando en realidad la
+                            # posicion ya no existia (p. ej. el SL salto justo
+                            # antes de que llegara el comando) — engañoso para
+                            # el operador, aunque el comportamiento de fondo
+                            # (abstenerse de actuar) siempre fue el correcto.
+                            if problem["reason"] == "position_not_found":
+                                detail = "la posicion ya no existe en MT5 (pudo cerrarse por SL/TP o externamente)"
+                            elif problem["reason"] == "invalid_volume":
+                                detail = "MT5 reporta un volumen invalido para la posicion"
+                            else:
+                                detail = (f"{effective_percent:.0f}% de {problem['volume']} resultaria en un "
+                                          f"volumen menor al minimo operable {problem['volume_min']}")
+                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado: {detail})")
+                            log.error("[TM][MGMT] close_partial_now rechazado | ticket=%s leg=%s "
                                       "group_id=%s percent=%s volume=%s close_vol=%s volume_min=%s motivo=%s",
                                       t.ticket, t.leg, group_id, effective_percent, problem["volume"],
                                       problem["close_vol"], problem["volume_min"], problem["reason"])

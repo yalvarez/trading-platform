@@ -2547,3 +2547,182 @@ async def test_tp2_partial_close_is_skipped_when_it_would_close_the_whole_runner
     # Trailing still ran on the (unreduced) runner in that same tick.
     assert tm.trades[runner_leg.ticket].peak_multiple == pytest.approx(1.0)
     assert sim.positions[runner_leg.ticket]["sl"] == pytest.approx(2510.0)
+
+
+# =====================================================================
+# Final fix wave, round 2 (2026-09-11) — re-review findings
+# =====================================================================
+
+# --- Round 2 / Important: the TP2 skip guard must latch, not re-evaluate
+#     on every tick forever ---
+
+@pytest.mark.asyncio
+async def test_tp2_skip_guard_checks_mt5_only_once_per_runner_across_many_ticks():
+    """
+    Round-2 regression: tp2_partial_applied correctly stays False when the
+    partial is skipped (nothing happened in MT5), but that left NOTHING
+    remembering the decision -- so the guard re-ran positions_get +
+    symbol_info and re-logged the WARNING on every tick of the management
+    loop (LOOP_INTERVAL=0.1s -> 10x/second) for the rest of the runner's
+    life. On the production default (fixed_lot=0.01, where the skip ALWAYS
+    fires) that is ~36k extra positions_get calls and ~36k WARNING lines per
+    hour, per affected runner, forever.
+
+    positions_get takes PooledMT5Client's lock, which has a known live bug
+    (the lock is never released if a call times out), so this was materially
+    increasing exposure to that bug on the DEFAULT production path.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)  # applies BE
+
+    # Count symbol_info calls: the skip guard is the only caller of it in
+    # this flow, so it is a precise probe for "did the guard re-evaluate?".
+    original_symbol_info = sim.symbol_info
+    calls = {"n": 0}
+
+    def counting_symbol_info(symbol):
+        calls["n"] += 1
+        return original_symbol_info(symbol)
+
+    sim.symbol_info = counting_symbol_info
+
+    # Price sits past tp2 and STAYS there for many ticks, exactly like a real
+    # runner that reached tp2 and keeps trailing.
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    for _ in range(25):
+        await tm._tick_once_account(ACCOUNT)
+
+    # The guard evaluated exactly once, not 25 times.
+    assert calls["n"] == 1, f"el guard de TP2 se re-evaluo {calls['n']} veces en 25 ticks"
+    # And the latch is what remembers it.
+    assert tm.trades[runner_leg.ticket].tp2_partial_skipped is True
+    # tp2_partial_applied stays False -- nothing was actually closed in MT5.
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is False
+    # The runner is untouched and still fully open.
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_tp2_skip_guard_logs_the_warning_only_once(caplog):
+    """The WARNING is the operator-visible half of the same problem: 10 lines
+    per second forever would bury every other log line."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    with caplog.at_level("WARNING", logger="trade_orchestrator.trade_manager"):
+        for _ in range(15):
+            await tm._tick_once_account(ACCOUNT)
+
+    skipped = [r for r in caplog.records if "TP2 partial close omitido" in r.getMessage()]
+    assert len(skipped) == 1, f"se logueo {len(skipped)} veces en 15 ticks"
+
+
+@pytest.mark.asyncio
+async def test_tp2_skip_latch_reopens_if_the_volume_ever_becomes_honourable():
+    """
+    The latch keys on the volume it evaluated, not on a bare boolean, so it
+    stops repeating for the common case WITHOUT permanently blinding the
+    guard if the position's volume ever genuinely changes (at which point
+    the earlier "not honourable" verdict no longer describes reality).
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    del sim.positions[tp1_leg.ticket]
+    await tm._tick_once_account(ACCOUNT)
+
+    sim.positions[runner_leg.ticket]["price_current"] = 2530.0
+    sim.price = 2530.0
+    await tm._tick_once_account(ACCOUNT)
+    assert tm.trades[runner_leg.ticket].tp2_partial_skipped is True
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is False
+
+    # Volume grows to a size where a 50% close IS honourable (0.10 -> 0.05/0.05).
+    sim.positions[runner_leg.ticket]["volume"] = 0.10
+    await tm._tick_once_account(ACCOUNT)
+
+    # The guard re-evaluated and the partial finally went through.
+    assert tm.trades[runner_leg.ticket].tp2_partial_applied is True
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)
+
+
+# --- Round 2 / Minor: a leg rejected because the position is GONE must not
+#     be reported as "rechazada por el broker" with None volumes ---
+
+@pytest.mark.asyncio
+async def test_close_partial_now_reports_a_vanished_position_accurately():
+    """
+    When the real cause is position_not_found (e.g. the SL fired moments
+    before the management command arrived), the old summary claimed the
+    broker rejected it over a minimum-volume problem and printed
+    "None"/"None" for volume/minimum -- misleading the operator about what
+    actually happened. The underlying behaviour was always safe (it
+    correctly declines to act); only the text was wrong.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                                   tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    # Both positions vanish from MT5 (SL hit) before the command lands, while
+    # they are still tracked in self.trades.
+    for t in legs:
+        del sim.positions[t.ticket]
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                                        raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] == "failed"
+    failures = [kwargs for event, kwargs in tm.notifier.events
+                if event == "mgmt_close_partial_now_failure"]
+    assert len(failures) == 1
+    summaries = " ".join(failures[0]["leg_summaries"])
+    # Says the position no longer exists...
+    assert "ya no existe" in summaries
+    # ...and does NOT claim a minimum-volume problem, nor print None figures.
+    assert "minimo operable" not in summaries
+    assert "None" not in summaries
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_still_names_the_minimum_volume_cause_when_that_is_the_cause():
+    """Guard for the fix above: the volume-minimum wording must survive for
+    the case it was written for."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0,
+                        tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
+                               raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    failures = [kwargs for event, kwargs in tm.notifier.events
+                if event == "mgmt_close_partial_now_failure"]
+    summaries = " ".join(failures[0]["leg_summaries"])
+    assert "minimo operable" in summaries
+    assert "ya no existe" not in summaries
+    assert "None" not in summaries
