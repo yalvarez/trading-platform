@@ -67,3 +67,19 @@ def test_mark_dead_letter_returns_false_when_event_id_not_found():
                              "timestamp": "t", "message": "m", "payload": {}})
 
         assert mark_dead_letter(path, "does-not-exist") is False
+
+
+def test_append_event_raises_on_io_failure():
+    """Regression test: append_event must propagate I/O exceptions.
+    Uses a path pointing to an existing directory instead of a file."""
+    with tempfile.TemporaryDirectory() as d:
+        # Create a directory where the file should be
+        dir_path = os.path.join(d, "dir_as_file.jsonl")
+        os.makedirs(dir_path)
+
+        envelope = {"event_id": "1", "event_type": "a", "channel": "audit",
+                    "timestamp": "t", "message": "m", "payload": {}}
+
+        # Should raise IsADirectoryError (or similar) when trying to open a directory as a file
+        with pytest.raises((IsADirectoryError, OSError)):
+            append_event(dir_path, envelope)

@@ -21,7 +21,9 @@ def append_event(path: str, envelope: dict) -> None:
 
 def mark_dead_letter(path: str, event_id: str) -> bool:
     """Reescribe la linea cuyo event_id coincide, agregando
-    delivery_status='dead_letter'. Retorna True si la encontro."""
+    delivery_status='dead_letter'. Retorna True si la encontro.
+    Usa escritura atómica (archivo temporal + os.replace) para evitar
+    corrupción si el proceso se cae durante la reescritura."""
     if not os.path.exists(path):
         return False
     with open(path, "r", encoding="utf-8") as f:
@@ -35,6 +37,8 @@ def mark_dead_letter(path: str, event_id: str) -> bool:
             found = True
         new_lines.append(json.dumps(record, ensure_ascii=False) + "\n")
     if found:
-        with open(path, "w", encoding="utf-8") as f:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
+        os.replace(tmp_path, path)
     return found
