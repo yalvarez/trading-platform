@@ -9,6 +9,7 @@ from .event_messages import (
     build_close_now_message,
     build_move_sl_be_applied_message,
     build_partial_failure_message,
+    build_close_partial_now_message,
 )
 import asyncio
 import inspect
@@ -955,7 +956,7 @@ class TradeManager:
             log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")
             await self._persist_group(runner.group_id)
 
-    async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict]) -> dict:
+    async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict], percent: Optional[float] = None) -> dict:
         """
         Ejecuta una decision de /mgmt/action (chat_id-scoping spec seccion 5).
         Resuelve TODOS los grupos activos del `chat_id` que mando el mensaje
@@ -1036,6 +1037,66 @@ class TradeManager:
                     results.append({"group_id": group_id, "status": "closed"})
                 except Exception as e:
                     log.error("[TM][MGMT] excepcion cerrando group_id=%s chat_id=%s: %s", group_id, chat_id, e)
+                    results.append({"group_id": group_id, "status": "failed", "reason": "exception"})
+            return {"status": "completed", "results": results}
+
+        if action == "close_partial_now":
+            effective_percent = percent if percent is not None else 50.0
+            results = []
+            for group_id in group_ids:
+                try:
+                    legs = [t for t in self.trades.values() if t.group_id == group_id]
+                    account = self._ensure_account_dict(legs[0].account_name)
+                    if not account:
+                        log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
+                        await self._notify(
+                            "mgmt_account_unresolved",
+                            message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
+                            chat_id=chat_id, group_id=group_id, action=action,
+                        )
+                        results.append({"group_id": group_id, "status": "failed", "reason": "account_unresolved"})
+                        continue
+                    client = self.mt5._client_for(account)
+                    channel_name = resolve_channel_name(chat_id, self._channel_names())
+                    leg_results = []
+                    any_leg_failed = False
+                    leg_summaries = []
+                    for t in list(legs):
+                        ok = await self._call(client.partial_close, account, t.ticket, effective_percent)
+                        if not ok:
+                            any_leg_failed = True
+                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
+                            log.error("[TM][MGMT] partial_close (parcial %.0f%%) rechazado | ticket=%s leg=%s group_id=%s",
+                                      effective_percent, t.ticket, t.leg, group_id)
+                            continue
+                        deal_info = await self._get_close_deal_info(client, t.ticket)
+                        leg_results.append({
+                            "leg": t.leg,
+                            "close_price": deal_info["price"] if deal_info else None,
+                            "close_volume": deal_info["volume"] if deal_info else None,
+                            "pnl_money": deal_info["profit"] if deal_info else None,
+                        })
+                    if any_leg_failed:
+                        message = build_partial_failure_message(channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries)
+                        await self._notify(
+                            "mgmt_close_partial_now_failure", channel="both", group_id=group_id, chat_id=chat_id,
+                            channel_name=channel_name, raw_text=raw_text, percent_requested=effective_percent,
+                            leg_summaries=leg_summaries, message=message,
+                        )
+                        results.append({"group_id": group_id, "status": "failed", "reason": "partial_close_rejected"})
+                        continue
+                    message = build_close_partial_now_message(
+                        channel_name=channel_name, group_id=group_id, raw_text=raw_text,
+                        percent_requested=effective_percent, leg_results=leg_results,
+                    )
+                    await self._notify(
+                        "mgmt_close_partial_now", channel="both", group_id=group_id, chat_id=chat_id,
+                        channel_name=channel_name, raw_text=raw_text, percent_requested=effective_percent,
+                        leg_results=leg_results, message=message,
+                    )
+                    results.append({"group_id": group_id, "status": "applied"})
+                except Exception as e:
+                    log.error("[TM][MGMT] excepcion en close_partial_now group_id=%s chat_id=%s: %s", group_id, chat_id, e)
                     results.append({"group_id": group_id, "status": "failed", "reason": "exception"})
             return {"status": "completed", "results": results}
 

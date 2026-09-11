@@ -302,6 +302,73 @@ async def test_apply_mgmt_action_close_now_one_group_fails_partial_close_other_s
 
 
 @pytest.mark.asyncio
+async def test_close_partial_now_applies_default_50_percent_when_no_percent_given():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs_before = [t for t in tm.trades.values() if t.group_id == group_id]
+    tickets_before = {t.ticket for t in legs_before}
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra parte", correction=None)
+
+    assert result["status"] == "completed"
+    # Both legs still open (partial, not full close) -- tickets unchanged.
+    remaining_tickets = {t.ticket for t in tm.trades.values() if t.group_id == group_id}
+    assert remaining_tickets == tickets_before
+    for ticket in tickets_before:
+        pos = sim.positions[ticket]
+        assert pos["volume"] == pytest.approx(0.005)  # 50% of the 0.01 default fixed_lot
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_applies_explicit_percent():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+
+    await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
+
+    for t in legs:
+        pos = sim.positions[t.ticket]
+        assert pos["volume"] == pytest.approx(0.01 * 0.7)
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_notifies_success_event_with_both_channel():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
+
+    events = [(event, kwargs) for event, kwargs in tm.notifier.events if event == "mgmt_close_partial_now"]
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_reports_failure_when_broker_rejects_a_leg():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    original_partial_close = sim.partial_close
+    def failing_partial_close(account, ticket, percent):
+        return False
+    sim.partial_close = failing_partial_close
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
+
+    events = [event for event, kwargs in tm.notifier.events if event == "mgmt_close_partial_now_failure"]
+    assert len(events) == 1
+    assert result["results"][0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_move_sl_be_now_applies_to_all_groups_with_mixed_outcomes():
     sim = SimuladorMT5()
     sim.price = 2500.0

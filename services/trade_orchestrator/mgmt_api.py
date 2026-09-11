@@ -30,6 +30,7 @@ class MgmtActionRequest(BaseModel):
     chat_id: str
     raw_text: str
     correction: Optional[Correction] = None
+    percent: Optional[float] = None
 
 def create_mgmt_app(trade_manager) -> FastAPI:
     app = FastAPI(title="trade_orchestrator-mgmt")
@@ -52,7 +53,7 @@ def create_mgmt_app(trade_manager) -> FastAPI:
         correction = req.correction.model_dump() if req.correction else None
         try:
             result = await trade_manager.apply_mgmt_action(
-                action=req.action, chat_id=req.chat_id, raw_text=req.raw_text, correction=correction,
+                action=req.action, chat_id=req.chat_id, raw_text=req.raw_text, correction=correction, percent=req.percent,
             )
         except Exception as e:
             log.exception("[MGMT_API] apply_mgmt_action fallo inesperadamente: action=%s chat_id=%s", req.action, req.chat_id)
