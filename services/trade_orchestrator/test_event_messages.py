@@ -85,3 +85,46 @@ def test_partial_failure_message_flags_it_needs_review():
         leg_summaries=["tp1 (ticket=1, rechazado)"],
     )
     assert "revisar" in msg.lower() or "revis" in msg.lower()
+
+
+def test_direction_none_handled_gracefully_in_all_functions():
+    """Test that direction=None is handled without crashing (degraded output with 'N/D')."""
+    # build_group_opened_message
+    msg = build_group_opened_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD", direction=None,
+        entry_price=1.09345, sl=1.09100, tp1=1.09500, tp2=1.09800, volume=0.02,
+    )
+    assert "N/D" in msg
+    assert "EURUSD" in msg
+
+    # build_tp1_hit_message
+    msg = build_tp1_hit_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD", direction=None,
+        close_price=1.09500, close_volume=0.01, pnl_money=12.50, account_currency="USD",
+    )
+    assert "N/D" in msg
+    assert "TP1" in msg
+
+    # build_tp2_partial_closed_message
+    msg = build_tp2_partial_closed_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD", direction=None,
+        close_price=1.09500, close_volume=0.01, pnl_money=5.0, remaining_volume=0.01,
+    )
+    assert "N/D" in msg
+    assert "TP2" in msg
+
+    # build_sl_hit_message
+    msg = build_sl_hit_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD", direction=None,
+        close_price=1.09100, close_volume=0.01, pnl_money=-24.50,
+    )
+    assert "N/D" in msg
+    assert "STOP" in msg.upper()
+
+    # build_external_close_message
+    msg = build_external_close_message(
+        channel_name="Oro Premium", group_id=61, symbol="EURUSD", direction=None,
+        leg="runner", close_price=1.09200, close_volume=0.01, pnl_money=-5.0,
+    )
+    assert "N/D" in msg
+    assert "EXTERNO" in msg.upper()
