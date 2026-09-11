@@ -36,7 +36,7 @@ Esto crea el stream `raw_messages` y el grupo `router_group` si no existen.
    - Telegram credentials: `TG_API_ID`, `TG_API_HASH`, `TG_PHONE`
    - MT5 account config in `ACCOUNTS_JSON` (single entry for now)
    - Security keys: `N8N_ACTION_API_KEY`, `TRADE_API_KEY` (both **REQUIRED** — services will not start without them)
-   - Optional: `N8N_WEBHOOK_URL` + `N8N_WEBHOOK_TOKEN` for trade notifications
+   - Optional: `N8N_EVENT_WEBHOOK_URL` + `N8N_EVENT_WEBHOOK_TOKEN` for the audit log / Telegram event feed
 
 2. Launch:
 ```bash
@@ -85,7 +85,9 @@ Redis: raw_messages stream
        └─ runner_leg: uncapped proportional trailing, no fixed TP close
     ↓
 Trade Events (opened, TP hit, etc)
-    ├─ POST to N8N_WEBHOOK_URL (if configured)
+    ├─ Append to data/audit_log.jsonl (always — primary source of truth)
+    ├─ POST envelope to N8N_EVENT_WEBHOOK_URL (if configured)
+    │    └─ n8n branches on `channel`: "audit" → Data Table, "both" → Data Table + Telegram
     └─ In-memory group state tracking
 ```
 
@@ -169,8 +171,11 @@ ACCOUNTS_JSON=[
 
 **Signal Processing:**
 - `N8N_INBOUND_WEBHOOK_URL`: n8n webhook URL for text not recognized as signals
-- `N8N_WEBHOOK_URL`: (optional) n8n webhook for trade event notifications
-- `N8N_WEBHOOK_TOKEN`: (optional) auth token for trade notification webhook
+
+**Audit Log & Event Notifications:**
+- `N8N_EVENT_WEBHOOK_URL`: (optional) n8n webhook receiving the full event envelope
+- `N8N_EVENT_WEBHOOK_TOKEN`: (optional) auth token, sent as the `X-N8N-Token` header
+- `CHANNEL_NAMES_JSON`: `chat_id` → human-readable channel name mapping used in messages
 
 **Management & Trade APIs:**
 - `N8N_ACTION_API_KEY`: API key for trade_orchestrator `/mgmt/action` endpoint (REQUIRED)
@@ -360,32 +365,44 @@ Text that doesn't match TradePulse patterns is forwarded to `N8N_INBOUND_WEBHOOK
 
 ## Notifications
 
-### n8n Webhook (Trade Events)
+### Audit Log + n8n Event Webhook
 
-If `N8N_WEBHOOK_URL` is set, trade lifecycle events are POSTed as JSON. The payload shape varies
-by `event` — there is no single fixed schema across all events; each is whatever kwargs the
-corresponding `_notify(...)` call in `services/trade_orchestrator/trade_manager.py` sends. There
-is no `trade_opened` event and no `entry_price`/`sl_price`/`tp_prices`/`lot`/`account_name` schema.
+Every trade lifecycle event goes through a single `EventBus`, which does two things:
 
-Example — `group_opened` (a signal opened the tp1/runner leg pair):
+1. **Appends the event to `data/audit_log.jsonl`** — always, synchronously, before anything
+   else. This local JSONL file is the primary source of truth and the safety net that survives
+   a Redis or n8n outage. It is bind-mounted out of the container by `docker-compose.yml`, so
+   it persists across rebuilds.
+2. **POSTs the same envelope to `N8N_EVENT_WEBHOOK_URL`** (if configured), with
+   `N8N_EVENT_WEBHOOK_TOKEN` sent as the `X-N8N-Token` header. Failed deliveries are retried by
+   a background worker.
+
+Each event is one envelope with a fixed top-level shape:
+
 ```json
 {
-  "event": "group_opened",
-  "group_id": 12345,
-  "symbol": "XAUUSD",
-  "direction": "BUY",
-  "tp1_ticket": 100001,
-  "runner_ticket": 100002,
-  "sl": 2490.0,
-  "tp1": 2515.0,
-  "tp2": 2530.0
+  "event_id": "0f9c...",
+  "event_type": "group_opened",
+  "channel": "both",
+  "timestamp": "2026-09-10T14:03:11.482Z",
+  "message": "🟢 APERTURA — Canal: Oro Premium (grupo 12345)\n...",
+  "payload": { "group_id": 12345, "symbol": "XAUUSD", "direction": "BUY", "...": "..." }
 }
 ```
 
-Other events (`group_updated`, `tp1_hit`, `trailing_updated`, `runner_closed`, `open_aborted`,
-`open_failed`, `mgmt_close_now`, `mgmt_move_sl_be_applied`, `mgmt_move_sl_be_already_satisfied`,
-`mgmt_note_sl_hit`) each carry their own relevant subset of fields — see the `_notify(...)` call
-sites in `trade_manager.py` for the authoritative field list per event.
+`channel` is the routing decision and is a sibling of `payload`, not nested inside it:
+
+- `"audit"` — n8n writes it to the Data Table only.
+- `"both"` — n8n writes it to the Data Table **and** sends `message` verbatim to Telegram.
+
+`message` is pre-rendered Spanish text (built in
+`services/trade_orchestrator/event_messages.py`) and is meant to be forwarded as-is — n8n
+does no formatting of its own. `payload` carries the structured per-event fields and varies by
+`event_type`; see the `_notify(...)` call sites in `trade_manager.py` for the authoritative
+field list per event.
+
+Full design, including the event catalogue and which events are `both` vs `audit`:
+`docs/superpowers/specs/2026-09-10-audit-log-and-telegram-notifications-design.md`.
 
 ## Testing
 

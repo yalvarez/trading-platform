@@ -50,7 +50,7 @@ A containerized trading automation platform that:
 - Mechanical management loop (every 2s):
   - Checks price updates via MT5 connection
   - Applies trailing stop logic (proportional drawdown)
-  - Emits trade events (optional: POST to `N8N_WEBHOOK_URL`)
+  - Emits trade events (always appended to `data/audit_log.jsonl`; optional POST to `N8N_EVENT_WEBHOOK_URL`)
 - HTTP API `/mgmt/action` (port 8200):
   - Receives: `close_now`, `move_sl_be_now`, `note_sl_hit`, `signal_correction`, `ignore`
   - Auth: `X-N8N-Action-Key: <N8N_ACTION_API_KEY>`
@@ -171,45 +171,40 @@ Response for signal_correction (only the most recent group of the chat):
 
 ---
 
-## 📱 **Trade Notifications**
+## 📱 **Audit Log + Trade Notifications**
 
-If `N8N_WEBHOOK_URL` is configured, trade lifecycle events are POSTed as JSON. The payload shape
-varies by `event`; the fields shown below are the exact kwargs each call site sends (source:
-`services/trade_orchestrator/trade_manager.py`, `_notify()` call sites) — there is no single
-fixed schema across all events.
+Every trade lifecycle event passes through a single `EventBus`, which appends it to
+`data/audit_log.jsonl` (always — the primary source of truth, bind-mounted to the host so it
+survives rebuilds) and then POSTs the same envelope to `N8N_EVENT_WEBHOOK_URL` if configured.
+Failed deliveries are retried by a background worker.
 
-**`group_opened`** (a signal opened the tp1/runner leg pair):
+Every event shares one fixed top-level envelope:
+
 ```json
 {
-  "event": "group_opened",
-  "group_id": 12345,
-  "symbol": "XAUUSD",
-  "direction": "BUY",
-  "tp1_ticket": 100001,
-  "runner_ticket": 100002,
-  "sl": 2490.0,
-  "tp1": 2515.0,
-  "tp2": 2530.0
+  "event_id": "0f9c...",
+  "event_type": "group_opened",
+  "channel": "both",
+  "timestamp": "2026-09-10T14:03:11.482Z",
+  "message": "🟢 APERTURA — Canal: Oro Premium (grupo 12345)\n...",
+  "payload": { "group_id": 12345, "symbol": "XAUUSD", "direction": "BUY", "...": "..." }
 }
 ```
 
-**`tp1_hit`** (tp1 leg closed, runner moved to BE):
-```json
-{"event": "tp1_hit", "group_id": 12345, "symbol": "XAUUSD", "runner_ticket": 100002}
-```
+`channel` is a sibling of `payload` (not nested inside it) and drives routing in n8n:
+`"audit"` → Data Table only; `"both"` → Data Table **and** the `message` text forwarded
+verbatim to Telegram. `message` is pre-rendered Spanish built in
+`services/trade_orchestrator/event_messages.py`.
 
-**`trailing_updated`** (runner's SL advanced):
-```json
-{"event": "trailing_updated", "group_id": 12345, "ticket": 100002, "peak_multiple": 1.5, "new_sl": 2520.0}
-```
+`payload` holds the structured fields and varies by `event_type` — read the `_notify(...)`
+call sites in `trade_manager.py` for the authoritative field list per event. There is no
+`trade_opened` event and no fixed `entry_price`/`sl_price`/`tp_prices`/`lot` schema.
 
-Other events use the same pattern (an `event` name plus whatever fields are relevant to that
-event — `group_updated`, `runner_closed`, `open_aborted`, `open_failed`,
-`mgmt_close_now`/`mgmt_move_sl_be_applied`/`mgmt_move_sl_be_already_satisfied`/`mgmt_note_sl_hit`).
-There is no `trade_opened` event and no fixed `entry_price`/`sl_price`/`tp_prices`/`lot` schema —
-read `_notify(...)` call sites in `trade_manager.py` for the authoritative field list per event.
+Optional token: `N8N_EVENT_WEBHOOK_TOKEN` is sent as the `X-N8N-Token` header (not
+`Authorization`).
 
-Optional token: `N8N_WEBHOOK_TOKEN` is sent as the `X-N8N-Token` header (not `Authorization`).
+Full design, including the event catalogue and each event's `audit`/`both` channel:
+`docs/superpowers/specs/2026-09-10-audit-log-and-telegram-notifications-design.md`.
 
 ---
 
@@ -291,8 +286,8 @@ REDIS_URL=redis://redis:6379/0
 
 # Webhooks
 N8N_INBOUND_WEBHOOK_URL=https://your-n8n-instance.example.com/webhook/inbound
-N8N_WEBHOOK_URL=https://your-n8n-instance.example.com/webhook/trades  (optional)
-N8N_WEBHOOK_TOKEN=<optional>
+N8N_EVENT_WEBHOOK_URL=https://your-n8n-instance.example.com/webhook/events  (optional)
+N8N_EVENT_WEBHOOK_TOKEN=<optional>
 
 # Trading
 TRADING_WINDOWS=00:00-23:59

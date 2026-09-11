@@ -100,6 +100,12 @@ services:
     volumes:
       - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
       - ./data/trade_state.jsonl:/app/data/trade_state.jsonl:rw
+      # El audit log JSONL es la fuente de verdad primaria de eventos y la red
+      # de seguridad independiente de caidas de Redis/n8n (ver spec
+      # docs/superpowers/specs/2026-09-10-audit-log-and-telegram-notifications-design.md).
+      # Sin este bind mount vive solo dentro del contenedor y se destruye en
+      # cada rebuild, que es justamente lo contrario de lo que se pretende.
+      - ./data/audit_log.jsonl:/app/data/audit_log.jsonl:rw
     ports:
       - "8200:8200"
 

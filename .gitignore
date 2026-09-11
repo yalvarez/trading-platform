@@ -14,6 +14,11 @@ log.txt
 data/trade_state.jsonl
 data/trade_state.jsonl.tmp
 
+# Audit log (operational data: contiene chat_ids y P&L reales, nunca se
+# commitea el contenido de una corrida local). El archivo vacio esta trackeado
+# como placeholder del bind mount de docker-compose, igual que trade_state.jsonl.
+data/audit_log.jsonl
+
 # Python cache
 __pycache__/
 *.pyo

@@ -16,7 +16,13 @@ Ensure the following env vars exist in `.env`:
 - `N8N_ACTION_API_KEY`: REQUIRED for `/mgmt/action` endpoint (fail-closed)
 - `TRADE_API_KEY`: REQUIRED for trade_api (fail-closed)
 - `N8N_INBOUND_WEBHOOK_URL`: n8n webhook for unrecognized signal text
-- `N8N_WEBHOOK_URL`: (optional) n8n webhook for trade event notifications
+- `N8N_EVENT_WEBHOOK_URL`: (optional) n8n webhook receiving the audit/Telegram event envelope
+- `N8N_EVENT_WEBHOOK_TOKEN`: (optional) auth token for that webhook, sent as `X-N8N-Token`
+- `CHANNEL_NAMES_JSON`: (optional) `chat_id` → channel name mapping used in event messages
+
+> Every event is also appended to `data/audit_log.jsonl`, which `docker-compose.yml`
+> bind-mounts to the host so it survives rebuilds. See
+> `docs/superpowers/specs/2026-09-10-audit-log-and-telegram-notifications-design.md`.
 
 ## Quick Docker Commands
 
