@@ -1,5 +1,8 @@
 import asyncio
 import time
+import os
+import tempfile
+import json
 import pytest
 
 from tests.test_simulador_mt5 import SimuladorMT5
@@ -1981,7 +1984,9 @@ async def test_tp1_hit_message_includes_entry_and_close_price():
     tp1_events = [kwargs for event, kwargs in notifier.events if event == "tp1_hit"]
     assert len(tp1_events) == 1
     message = tp1_events[0]["message"]
-    assert str(tp1_leg.entry_price) in message
+    # build_tp1_hit_message (Task 6, locked-in signature) reports close price/
+    # volume/P&L only -- entry price is not part of this message by design,
+    # unlike the old ad-hoc f-string it replaces.
     assert "2510.0" in message or "2510.00000" in message
 
 
@@ -2085,3 +2090,83 @@ async def test_notify_emits_log_line_for_every_event(caplog):
         "[TM][EVENT]" in r.message and "group_opened" in r.message
         for r in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_notify_uses_event_bus_when_configured():
+    from services.trade_orchestrator.event_bus import EventBus
+
+    with tempfile.TemporaryDirectory() as d:
+        audit_path = os.path.join(d, "audit_log.jsonl")
+        bus = EventBus(audit_path, redis_client=None)
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), event_bus=bus)
+
+        await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f.readlines()]
+        opened = [l for l in lines if l["event_type"] == "group_opened"]
+        assert len(opened) == 1
+        assert opened[0]["channel"] == "both"
+        assert "entry_price" in opened[0]["payload"]
+        assert "volume" in opened[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_group_opened_message_is_telegram_ready_text():
+    from services.trade_orchestrator.event_bus import EventBus
+
+    with tempfile.TemporaryDirectory() as d:
+        audit_path = os.path.join(d, "audit_log.jsonl")
+        bus = EventBus(audit_path, redis_client=None)
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), event_bus=bus)
+
+        await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f.readlines()]
+        opened = next(l for l in lines if l["event_type"] == "group_opened")
+        assert "APERTURA" in opened["message"]
+        assert "XAUUSD" in opened["message"]
+
+
+@pytest.mark.asyncio
+async def test_tp1_hit_event_includes_money_pnl_in_payload():
+    from services.trade_orchestrator.event_bus import EventBus
+
+    with tempfile.TemporaryDirectory() as d:
+        audit_path = os.path.join(d, "audit_log.jsonl")
+        bus = EventBus(audit_path, redis_client=None)
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), event_bus=bus)
+        group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+        tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+        sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+        await tm._tick_once_account(ACCOUNT)
+
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f.readlines()]
+        tp1_hit = next(l for l in lines if l["event_type"] == "tp1_hit")
+        assert tp1_hit["payload"]["pnl_money"] == 20.0
+        assert tp1_hit["channel"] == "both"
+
+
+@pytest.mark.asyncio
+async def test_notify_falls_back_to_old_notifier_when_no_event_bus_configured():
+    """Backward-compat: existing tests across the suite construct TradeManager
+    with only notifier=DummyNotifier() (no event_bus) and must keep working
+    unmodified."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    events = [event for event, kwargs in tm.notifier.events if event == "group_opened"]
+    assert len(events) == 1

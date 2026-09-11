@@ -1,6 +1,15 @@
 from .trade_utils import safe_comment, parse_group_comment
 from .channel_names import resolve_channel_name
-from .event_messages import build_sl_hit_message, build_external_close_message
+from .event_messages import (
+    build_sl_hit_message,
+    build_external_close_message,
+    build_group_opened_message,
+    build_tp1_hit_message,
+    build_tp2_partial_closed_message,
+    build_close_now_message,
+    build_move_sl_be_applied_message,
+    build_partial_failure_message,
+)
 import asyncio
 import inspect
 import os
@@ -38,11 +47,13 @@ class ManagedTrade:
 
 
 class TradeManager:
-    def __init__(self, mt5_executor, *, notifier=None, config_provider=None, state_store=None):
+    def __init__(self, mt5_executor, *, notifier=None, event_bus=None, config_provider=None, state_store=None, channel_names=None):
         self.mt5 = mt5_executor
         self.notifier = notifier
+        self.event_bus = event_bus
         self.config_provider = config_provider
         self.state_store = state_store
+        self.channel_names = channel_names or {}
         self.trades: dict[int, ManagedTrade] = {}
         self._next_group_id = 1
 
@@ -56,12 +67,19 @@ class TradeManager:
         log.error("[TM][ERROR] No se encontro el dict de cuenta para: %s", account)
         return None
 
-    async def _notify(self, event: str, **kwargs) -> None:
+    async def _notify(self, event: str, *, channel: str = "audit", **kwargs) -> None:
         log.info("[TM][EVENT] %s %s", event, kwargs)
+        message = kwargs.pop("message", "")
+        if self.event_bus is not None:
+            try:
+                await self.event_bus.emit(event, channel, message, kwargs)
+            except Exception as e:
+                log.warning("[TM] event_bus.emit failed for event=%s: %s", event, e)
+            return
         if not self.notifier:
             return
         try:
-            await self.notifier.notify_trade_event(event, **kwargs)
+            await self.notifier.notify_trade_event(event, message=message, **kwargs)
         except Exception as e:
             log.warning("[TM] notify failed for event=%s: %s", event, e)
 
@@ -351,11 +369,16 @@ class TradeManager:
         ACTIVE_TRADES.set(len(self.trades))
         log.info("[TM] group %s opened: tp1=%s runner=%s symbol=%s dir=%s sl=%s tp1_price=%s tp2_price=%s",
                   group_id, tickets["tp1"], tickets["runner"], symbol, direction, sl, tp1, tp2)
+        channel_name = resolve_channel_name(chat_id, self._channel_names())
+        message = build_group_opened_message(
+            channel_name=channel_name, group_id=group_id, symbol=symbol, direction=direction,
+            entry_price=price, sl=sl, tp1=tp1, tp2=tp2, volume=account.get("fixed_lot", 0.01),
+        )
         await self._notify(
-            "group_opened", group_id=group_id, symbol=symbol, direction=direction,
+            "group_opened", channel="both", group_id=group_id, symbol=symbol, direction=direction,
             tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2,
-            message=f"Grupo {group_id} abierto: {direction.upper()} {symbol} — tp1 ticket={tickets['tp1']}, "
-                    f"runner ticket={tickets['runner']}, sl={sl}, tp1={tp1}, tp2={tp2}.",
+            chat_id=chat_id, channel_name=channel_name, entry_price=price, volume=account.get("fixed_lot", 0.01),
+            message=message,
         )
         await self._persist_group(group_id)
         return group_id
@@ -671,12 +694,20 @@ class TradeManager:
             # own never-regress guard, see update_group_signal) would
             # compare against the wrong baseline.
             runner.planned_sl = runner.entry_price
-            close_price = await self._get_close_price(client, tp1_leg.ticket)
+            deal_info = await self._get_close_deal_info(client, tp1_leg.ticket)
+            channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
+            close_price = deal_info["price"] if deal_info else None
+            pnl_money = deal_info["profit"] if deal_info else None
+            close_volume = deal_info["volume"] if deal_info else None
+            message = build_tp1_hit_message(
+                channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, direction=tp1_leg.direction,
+                close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, account_currency="USD",
+            )
             await self._notify(
-                "tp1_hit", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=runner.ticket,
-                message=f"TP1 de {tp1_leg.symbol} (grupo {tp1_leg.group_id}) alcanzado "
-                        f"(apertura {self._fmt_price(tp1_leg.entry_price)}, cierre {self._fmt_price(close_price)}). "
-                        f"Runner (ticket={runner.ticket}) movido a breakeven.",
+                "tp1_hit", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id, channel_name=channel_name,
+                close_price=close_price, close_volume=close_volume, pnl_money=pnl_money,
+                message=message,
             )
             await self._persist_group(tp1_leg.group_id)
         else:
@@ -797,10 +828,21 @@ class TradeManager:
                       runner.ticket, runner.group_id)
             return
         runner.tp2_partial_applied = True
+        deal_info = await self._get_close_deal_info(client, runner.ticket)
+        channel_name = resolve_channel_name(runner.chat_id, self._channel_names())
+        close_price = deal_info["price"] if deal_info else None
+        pnl_money = deal_info["profit"] if deal_info else None
+        close_volume = deal_info["volume"] if deal_info else None
+        remaining_volume = getattr(pos, "volume", None)
+        message = build_tp2_partial_closed_message(
+            channel_name=channel_name, group_id=runner.group_id, symbol=runner.symbol, direction=runner.direction,
+            close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, remaining_volume=remaining_volume,
+        )
         await self._notify(
-            "tp2_partial_closed", group_id=runner.group_id, ticket=runner.ticket, symbol=runner.symbol,
-            message=f"Runner del grupo {runner.group_id} ({runner.symbol}, ticket={runner.ticket}) alcanzo TP2 "
-                    f"({self._fmt_price(runner.tp2_price)}): 50% del volumen cerrado, el resto sigue corriendo con trailing.",
+            "tp2_partial_closed", channel="both", group_id=runner.group_id, ticket=runner.ticket, symbol=runner.symbol,
+            chat_id=runner.chat_id, channel_name=channel_name, close_price=close_price,
+            close_volume=close_volume, pnl_money=pnl_money, remaining_volume=remaining_volume,
+            message=message,
         )
         await self._persist_group(runner.group_id)
 
@@ -947,7 +989,9 @@ class TradeManager:
                         results.append({"group_id": group_id, "status": "failed", "reason": "account_unresolved"})
                         continue
                     client = self.mt5._client_for(account)
+                    channel_name = resolve_channel_name(chat_id, self._channel_names())
                     leg_summaries = []
+                    leg_results = []
                     any_leg_failed = False
                     for t in list(legs):
                         ok = await self._call(client.partial_close, account, t.ticket, 100)
@@ -956,25 +1000,37 @@ class TradeManager:
                             log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
                                       t.ticket, t.leg, group_id)
                             continue
-                        close_price = await self._get_close_price(client, t.ticket)
+                        deal_info = await self._get_close_deal_info(client, t.ticket)
+                        close_price = deal_info["price"] if deal_info else None
+                        pnl_money = deal_info["profit"] if deal_info else None
+                        close_volume = deal_info["volume"] if deal_info else None
                         leg_summaries.append(
                             f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
                             f"cierre {self._fmt_price(close_price)})"
                         )
+                        leg_results.append({
+                            "leg": t.leg, "close_price": close_price,
+                            "close_volume": close_volume, "pnl_money": pnl_money,
+                        })
                         self.trades.pop(t.ticket, None)
                     if any_leg_failed:
+                        message = build_partial_failure_message(
+                            channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries,
+                        )
                         await self._notify(
-                            "mgmt_close_now_partial_failure", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
-                            message=f"Grupo {group_id}: al menos una pierna no pudo cerrarse via /mgmt/action "
-                                    f"(partial_close rechazado por el broker). Piernas cerradas: "
-                                    f"{', '.join(leg_summaries) if leg_summaries else 'ninguna'}. Texto original: {raw_text!r}",
+                            "mgmt_close_now_partial_failure", channel="both", group_id=group_id, chat_id=chat_id,
+                            channel_name=channel_name, raw_text=raw_text, message=message,
                         )
                         results.append({"group_id": group_id, "status": "failed", "reason": "partial_close_rejected"})
                         continue
+                    total_pnl_money = sum(lr["pnl_money"] for lr in leg_results if lr["pnl_money"] is not None)
+                    message = build_close_now_message(
+                        channel_name=channel_name, group_id=group_id, raw_text=raw_text,
+                        leg_results=leg_results, total_pnl_money=total_pnl_money,
+                    )
                     await self._notify(
-                        "mgmt_close_now", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
-                        message=f"Grupo {group_id} cerrado manualmente via /mgmt/action: "
-                                f"{', '.join(leg_summaries)}. Texto original: {raw_text!r}",
+                        "mgmt_close_now", channel="both", group_id=group_id, chat_id=chat_id,
+                        channel_name=channel_name, raw_text=raw_text, message=message,
                     )
                     await self._close_group_in_store(group_id)
                     results.append({"group_id": group_id, "status": "closed"})
@@ -1033,10 +1089,13 @@ class TradeManager:
                         # that call site's comment for why this matters
                         # across a restart's reconcile_from_mt5.
                         runner.planned_sl = be_price
+                        channel_name = resolve_channel_name(chat_id, self._channel_names())
+                        message = build_move_sl_be_applied_message(
+                            channel_name=channel_name, group_id=group_id, new_sl=be_price, raw_text=raw_text,
+                        )
                         await self._notify(
-                            "mgmt_move_sl_be_applied", group_id=group_id, chat_id=chat_id, raw_text=raw_text,
-                            message=f"Grupo {group_id}: SL movido a breakeven manualmente via /mgmt/action. "
-                                    f"Texto original: {raw_text!r}",
+                            "mgmt_move_sl_be_applied", channel="both", group_id=group_id, chat_id=chat_id,
+                            channel_name=channel_name, raw_text=raw_text, message=message,
                         )
                         await self._persist_group(group_id)
                         results.append({"group_id": group_id, "status": "applied"})
