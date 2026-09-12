@@ -574,80 +574,92 @@ class TradeManager:
             positions = await self._call(client.positions_get) or []
             pos_by_ticket = {p.ticket: p for p in positions}
 
-            # Detect closed tickets for this account (TP1 hit, SL hit, or manual close)
+            # Detect closed tickets for this account (TP1 hit, SL hit, or manual close).
+            # Each ticket's processing is isolated in its own try/except (real
+            # production risk: an unhandled exception while processing one
+            # group -- e.g. a timeout not already caught by Tasks 1/3/4/5, or
+            # any other unexpected error -- must not abort processing for
+            # every OTHER group on this same account in the same tick).
             for ticket in [t for t, mt in self.trades.items() if mt.account_name == account["name"]]:
                 if ticket in pos_by_ticket:
                     continue
                 closed_trade = self.trades.pop(ticket)
-                # Real production bug: a tp1_leg disappearing from positions_get
-                # was ALWAYS treated as "TP1 reached", regardless of the real
-                # close price -- a SL hit, a manual close, or a test's own
-                # emergency cleanup on this same ticket all triggered the
-                # "TP1 alcanzado" flow (moving the runner to BE, incrementing
-                # TP1_HITS, and logging a false tp1_hit event to n8n). Confirmed
-                # live: a tp1_leg closed via partial_close (DEAL_REASON_CLIENT)
-                # at a loss, well below its own tp1_price, still got logged as
-                # a TP1 hit. Verify the real close price actually reached
-                # tp1_price (within half the entry->tp1 distance, to tolerate
-                # normal slippage) before treating this as a genuine TP1 event.
-                classification = await self._classify_leg_closure(client, closed_trade)
-                cause = classification["cause"]
-                if cause == "tp1":
-                    await self._on_tp1_leg_closed(account, client, closed_trade)
-                elif cause == "sl":
-                    channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
-                    message = build_sl_hit_message(
-                        channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
-                        direction=closed_trade.direction, close_price=classification["price"],
-                        close_volume=classification["volume"], pnl_money=classification["profit"],
-                    )
-                    await self._notify(
-                        "sl_hit_detected", channel="both", group_id=closed_trade.group_id, chat_id=closed_trade.chat_id,
-                        channel_name=channel_name, symbol=closed_trade.symbol, direction=closed_trade.direction,
-                        leg=closed_trade.leg, close_price=classification["price"], close_volume=classification["volume"],
-                        pnl_money=classification["profit"], message=message,
-                    )
-                else:
-                    channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
-                    if cause == "external":
-                        message = build_external_close_message(
+                try:
+                    # Real production bug: a tp1_leg disappearing from positions_get
+                    # was ALWAYS treated as "TP1 reached", regardless of the real
+                    # close price -- a SL hit, a manual close, or a test's own
+                    # emergency cleanup on this same ticket all triggered the
+                    # "TP1 alcanzado" flow (moving the runner to BE, incrementing
+                    # TP1_HITS, and logging a false tp1_hit event to n8n). Confirmed
+                    # live: a tp1_leg closed via partial_close (DEAL_REASON_CLIENT)
+                    # at a loss, well below its own tp1_price, still got logged as
+                    # a TP1 hit. Verify the real close price actually reached
+                    # tp1_price (within half the entry->tp1 distance, to tolerate
+                    # normal slippage) before treating this as a genuine TP1 event.
+                    classification = await self._classify_leg_closure(client, closed_trade)
+                    cause = classification["cause"]
+                    if cause == "tp1":
+                        await self._on_tp1_leg_closed(account, client, closed_trade)
+                    elif cause == "sl":
+                        channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
+                        message = build_sl_hit_message(
                             channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
-                            direction=closed_trade.direction, leg=closed_trade.leg,
-                            close_price=classification["price"], close_volume=classification["volume"],
-                            pnl_money=classification["profit"],
+                            direction=closed_trade.direction, close_price=classification["price"],
+                            close_volume=classification["volume"], pnl_money=classification["profit"],
                         )
                         await self._notify(
-                            "external_close_detected", channel="both", group_id=closed_trade.group_id,
-                            chat_id=closed_trade.chat_id, channel_name=channel_name, symbol=closed_trade.symbol,
-                            direction=closed_trade.direction, leg=closed_trade.leg,
-                            close_price=classification["price"], close_volume=classification["volume"],
+                            "sl_hit_detected", channel="both", group_id=closed_trade.group_id, chat_id=closed_trade.chat_id,
+                            channel_name=channel_name, symbol=closed_trade.symbol, direction=closed_trade.direction,
+                            leg=closed_trade.leg, close_price=classification["price"], close_volume=classification["volume"],
                             pnl_money=classification["profit"], message=message,
                         )
                     else:
-                        leg_label = "Runner" if closed_trade.leg == "runner" else "tp1_leg"
-                        await self._notify(
-                            "runner_closed" if closed_trade.leg == "runner" else "tp1_leg_closed_not_at_tp1",
-                            channel="audit", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
-                            message=f"{leg_label} del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) "
-                                    f"se cerro sin poder determinar la causa. Precio de apertura "
-                                    f"{self._fmt_price(closed_trade.entry_price)}.",
-                        )
-                remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
-                if not remaining:
-                    await self._close_group_in_store(closed_trade.group_id)
+                        channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
+                        if cause == "external":
+                            message = build_external_close_message(
+                                channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
+                                direction=closed_trade.direction, leg=closed_trade.leg,
+                                close_price=classification["price"], close_volume=classification["volume"],
+                                pnl_money=classification["profit"],
+                            )
+                            await self._notify(
+                                "external_close_detected", channel="both", group_id=closed_trade.group_id,
+                                chat_id=closed_trade.chat_id, channel_name=channel_name, symbol=closed_trade.symbol,
+                                direction=closed_trade.direction, leg=closed_trade.leg,
+                                close_price=classification["price"], close_volume=classification["volume"],
+                                pnl_money=classification["profit"], message=message,
+                            )
+                        else:
+                            leg_label = "Runner" if closed_trade.leg == "runner" else "tp1_leg"
+                            await self._notify(
+                                "runner_closed" if closed_trade.leg == "runner" else "tp1_leg_closed_not_at_tp1",
+                                channel="audit", group_id=closed_trade.group_id, ticket=ticket, symbol=closed_trade.symbol,
+                                message=f"{leg_label} del grupo {closed_trade.group_id} ({closed_trade.symbol}, ticket={ticket}) "
+                                        f"se cerro sin poder determinar la causa. Precio de apertura "
+                                        f"{self._fmt_price(closed_trade.entry_price)}.",
+                            )
+                    remaining = [t for t in self.trades.values() if t.group_id == closed_trade.group_id]
+                    if not remaining:
+                        await self._close_group_in_store(closed_trade.group_id)
+                except Exception as e:
+                    log.error("[TM] error procesando cierre de ticket=%s group_id=%s: %s",
+                              ticket, closed_trade.group_id, e)
 
             ACTIVE_TRADES.set(len(self.trades))
 
             for ticket, t in [(tk, mt) for tk, mt in self.trades.items() if mt.account_name == account["name"]]:
-                pos = pos_by_ticket.get(ticket)
-                if not pos or t.leg != "runner" or not t.be_applied:
-                    continue
-                await self._apply_tp2_partial_close(account, client, t, pos)
-                # Re-fetch: partial_close above may have changed this position's
-                # live volume, and _apply_trailing's SL move must act on that
-                # up-to-date position, not a stale pre-partial-close snapshot.
-                pos = (await self._call(client.positions_get, ticket=ticket) or [pos])[0]
-                await self._apply_trailing(account, client, t, pos)
+                try:
+                    pos = pos_by_ticket.get(ticket)
+                    if not pos or t.leg != "runner" or not t.be_applied:
+                        continue
+                    await self._apply_tp2_partial_close(account, client, t, pos)
+                    # Re-fetch: partial_close above may have changed this position's
+                    # live volume, and _apply_trailing's SL move must act on that
+                    # up-to-date position, not a stale pre-partial-close snapshot.
+                    pos = (await self._call(client.positions_get, ticket=ticket) or [pos])[0]
+                    await self._apply_trailing(account, client, t, pos)
+                except Exception as e:
+                    log.error("[TM] error aplicando TP2/trailing a ticket=%s group_id=%s: %s", ticket, t.group_id, e)
 
         except Exception as e:
             log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)

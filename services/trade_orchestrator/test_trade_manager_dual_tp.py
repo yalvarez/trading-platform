@@ -2930,3 +2930,43 @@ async def test_tp2_partial_close_timeout_notifies_tp2_partial_timeout(monkeypatc
     timeout_events = [event for event, kwargs in tm.notifier.events if event == "tp2_partial_timeout"]
     assert len(timeout_events) == 1
     assert runner.tp2_partial_applied is False
+
+
+@pytest.mark.asyncio
+async def test_one_groups_unhandled_exception_does_not_block_another_groups_processing(monkeypatch):
+    """Real production risk generalized from the group-122 incident: today
+    _tick_once_account has a single try/except around its ENTIRE body, so
+    any unhandled exception while processing one group (even one Task 1-5
+    don't already catch) aborts processing for every other group on the
+    same account in that same tick. Two independent groups on one account,
+    one hitting an unhandled error and one closing cleanly via real TP,
+    must both be processed in the same tick -- the second group's event
+    must not be silently dropped because the first group blew up."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_a = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    group_b = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg_a = next(t for t in tm.trades.values() if t.group_id == group_a and t.leg == "tp1")
+    tp1_leg_b = next(t for t in tm.trades.values() if t.group_id == group_b and t.leg == "tp1")
+
+    sim.close_position_by_tp(tp1_leg_a.ticket, close_price=2510.0, profit=20.0)
+    sim.close_position_by_tp(tp1_leg_b.ticket, close_price=2510.0, profit=20.0)
+
+    # Force an unhandled (non-MT5CallTimeoutError) exception specifically
+    # while classifying group_a's closed leg, without affecting group_b's.
+    original_classify = tm._classify_leg_closure
+
+    async def classify_raises_for_group_a(client, closed_trade):
+        if closed_trade.group_id == group_a:
+            raise RuntimeError("simulated unrelated bug processing group_a")
+        return await original_classify(client, closed_trade)
+
+    monkeypatch.setattr(tm, "_classify_leg_closure", classify_raises_for_group_a)
+
+    await tm._tick_once_account(ACCOUNT)
+
+    tp1_hit_group_ids = [kwargs["group_id"] for event, kwargs in tm.notifier.events if event == "tp1_hit"]
+    assert group_b in tp1_hit_group_ids
+    assert group_a not in tp1_hit_group_ids  # group_a's own exception did prevent ITS notification
