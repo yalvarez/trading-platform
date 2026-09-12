@@ -159,3 +159,47 @@ def test_tp1_hit_be_failed_message_handles_direction_none():
         direction=None, runner_ticket=123456,
     )
     assert "N/D" in msg
+
+
+# --- Task 2: Timeout message builders ---
+
+def test_tp1_hit_be_timeout_message_conveys_uncertainty_and_urgency():
+    from services.trade_orchestrator.event_messages import build_tp1_hit_be_timeout_message
+
+    msg = build_tp1_hit_be_timeout_message(
+        channel_name="Oro Premium", group_id=61, symbol="XAUUSD", direction="BUY", runner_ticket=12345,
+    )
+    assert "TP1" in msg.upper()
+    assert "no se pudo confirmar" in msg.lower() or "no pudo confirmar" in msg.lower()
+    assert "revisar" in msg.lower()
+
+
+def test_tp1_hit_be_timeout_message_handles_direction_none():
+    from services.trade_orchestrator.event_messages import build_tp1_hit_be_timeout_message
+
+    # Must not crash even if direction is somehow missing, same guard as the
+    # other builders in this file (Task 6 of the audit-log plan already
+    # established this pattern for every direction-taking builder).
+    msg = build_tp1_hit_be_timeout_message(
+        channel_name="Oro Premium", group_id=61, symbol="XAUUSD", direction=None, runner_ticket=12345,
+    )
+    assert isinstance(msg, str) and len(msg) > 0
+
+
+def test_tp2_partial_timeout_message_conveys_uncertainty():
+    from services.trade_orchestrator.event_messages import build_tp2_partial_timeout_message
+
+    msg = build_tp2_partial_timeout_message(
+        channel_name="Oro Premium", group_id=61, symbol="XAUUSD", direction="SELL",
+    )
+    assert "TP2" in msg.upper()
+    assert "revisar" in msg.lower()
+
+
+def test_tp2_partial_timeout_message_handles_direction_none():
+    from services.trade_orchestrator.event_messages import build_tp2_partial_timeout_message
+
+    msg = build_tp2_partial_timeout_message(
+        channel_name="Oro Premium", group_id=61, symbol="XAUUSD", direction=None,
+    )
+    assert isinstance(msg, str) and len(msg) > 0

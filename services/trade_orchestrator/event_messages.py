@@ -130,3 +130,25 @@ def build_partial_failure_message(*, channel_name, group_id, leg_summaries) -> s
         f"Al menos una pierna fue rechazada por el broker. Piernas: {legs_text}\n"
         f"Revisar manualmente — puede quedar una posicion abierta."
     )
+
+
+def build_tp1_hit_be_timeout_message(*, channel_name, group_id, symbol, direction, runner_ticket) -> str:
+    return (
+        f"⚠️ TP1 ALCANZADO — Canal: {channel_name} (grupo {group_id})\n"
+        f"{symbol} {_fmt_direction(direction)}\n"
+        f"No se pudo CONFIRMAR si el runner (ticket={runner_ticket}) quedo en breakeven "
+        f"— MT5 no respondio a tiempo. El runner puede seguir con su SL original, o el "
+        f"breakeven puede haberse aplicado igual en segundo plano sin que el sistema se "
+        f"entere.\n"
+        f"Revisar manualmente en MT5."
+    )
+
+
+def build_tp2_partial_timeout_message(*, channel_name, group_id, symbol, direction) -> str:
+    return (
+        f"⚠️ TP2 ALCANZADO — Canal: {channel_name} (grupo {group_id})\n"
+        f"{symbol} {_fmt_direction(direction)}\n"
+        f"No se pudo confirmar si el cierre parcial del 50%% se ejecuto — MT5 no respondio "
+        f"a tiempo.\n"
+        f"Revisar manualmente el volumen real de la posicion en MT5."
+    )
