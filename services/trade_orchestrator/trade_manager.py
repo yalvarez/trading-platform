@@ -11,6 +11,8 @@ from .event_messages import (
     build_partial_failure_message,
     build_close_partial_now_message,
     build_tp1_hit_be_failed_message,
+    build_tp1_hit_be_timeout_message,
+    build_tp2_partial_timeout_message,
 )
 import asyncio
 import inspect
@@ -691,15 +693,46 @@ class TradeManager:
         return {"cause": cause, **info}
 
     async def _on_tp1_leg_closed(self, account, client, tp1_leg: ManagedTrade) -> None:
-        """TP1 hit -> mueve el runner del mismo group_id a BE (dual-TP spec seccion 4)."""
+        """TP1 hit -> notifica el hecho de inmediato, luego intenta mover el
+        runner del mismo group_id a BE (dual-TP spec seccion 4).
+
+        Real production incident (group 122, 2026-09-11): con el orden
+        anterior (notificar tp1_hit solo DESPUES de un _force_runner_sl
+        exitoso), un order_send colgado (timeout) en el intento de BE hacia
+        que la excepcion se propagara antes de llegar al notify -- perdiendo
+        en silencio la notificacion de un TP1 que ya habia ocurrido de
+        verdad (confirmado con deal.reason=DEAL_REASON_TP en MT5). El TP1 ya
+        es un hecho confirmado en el momento en que esta funcion se invoca
+        (via _classify_leg_closure) -- no depende en absoluto de si el BE
+        tiene exito, asi que se notifica primero, sin condicionarlo al
+        resultado del intento de BE que sigue.
+        """
         TP1_HITS.inc()
         runner = next((t for t in self.trades.values() if t.group_id == tp1_leg.group_id and t.leg == "runner"), None)
         if not runner:
             return
+
+        deal_info = await self._get_close_deal_info(client, tp1_leg.ticket)
+        channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
+        close_price = deal_info["price"] if deal_info else None
+        pnl_money = deal_info["profit"] if deal_info else None
+        close_volume = deal_info["volume"] if deal_info else None
+        message = build_tp1_hit_message(
+            channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, direction=tp1_leg.direction,
+            close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, account_currency="USD",
+        )
+        await self._notify(
+            "tp1_hit", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+            runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id, channel_name=channel_name,
+            close_price=close_price, close_volume=close_volume, pnl_money=pnl_money,
+            message=message,
+        )
+
         if runner.entry_price is None:
             log.error("[TM] no se puede aplicar BE: runner=%s no tiene entry_price registrado (group_id=%s)",
                       runner.ticket, tp1_leg.group_id)
             return
+
         # be_applied SOLO se marca True si el order_send realmente tuvo exito.
         # Bug real de produccion: marcarlo incondicionalmente dejaba el runner en
         # un estado inconsistente cuando el BE fallaba — el guard de _apply_trailing
@@ -708,7 +741,22 @@ class TradeManager:
         # _force_runner_sl ya reintenta internamente (este es el unico momento
         # en que se dispara el BE — si se pierde aqui sin reintentar, el runner
         # queda huerfano de BE para siempre).
-        ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
+        try:
+            ok = await self._force_runner_sl(account, client, runner, runner.entry_price, reason="TP1-BE")
+        except MT5CallTimeoutError:
+            log.error("[TM] timeout aplicando BE tras TP1, runner=%s group_id=%s — estado del BE desconocido",
+                      runner.ticket, tp1_leg.group_id)
+            timeout_message = build_tp1_hit_be_timeout_message(
+                channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                direction=tp1_leg.direction, runner_ticket=runner.ticket,
+            )
+            await self._notify(
+                "tp1_hit_be_timeout", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                direction=tp1_leg.direction, runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id,
+                channel_name=channel_name, message=timeout_message,
+            )
+            return
+
         if ok:
             runner.be_applied = True
             # Real production bug found live (2026-09-10, e2e D1 scenario):
@@ -722,21 +770,6 @@ class TradeManager:
             # own never-regress guard, see update_group_signal) would
             # compare against the wrong baseline.
             runner.planned_sl = runner.entry_price
-            deal_info = await self._get_close_deal_info(client, tp1_leg.ticket)
-            channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
-            close_price = deal_info["price"] if deal_info else None
-            pnl_money = deal_info["profit"] if deal_info else None
-            close_volume = deal_info["volume"] if deal_info else None
-            message = build_tp1_hit_message(
-                channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, direction=tp1_leg.direction,
-                close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, account_currency="USD",
-            )
-            await self._notify(
-                "tp1_hit", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
-                runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id, channel_name=channel_name,
-                close_price=close_price, close_volume=close_volume, pnl_money=pnl_money,
-                message=message,
-            )
             await self._persist_group(tp1_leg.group_id)
         else:
             log.error("[TM] BE no se pudo aplicar tras 3 intentos, runner=%s group_id=%s queda con SL original",
@@ -746,15 +779,14 @@ class TradeManager:
             # normal (sigue vivo con su SL original, sin el BE que ya se
             # gano), asi que es discutiblemente la notificacion mas urgente
             # de todas — dejarla audit-only significaba que nadie se enteraba.
-            channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
-            message = build_tp1_hit_be_failed_message(
+            failed_message = build_tp1_hit_be_failed_message(
                 channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
                 direction=tp1_leg.direction, runner_ticket=runner.ticket,
             )
             await self._notify(
                 "tp1_hit_be_failed", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
                 direction=tp1_leg.direction, runner_ticket=runner.ticket, chat_id=tp1_leg.chat_id,
-                channel_name=channel_name, message=message,
+                channel_name=channel_name, message=failed_message,
             )
 
     async def _get_close_deal_info(self, client, ticket: int) -> Optional[dict]:

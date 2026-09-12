@@ -2777,3 +2777,85 @@ async def test_close_partial_now_still_names_the_minimum_volume_cause_when_that_
     assert "minimo operable" in summaries
     assert "ya no existe" not in summaries
     assert "None" not in summaries
+
+
+@pytest.mark.asyncio
+async def test_tp1_hit_is_notified_even_when_the_be_order_send_times_out(monkeypatch):
+    """Real production incident (group 122, 2026-09-11): confirmed via MT5's
+    real history_deals_get that TP1 genuinely hit (reason=DEAL_REASON_TP,
+    real profit), but the tp1_hit notification never reached the audit log,
+    n8n, or Telegram -- because the order_send moving the runner to BE hung,
+    raised a timeout, and the notify call (which used to sit AFTER the BE
+    attempt) was never reached. tp1_hit must be notified as soon as TP1 is
+    confirmed, independent of what happens when attempting BE afterward."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    def hung_order_send(req):
+        time.sleep(0.3)
+        return None
+
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+    sim.order_send = hung_order_send
+
+    await tm._tick_once_account(ACCOUNT)
+
+    tp1_hit_events = [kwargs for event, kwargs in tm.notifier.events if event == "tp1_hit"]
+    assert len(tp1_hit_events) == 1
+    assert tp1_hit_events[0]["pnl_money"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_be_timeout_notifies_tp1_hit_be_timeout_not_tp1_hit_be_failed(monkeypatch):
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    def hung_order_send(req):
+        time.sleep(0.3)
+        return None
+
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+    sim.order_send = hung_order_send
+
+    await tm._tick_once_account(ACCOUNT)
+
+    timeout_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit_be_timeout"]
+    failed_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit_be_failed"]
+    assert len(timeout_events) == 1
+    assert len(failed_events) == 0
+    # be_applied must NOT be set on an unknown-outcome timeout -- the runner's
+    # real MT5 state is unverified, so the in-memory flag must not claim success.
+    assert runner.be_applied is False
+
+
+@pytest.mark.asyncio
+async def test_be_clean_rejection_still_notifies_tp1_hit_be_failed_not_timeout(monkeypatch):
+    """Regression guard: a clean rejection (not a timeout) must keep firing
+    the existing tp1_hit_be_failed event, unchanged."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    def rejecting_order_send(req):
+        return type('OrderSendResult', (), {'retcode': 10016, 'order': 0, 'deal': 0, 'comment': 'Invalid stops'})()
+
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+    sim.order_send = rejecting_order_send
+
+    await tm._tick_once_account(ACCOUNT)
+
+    failed_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit_be_failed"]
+    timeout_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit_be_timeout"]
+    assert len(failed_events) == 1
+    assert len(timeout_events) == 0
