@@ -6,7 +6,7 @@ import json
 import pytest
 
 from tests.test_simulador_mt5 import SimuladorMT5
-from services.trade_orchestrator.trade_manager import TradeManager, ManagedTrade, MAGIC
+from services.trade_orchestrator.trade_manager import TradeManager, ManagedTrade, MAGIC, MT5CallTimeoutError
 
 
 class DummyExecutor:
@@ -1503,6 +1503,57 @@ async def test_call_falls_back_to_default_timeout_when_env_var_invalid(monkeypat
 
     assert result == "ok"
     assert "invalido" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_force_runner_sl_raises_mt5_call_timeout_error_on_a_hung_order_send(monkeypatch):
+    """Real production incident (group 122, 2026-09-11): a genuine TP1 hit
+    (confirmed via deal.reason=DEAL_REASON_TP) was followed by an order_send
+    that hung past MT5_CALL_TIMEOUT_SECONDS while moving the runner to BE.
+    The resulting asyncio.TimeoutError propagated unchanged out of
+    _force_runner_sl, was caught by _tick_once_account's single outer
+    try/except, and aborted the rest of that tick -- silently losing the
+    tp1_hit notification for an event that had already genuinely happened.
+    _force_runner_sl must re-raise as MT5CallTimeoutError so callers can
+    tell "MT5 never responded" apart from "MT5 said no"."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    client = sim
+
+    def hung_order_send(req):
+        time.sleep(0.3)  # longer than the patched 0.05s timeout
+        return None
+
+    monkeypatch.setattr(sim, "order_send", hung_order_send)
+
+    with pytest.raises(MT5CallTimeoutError):
+        await tm._force_runner_sl(ACCOUNT, client, runner, runner.entry_price, reason="TP1-BE")
+
+
+@pytest.mark.asyncio
+async def test_force_runner_sl_still_returns_false_on_a_clean_rejection_not_a_timeout():
+    """Regression guard: a clean MT5 rejection (bad retcode, no hang) must
+    keep returning False exactly as before -- only a real timeout should
+    raise MT5CallTimeoutError."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    client = sim
+
+    def rejecting_order_send(req):
+        return type('OrderSendResult', (), {'retcode': 10016, 'order': 0, 'deal': 0, 'comment': 'Invalid stops'})()
+
+    sim.order_send = rejecting_order_send
+
+    ok = await tm._force_runner_sl(ACCOUNT, client, runner, runner.entry_price, reason="TP1-BE")
+
+    assert ok is False
 
 
 # --- Task 3: TradeStateStore write-point wiring ---

@@ -29,6 +29,17 @@ ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
 
 MAGIC = 987654
 
+
+class MT5CallTimeoutError(Exception):
+    """Raised when an MT5 order_send/partial_close call times out (asyncio.TimeoutError
+    from TradeManager._call) rather than receiving a clean rejection from MT5. Distinct
+    from a clean failure: a timeout means MT5 never responded in time, not that it said no
+    -- the underlying action may still complete in the background (see TradeManager._call's
+    docstring). Callers that notify a business event on failure must treat this differently
+    from a clean rejection (see spec 2026-09-11-mt5-timeout-notification-safety-design.md)."""
+    pass
+
+
 @dataclass
 class ManagedTrade:
     account_name: str
@@ -799,6 +810,16 @@ class TradeManager:
         se beneficia del mismo reintento sin duplicar su propio loop —
         centralizado aqui en vez de en cada caller, mismo patron que
         _get_price_with_retry ya usa para tick_price.
+
+        Real production incident (group 122, 2026-09-11): a hung order_send
+        (past MT5_CALL_TIMEOUT_SECONDS) raised a bare asyncio.TimeoutError
+        that propagated unchanged, got caught by _tick_once_account's single
+        outer try/except, and silently dropped the tp1_hit notification for
+        an already-genuine TP1. A timeout means "MT5 never responded", not
+        "MT5 said no" -- re-raised here as MT5CallTimeoutError so callers can
+        tell the two apart and notify accordingly, instead of retrying (a
+        call that already hung 10s is unlikely to succeed on an immediate
+        retry) or losing the notification entirely.
         """
         # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida
         # mecanica es el trailing SL) -- omitir "tp" en un request action=6 puede
@@ -807,7 +828,10 @@ class TradeManager:
         req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": 0.0}
         ok = False
         for attempt in range(1, attempts + 1):
-            res = await self._call(client.order_send, req)
+            try:
+                res = await self._call(client.order_send, req)
+            except asyncio.TimeoutError:
+                raise MT5CallTimeoutError(f"order_send colgado moviendo SL runner={runner.ticket} reason={reason}")
             ok = bool(res and getattr(res, "retcode", None) == 10009)
             if ok:
                 break
