@@ -2859,3 +2859,50 @@ async def test_be_clean_rejection_still_notifies_tp1_hit_be_failed_not_timeout(m
     timeout_events = [event for event, kwargs in tm.notifier.events if event == "tp1_hit_be_timeout"]
     assert len(failed_events) == 1
     assert len(timeout_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_tp2_partial_close_timeout_notifies_tp2_partial_timeout(monkeypatch):
+    """Same failure class as the TP1/BE timeout (Task 3), applied to TP2's
+    partial_close call: a hung MT5 call must not silently drop the
+    notification, and must not falsely claim tp2_partial_applied succeeded
+    or failed cleanly -- the real outcome in MT5 is unknown.
+
+    Uses ACCOUNT_BIG_LOT (not ACCOUNT): with the default fixed_lot=0.01 ==
+    volume_min, _check_partial_close_is_honourable always finds the 50%
+    close unhonourable and returns before ever calling partial_close (see
+    test_tp2_partial_close_is_skipped_when_it_would_close_the_whole_runner),
+    so the hung partial_close would never actually run under ACCOUNT.
+
+    Also sets sim.positions[runner.ticket]["price_current"] explicitly (same
+    pattern as every other TP2 test in this file, e.g.
+    test_tp2_partial_close_takes_half_volume_and_keeps_trailing_on_remainder):
+    SimuladorMT5.positions_get returns whatever price_current is stored on
+    the position dict as-is -- it does not recompute it from sim.price -- so
+    changing sim.price alone never makes reached_tp2 true and the hung
+    partial_close would never be reached."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+    runner.be_applied = True  # TP2 partial only runs once BE is already applied
+
+    sim.close_position_by_tp(tp1_leg.ticket, close_price=2510.0, profit=20.0)
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)  # processes the TP1 leg's closure, applies BE for real
+
+    def hung_partial_close(account, ticket, percent):
+        time.sleep(0.3)
+        return True
+
+    sim.positions[runner.ticket]["price_current"] = 2530.0  # reaches tp2
+    sim.price = 2530.0
+    sim.partial_close = hung_partial_close
+
+    await tm._tick_once_account(ACCOUNT_BIG_LOT)
+
+    timeout_events = [event for event, kwargs in tm.notifier.events if event == "tp2_partial_timeout"]
+    assert len(timeout_events) == 1
+    assert runner.tp2_partial_applied is False

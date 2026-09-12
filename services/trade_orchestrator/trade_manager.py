@@ -997,7 +997,20 @@ class TradeManager:
             return
         # El parcial es honrable: cualquier latch previo quedo obsoleto.
         runner.tp2_partial_skipped_volume = None
-        ok = await self._call(client.partial_close, account, runner.ticket, 50)
+        try:
+            ok = await self._call(client.partial_close, account, runner.ticket, 50)
+        except asyncio.TimeoutError:
+            log.error("[TM] timeout aplicando partial close en tp2, runner=%s group_id=%s — estado desconocido",
+                      runner.ticket, runner.group_id)
+            channel_name = resolve_channel_name(runner.chat_id, self._channel_names())
+            timeout_message = build_tp2_partial_timeout_message(
+                channel_name=channel_name, group_id=runner.group_id, symbol=runner.symbol, direction=runner.direction,
+            )
+            await self._notify(
+                "tp2_partial_timeout", channel="both", group_id=runner.group_id, ticket=runner.ticket,
+                symbol=runner.symbol, chat_id=runner.chat_id, channel_name=channel_name, message=timeout_message,
+            )
+            return
         if not ok:
             log.error("[TM] fallo aplicando partial close en tp2 runner=%s group_id=%s",
                       runner.ticket, runner.group_id)
