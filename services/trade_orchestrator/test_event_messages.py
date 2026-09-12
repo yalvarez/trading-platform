@@ -194,6 +194,7 @@ def test_tp2_partial_timeout_message_conveys_uncertainty():
     )
     assert "TP2" in msg.upper()
     assert "revisar" in msg.lower()
+    assert "%%" not in msg
 
 
 def test_tp2_partial_timeout_message_handles_direction_none():

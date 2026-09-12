@@ -148,7 +148,7 @@ def build_tp2_partial_timeout_message(*, channel_name, group_id, symbol, directi
     return (
         f"⚠️ TP2 ALCANZADO — Canal: {channel_name} (grupo {group_id})\n"
         f"{symbol} {_fmt_direction(direction)}\n"
-        f"No se pudo confirmar si el cierre parcial del 50%% se ejecuto — MT5 no respondio "
+        f"No se pudo confirmar si el cierre parcial del 50% se ejecuto — MT5 no respondio "
         f"a tiempo.\n"
         f"Revisar manualmente el volumen real de la posicion en MT5."
     )

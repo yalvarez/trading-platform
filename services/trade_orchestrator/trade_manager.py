@@ -643,7 +643,7 @@ class TradeManager:
                         await self._close_group_in_store(closed_trade.group_id)
                 except Exception as e:
                     log.error("[TM] error procesando cierre de ticket=%s group_id=%s: %s",
-                              ticket, closed_trade.group_id, e)
+                              ticket, closed_trade.group_id, e, exc_info=True)
 
             ACTIVE_TRADES.set(len(self.trades))
 
@@ -659,7 +659,7 @@ class TradeManager:
                     pos = (await self._call(client.positions_get, ticket=ticket) or [pos])[0]
                     await self._apply_trailing(account, client, t, pos)
                 except Exception as e:
-                    log.error("[TM] error aplicando TP2/trailing a ticket=%s group_id=%s: %s", ticket, t.group_id, e)
+                    log.error("[TM] error aplicando TP2/trailing a ticket=%s group_id=%s: %s", ticket, t.group_id, e, exc_info=True)
 
         except Exception as e:
             log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)
