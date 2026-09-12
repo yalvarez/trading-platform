@@ -473,6 +473,30 @@ async def test_apply_mgmt_action_move_sl_be_now_with_missing_entry_price_reports
 
 
 @pytest.mark.asyncio
+async def test_move_sl_be_now_reports_timeout_status_distinct_from_failed(monkeypatch):
+    """Regression guard extending Task 1's MT5CallTimeoutError: this action's
+    existing per-group try/except must recognize the new exception type
+    explicitly, rather than letting it fall into the generic 'reason':
+    'exception' bucket -- the HTTP caller (n8n) should be able to tell
+    'MT5 never responded' apart from 'something else broke'."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    def hung_order_send(req):
+        time.sleep(0.3)
+        return None
+
+    sim.order_send = hung_order_send
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="pon en be", correction=None)
+
+    assert result["results"][0]["status"] == "timeout"
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_note_sl_hit_notifies_once_per_group_without_touching_mt5():
     sim = SimuladorMT5()
     sim.price = 2500.0

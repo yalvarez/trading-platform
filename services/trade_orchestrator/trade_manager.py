@@ -1388,7 +1388,12 @@ class TradeManager:
                         )
                         results.append({"group_id": group_id, "status": "already_satisfied"})
                         continue
-                    ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
+                    try:
+                        ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
+                    except MT5CallTimeoutError:
+                        log.error("[TM][MGMT] timeout aplicando BE via mgmt_action group_id=%s chat_id=%s", group_id, chat_id)
+                        results.append({"group_id": group_id, "status": "timeout"})
+                        continue
                     if ok:
                         runner.be_applied = True
                         # Same fix as _on_tp1_leg_closed: keep planned_sl in
