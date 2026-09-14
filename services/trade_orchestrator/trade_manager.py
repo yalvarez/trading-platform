@@ -841,6 +841,83 @@ class TradeManager:
     def _fmt_price(price: Optional[float]) -> str:
         return f"{price:.5f}" if price is not None else "N/D"
 
+    async def _move_group_legs_to_be(self, account, client, legs: list[ManagedTrade], *, reason: str) -> Optional[dict]:
+        """
+        Mueve a breakeven (precio de entrada compartido por ambas piernas)
+        cualquier pierna de `legs` (tp1, runner, o ambas) cuyo SL en vivo
+        siga peor que BE. Piernas ya en BE o mejor se omiten. Devuelve
+        {"be_price": ..., "leg_ok": {leg_name: bool}} para las piernas que
+        SI necesitaban moverse, o None si ninguna lo necesitaba.
+
+        Compartido por move_sl_be_now (accion dedicada) y close_partial_now
+        (BE automatico tras un cierre parcial, decision de producto
+        2026-09-14: proteger capital siempre que se toma parcial, con o sin
+        mencion explicita de BE en el mensaje del canal) -- misma logica de
+        "que piernas siguen vivas y peor que BE" en ambos casos.
+        """
+        live_legs = [t for t in legs if t.entry_price is not None]
+        if not live_legs:
+            return None
+        be_price: float = live_legs[0].entry_price  # type: ignore[assignment]
+        is_buy = live_legs[0].direction == "BUY"
+
+        legs_needing_be = []
+        for leg in live_legs:
+            pos_list = await self._call(client.positions_get, ticket=leg.ticket)
+            current_sl = float(pos_list[0].sl) if pos_list else None
+            worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
+            if worse_than_be:
+                legs_needing_be.append(leg)
+        if not legs_needing_be:
+            return None
+
+        leg_ok = {}
+        for leg in legs_needing_be:
+            leg_ok[leg.leg] = await self._force_runner_sl(account, client, leg, be_price, reason=reason)
+        for leg in legs_needing_be:
+            if leg_ok.get(leg.leg):
+                leg.be_applied = True
+                # Same fix as _on_tp1_leg_closed: keep planned_sl in sync
+                # with the real, just-applied BE price -- see that call
+                # site's comment for why this matters across a restart's
+                # reconcile_from_mt5.
+                leg.planned_sl = be_price
+        return {"be_price": be_price, "leg_ok": leg_ok}
+
+    async def _force_full_close(self, account, client, ticket: int, *, attempts: int = 3, retry_delay_seconds: float = 0.2) -> bool:
+        """
+        Cierra el 100% de `ticket` via partial_close, reintentando unas pocas
+        veces ante un rechazo transitorio del broker antes de darse por
+        vencido -- mismo patron que _force_runner_sl ya usa para order_send.
+
+        close_now es una instruccion absoluta: el usuario pide estar
+        completamente fuera del mercado YA, casi siempre porque el trade va
+        en contra (o simplemente quiere salir sin importar el P&L). A
+        diferencia de close_partial_now, no existe un fallback sensato tipo
+        "aplica BE en su lugar" -- eso no cumple lo que se pidio y, si el
+        trade esta en negativo, tampoco protege nada real. Lo correcto es
+        agotar los reintentos antes de reportar fallo, no rendirse al primer
+        rechazo.
+
+        Real production incident (group 127, 2026-09-13): un partial_close
+        colgado (timeout) lanzo un asyncio.TimeoutError crudo que escapo del
+        loop por-pierna y aborto TODO el grupo via el try/except externo --
+        la pierna hermana (runner) nunca se intento siquiera. Re-lanzado aqui
+        como MT5CallTimeoutError para que el caller pueda aislar el timeout
+        de UNA pierna sin dejar de intentar la otra.
+        """
+        ok = False
+        for attempt in range(1, attempts + 1):
+            try:
+                ok = bool(await self._call(client.partial_close, account, ticket, 100))
+            except asyncio.TimeoutError:
+                raise MT5CallTimeoutError(f"partial_close colgado cerrando ticket={ticket}")
+            if ok:
+                break
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay_seconds)
+        return ok
+
     async def _force_runner_sl(self, account, client, runner: ManagedTrade, new_sl: float, *, reason: str, attempts: int = 3, retry_delay_seconds: float = 0.2) -> bool:
         """
         Mueve el SL del runner via order_send, reintentando unas pocas veces
@@ -1202,11 +1279,24 @@ class TradeManager:
                     leg_results = []
                     any_leg_failed = False
                     for t in list(legs):
-                        ok = await self._call(client.partial_close, account, t.ticket, 100)
+                        # Cada pierna se aisla en su propio try/except: un
+                        # timeout en tp1 no debe impedir que se intente
+                        # cerrar el runner tambien (ver docstring de
+                        # _force_full_close para el incidente real que esto
+                        # arregla).
+                        try:
+                            ok = await self._force_full_close(account, client, t.ticket)
+                        except MT5CallTimeoutError:
+                            any_leg_failed = True
+                            log.error("[TM][MGMT] close_now: timeout cerrando ticket=%s leg=%s group_id=%s",
+                                      t.ticket, t.leg, group_id)
+                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
+                            continue
                         if not ok:
                             any_leg_failed = True
                             log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
                                       t.ticket, t.leg, group_id)
+                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
                             continue
                         deal_info = await self._get_close_deal_info(client, t.ticket)
                         close_price = deal_info["price"] if deal_info else None
@@ -1290,7 +1380,17 @@ class TradeManager:
                     leg_results = []
                     any_leg_failed = False
                     leg_summaries = []
-                    for t in list(legs):
+                    # Product decision 2026-09-14: only the runner leg takes
+                    # the discretionary partial. tp1 has a fixed job (exit in
+                    # full at its own TP1) -- partial-closing it too would
+                    # double the "lock in profit" mechanism and shrink the
+                    # volume it exits with for no risk-management reason,
+                    # since BE (applied below, unconditionally) already
+                    # protects the position. Same pattern as TP2's own
+                    # partial-close mechanic, which also only ever touches
+                    # the runner.
+                    partial_legs = [t for t in legs if t.leg == "runner"]
+                    for t in partial_legs:
                         # Fix 1: validar POR PIERNA (cada una tiene su propio
                         # volumen vivo) antes de tocar MT5 — ver
                         # _check_partial_close_is_honourable para el bug de
@@ -1334,6 +1434,23 @@ class TradeManager:
                             "close_volume": deal_info["volume"] if deal_info else None,
                             "pnl_money": deal_info["profit"] if deal_info else None,
                         })
+
+                    # Product decision 2026-09-14: BE protection is applied
+                    # unconditionally after a close_partial_now, independent
+                    # of whether the partial itself succeeded -- protecting
+                    # capital is always correct once the message asked to
+                    # lock in profit, and must not depend on the message
+                    # explicitly mentioning BE (real bug: n8n's classifier
+                    # had to pick ONE action for messages combining "secure
+                    # partials" + "set BE", silently dropping whichever one
+                    # lost -- see group 128 incident). Applies to every leg
+                    # still open (tp1 if not yet hit, and the runner with
+                    # whatever volume remains after the partial attempt).
+                    try:
+                        await self._move_group_legs_to_be(account, client, legs, reason="mgmt-close-partial-auto-BE")
+                    except MT5CallTimeoutError:
+                        log.error("[TM][MGMT] timeout aplicando BE automatico tras close_partial_now group_id=%s chat_id=%s", group_id, chat_id)
+
                     if any_leg_failed:
                         message = build_partial_failure_message(channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries)
                         await self._notify(
@@ -1352,6 +1469,7 @@ class TradeManager:
                         channel_name=channel_name, raw_text=raw_text, percent_requested=effective_percent,
                         leg_results=leg_results, message=message,
                     )
+                    await self._persist_group(group_id)
                     results.append({"group_id": group_id, "status": "applied"})
                 except Exception as e:
                     log.error("[TM][MGMT] excepcion en close_partial_now group_id=%s chat_id=%s: %s", group_id, chat_id, e)
@@ -1388,31 +1506,32 @@ class TradeManager:
                                   runner.ticket, group_id)
                         results.append({"group_id": group_id, "status": "failed", "reason": "no_entry_price"})
                         continue
-                    pos_list = await self._call(client.positions_get, ticket=runner.ticket)
-                    current_sl = float(pos_list[0].sl) if pos_list else None
-                    be_price = runner.entry_price
-                    is_buy = runner.direction == "BUY"
-                    worse_than_be = current_sl is None or (current_sl < be_price if is_buy else current_sl > be_price)
-                    if not worse_than_be:
+                    # Fix (group 128, 2026-09-13/14): un mensaje de canal puede
+                    # pedir BE antes de que el sistema haya registrado el TP1
+                    # de este grupo (el canal afirmaba "ROAD TO TP1" pero
+                    # tp1_hit nunca se disparo para ese grupo). Si la pierna
+                    # tp1 sigue viva en ese momento, tambien debe moverse a
+                    # BE -- de lo contrario queda con su SL original mientras
+                    # el runner si se protege, y esa pierna se come una
+                    # perdida completa que BE habria evitado.
+                    tp1_leg = next((t for t in legs if t.leg == "tp1"), None)
+                    legs_to_move = [runner] + ([tp1_leg] if tp1_leg else [])
+                    try:
+                        be_result = await self._move_group_legs_to_be(account, client, legs_to_move, reason="mgmt-fallback-BE")
+                    except MT5CallTimeoutError:
+                        log.error("[TM][MGMT] timeout aplicando BE via mgmt_action group_id=%s chat_id=%s", group_id, chat_id)
+                        results.append({"group_id": group_id, "status": "timeout"})
+                        continue
+                    if be_result is None:
                         await self._notify(
                             "mgmt_move_sl_be_already_satisfied", group_id=group_id, chat_id=chat_id,
                             message=f"Grupo {group_id}: SL ya estaba en breakeven o mejor, no se aplico ningun cambio.",
                         )
                         results.append({"group_id": group_id, "status": "already_satisfied"})
                         continue
-                    try:
-                        ok = await self._force_runner_sl(account, client, runner, be_price, reason="mgmt-fallback-BE")
-                    except MT5CallTimeoutError:
-                        log.error("[TM][MGMT] timeout aplicando BE via mgmt_action group_id=%s chat_id=%s", group_id, chat_id)
-                        results.append({"group_id": group_id, "status": "timeout"})
-                        continue
-                    if ok:
-                        runner.be_applied = True
-                        # Same fix as _on_tp1_leg_closed: keep planned_sl in
-                        # sync with the real, just-applied BE price -- see
-                        # that call site's comment for why this matters
-                        # across a restart's reconcile_from_mt5.
-                        runner.planned_sl = be_price
+                    be_price = be_result["be_price"]
+                    leg_ok = be_result["leg_ok"]
+                    if all(leg_ok.values()):
                         channel_name = resolve_channel_name(chat_id, self._channel_names())
                         message = build_move_sl_be_applied_message(
                             channel_name=channel_name, group_id=group_id, new_sl=be_price, raw_text=raw_text,
@@ -1424,7 +1543,9 @@ class TradeManager:
                         await self._persist_group(group_id)
                         results.append({"group_id": group_id, "status": "applied"})
                     else:
-                        results.append({"group_id": group_id, "status": "failed"})
+                        failed_legs = [leg_name for leg_name, ok in leg_ok.items() if not ok]
+                        log.error("[TM][MGMT] move_sl_be_now: fallo moviendo BE para legs=%s group_id=%s", failed_legs, group_id)
+                        results.append({"group_id": group_id, "status": "failed", "reason": "partial_be_rejected", "failed_legs": failed_legs})
                 except Exception as e:
                     log.error("[TM][MGMT] excepcion aplicando BE a group_id=%s chat_id=%s: %s", group_id, chat_id, e)
                     results.append({"group_id": group_id, "status": "failed", "reason": "exception"})

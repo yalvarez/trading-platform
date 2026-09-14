@@ -229,6 +229,86 @@ async def test_apply_mgmt_action_close_now_closes_all_groups_of_the_same_chat():
 
 
 @pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_retries_a_transient_partial_close_rejection():
+    """
+    close_now is an absolute instruction (the user is asking to be
+    completely out of the market NOW) -- unlike close_partial_now, there is
+    no sensible fallback like "apply BE instead" when a leg's close is
+    rejected: the position is presumably red (or the user just wants out
+    regardless of P&L), so a stale SL offers no real protection and does
+    not fulfil what was actually asked. The right fix is for close_now to
+    retry a transient rejection (same pattern _force_runner_sl already uses
+    for SL moves) instead of giving up on the first no from the broker.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_ticket = next(t.ticket for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+
+    real_partial_close = sim.partial_close
+    call_count = {"n": 0}
+
+    def flaky_partial_close(account, ticket, percent):
+        if ticket == tp1_ticket:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return False  # first attempt: broker rejects transiently
+        return real_partial_close(account, ticket, percent)
+
+    sim.partial_close = flaky_partial_close
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "closed"}]}
+    assert call_count["n"] == 2  # failed once, succeeded on retry
+    remaining = [t for t in tm.trades.values() if t.group_id == group_id]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_close_now_a_hung_leg_does_not_block_the_sibling_leg():
+    """
+    Real production incident (group 127, 2026-09-13): a close_now request
+    timed out on the tp1 leg's partial_close (MT5 call hung past
+    MT5_CALL_TIMEOUT_SECONDS). The bare asyncio.TimeoutError propagated
+    unhandled out of the per-leg loop, was caught only by the outer
+    per-group try/except, and aborted the ENTIRE group -- the runner leg
+    was never even attempted, staying open with its original SL while the
+    channel had asked to close everything immediately. A timeout on one leg
+    must not prevent the sibling leg from being attempted.
+    """
+    monkeypatch_timeout = "0.05"
+    import os as _os
+    _os.environ["MT5_CALL_TIMEOUT_SECONDS"] = monkeypatch_timeout
+    try:
+        sim = SimuladorMT5()
+        sim.price = 2500.0
+        tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+        group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+        tp1_ticket = next(t.ticket for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+        runner_ticket = next(t.ticket for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+        real_partial_close = sim.partial_close
+
+        def hung_partial_close(account, ticket, percent):
+            if ticket == tp1_ticket:
+                time.sleep(0.3)  # never resolves before the timeout
+            return real_partial_close(account, ticket, percent)
+
+        sim.partial_close = hung_partial_close
+
+        result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="close now", correction=None)
+
+        # The runner leg (not hung) must have been closed regardless of tp1's timeout.
+        assert runner_ticket not in tm.trades
+        assert result["results"][0]["group_id"] == group_id
+        assert result["results"][0]["status"] in ("failed", "timeout")
+    finally:
+        del _os.environ["MT5_CALL_TIMEOUT_SECONDS"]
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_close_now_isolates_a_real_exception_in_one_group():
     """
     A real exception (not just a failed retcode) while processing one
@@ -306,6 +386,94 @@ async def test_apply_mgmt_action_close_now_one_group_fails_partial_close_other_s
 
 
 @pytest.mark.asyncio
+async def test_close_partial_now_only_closes_the_runner_leg_leaving_tp1_untouched():
+    """
+    Product decision 2026-09-14: the tp1 leg has a fixed purpose (exit in
+    full at its own TP1) -- taking a discretionary partial out of it as well
+    would double the "lock in profit" mechanism and shrink the volume tp1
+    exits with for no risk-management reason once BE is already applied.
+    Only the runner (the leg meant for live discretionary management,
+    already the one TP2's partial-close mechanic targets) takes the
+    requested percent; tp1 must be left at its full original volume.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] == "applied"
+    assert sim.positions[tp1_leg.ticket]["volume"] == pytest.approx(0.10)  # untouched
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)  # 50% closed
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_applies_be_to_both_legs_automatically_even_without_be_mention():
+    """
+    Real production bug (group 128, 2026-09-13/14) and follow-up product
+    decision: a channel message combining "secure partials" + "set BE" was
+    classified as move_sl_be_now only, silently dropping the partial-close
+    intent. Fix at the n8n/prompt layer: close_partial_now now always wins
+    that conflict since BE is folded into it automatically -- protecting
+    capital is always correct once profit is being locked in, whether or
+    not the message explicitly mentions BE. Both legs (tp1 still live, and
+    the runner's remainder after the partial) must end up at breakeven.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra parciales, sin mencionar BE", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] == "applied"
+    tp1_pos = sim.positions_get(ticket=tp1_leg.ticket)[0]
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(tp1_pos.sl - 2500.0) < 1e-6
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[tp1_leg.ticket].be_applied is True
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_still_applies_be_when_the_partial_itself_is_rejected():
+    """
+    Product decision 2026-09-14: if the runner's live volume is already at
+    the broker's minimum (e.g. 0.01 with fixed_lot=0.02, after TP2's own
+    50% partial already fired), a further close_partial_now must reject the
+    partial -- no early close by dipping below the tradeable minimum -- but
+    BE protection is independent of whether the partial could execute, and
+    must still be applied to every leg still open.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    # fixed_lot=0.01 == volume_min: any partial on the runner is unhonourable.
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] == "failed"
+    assert result["results"][0]["reason"] == "partial_close_rejected"
+    # Volume untouched (partial correctly declined)...
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.01)
+    # ...but BE protection still applied to both legs regardless.
+    tp1_pos = sim.positions_get(ticket=tp1_leg.ticket)[0]
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(tp1_pos.sl - 2500.0) < 1e-6
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[tp1_leg.ticket].be_applied is True
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
 async def test_close_partial_now_applies_default_50_percent_when_no_percent_given():
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -317,6 +485,8 @@ async def test_close_partial_now_applies_default_50_percent_when_no_percent_give
     group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
     legs_before = [t for t in tm.trades.values() if t.group_id == group_id]
     tickets_before = {t.ticket for t in legs_before}
+    tp1_leg = next(t for t in legs_before if t.leg == "tp1")
+    runner_leg = next(t for t in legs_before if t.leg == "runner")
 
     result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra parte", correction=None)
 
@@ -324,9 +494,9 @@ async def test_close_partial_now_applies_default_50_percent_when_no_percent_give
     # Both legs still open (partial, not full close) -- tickets unchanged.
     remaining_tickets = {t.ticket for t in tm.trades.values() if t.group_id == group_id}
     assert remaining_tickets == tickets_before
-    for ticket in tickets_before:
-        pos = sim.positions[ticket]
-        assert pos["volume"] == pytest.approx(0.05)  # 50% of the 0.10 fixed_lot
+    # Only the runner takes the partial -- tp1's job is to exit in full at its own TP1.
+    assert sim.positions[tp1_leg.ticket]["volume"] == pytest.approx(0.10)
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)  # 50% of the 0.10 fixed_lot
 
 
 @pytest.mark.asyncio
@@ -335,7 +505,7 @@ async def test_close_partial_now_applies_explicit_percent():
     sim.price = 2500.0
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
     group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
-    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    legs = [t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner"]
 
     await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
 
@@ -397,6 +567,38 @@ async def test_apply_mgmt_action_move_sl_be_now_applies_to_all_groups_with_mixed
     assert results_by_group[g2]["status"] == "already_satisfied"
     g1_runner = next(t for t in tm.trades.values() if t.group_id == g1 and t.leg == "runner")
     assert tm.trades[g1_runner.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
+async def test_apply_mgmt_action_move_sl_be_now_moves_both_legs_when_tp1_still_open():
+    """
+    Real production bug (group 128, 2026-09-13/14): a channel message
+    ("...ROAD TO TP1... secure partials. SET BE FOR ZERO RISK") arrived and
+    n8n classified it as move_sl_be_now, but the channel's claimed TP1 was
+    never actually hit by the system (tp1_hit was never logged for this
+    group) -- so the tp1 leg was still live, not yet closed at its own TP1.
+    move_sl_be_now only ever moved the runner leg's SL, silently leaving the
+    tp1 leg at its original SL. Both legs hit SL later and the tp1 leg took
+    a full loss that BE would have prevented -- the user had to move it to
+    BE manually. When the tp1 leg is still open, move_sl_be_now must move
+    BOTH legs to breakeven, not just the runner.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="move_sl_be_now", chat_id=CHAT_ID, raw_text="secure partials. SET BE FOR ZERO RISK", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "applied"}]}
+    tp1_pos = sim.positions_get(ticket=tp1_leg.ticket)[0]
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(tp1_pos.sl - 2500.0) < 1e-6
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[tp1_leg.ticket].be_applied is True
+    assert tm.trades[runner_leg.ticket].be_applied is True
 
 
 @pytest.mark.asyncio
@@ -2381,14 +2583,13 @@ async def test_close_partial_now_still_succeeds_when_both_halves_clear_the_minim
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
     group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0,
                                    tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
-    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
 
     result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
                                         raw_text="cierra la mitad", correction=None, percent=50.0)
 
     assert result["results"][0]["status"] == "applied"
-    for t in legs:
-        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.05)
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)
     successes = [e for e, _ in tm.notifier.events if e == "mgmt_close_partial_now"]
     assert len(successes) == 1
 
@@ -2405,14 +2606,13 @@ async def test_close_partial_now_allows_a_request_whose_both_sides_stay_tradeabl
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
     group_id = await tm.open_group(account, symbol="XAUUSD", direction="BUY", sl=2490.0,
                                    tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
-    legs = [t for t in tm.trades.values() if t.group_id == group_id]
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
 
     result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID,
                                         raw_text="cierra 80%", correction=None, percent=80.0)
 
     assert result["results"][0]["status"] == "applied"
-    for t in legs:
-        assert sim.positions[t.ticket]["volume"] == pytest.approx(0.01)
+    assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.01)
 
 
 # --- Fix 2: percent must be validated to (0, 100) ---
