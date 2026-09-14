@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import logging.handlers
 
 from services.common.config import Settings
 from services.common.redis_streams import redis_client, xread_loop, Streams
@@ -13,7 +14,37 @@ from .trade_state_store import TradeStateStore
 
 container_label = os.getenv("CONTAINER_LABEL") or os.getenv("HOSTNAME") or "trade_orchestrator"
 log_fmt = f"%(asctime)s %(levelname)s [{container_label}] %(name)s: %(message)s"
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=log_fmt)
+formatter = logging.Formatter(log_fmt)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+console_handler.setFormatter(formatter)
+root_logger.addHandler(console_handler)
+
+# Archivo de debug persistente en disco (bind-mounted, mismo patron que
+# audit_log.jsonl): docker logs se pierde por completo cada vez que el
+# contenedor se recrea (rebuild/restart), lo que ya nos costo la evidencia
+# cruda de un incidente real en produccion (grupo 129, 2026-09-14) -- para
+# cuando se re-reviso el log, el contenedor ya se habia reiniciado con el
+# fix desplegado y el log crudo del contenedor anterior ya no existia (solo
+# sobrevivio el audit_log.jsonl, que no registra logs a nivel DEBUG ni cada
+# tick del loop de gestion mecanica). Este handler queda SIEMPRE en DEBUG,
+# independiente de LOG_LEVEL/consola, para no volver a perder ese detalle.
+# Rotacion diaria con 15 backups (~15 dias de retencion) para no crecer sin
+# limite.
+debug_log_dir = os.getenv("DEBUG_LOG_DIR", "data")
+os.makedirs(debug_log_dir, exist_ok=True)
+debug_file_handler = logging.handlers.TimedRotatingFileHandler(
+    os.path.join(debug_log_dir, "orchestrator_debug.log"),
+    when="midnight", backupCount=15, encoding="utf-8",
+)
+debug_file_handler.setLevel(logging.DEBUG)
+debug_file_handler.setFormatter(formatter)
+root_logger.addHandler(debug_file_handler)
+
 log = logging.getLogger("trade_orchestrator")
 
 

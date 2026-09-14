@@ -106,6 +106,15 @@ services:
       # Sin este bind mount vive solo dentro del contenedor y se destruye en
       # cada rebuild, que es justamente lo contrario de lo que se pretende.
       - ./data/audit_log.jsonl:/app/data/audit_log.jsonl:rw
+      # Directorio completo (no un archivo unico como los de arriba) porque
+      # orchestrator_debug.log rota a nombres dinamicos
+      # (orchestrator_debug.log.YYYY-MM-DD, hasta 15 backups) via
+      # TimedRotatingFileHandler -- montar solo el archivo base no capturaria
+      # los archivos rotados. Real incidente de produccion (grupo 129,
+      # 2026-09-14): docker logs (nivel DEBUG) se perdio por completo al
+      # recrear el contenedor con un fix, dejando solo el audit_log.jsonl
+      # (que no registra a nivel DEBUG) para diagnosticar.
+      - ./data:/app/data:rw
     ports:
       - "8200:8200"
 
