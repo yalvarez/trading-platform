@@ -942,11 +942,21 @@ class TradeManager:
         call that already hung 10s is unlikely to succeed on an immediate
         retry) or losing the notification entirely.
         """
-        # tp=0.0 explicito: el runner nunca lleva un TP real en MT5 (su unica salida
-        # mecanica es el trailing SL) -- omitir "tp" en un request action=6 puede
-        # limpiar o preservar el TP existente segun el broker, asi que lo fijamos
-        # explicitamente en vez de depender de ese comportamiento implicito.
-        req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": 0.0}
+        # tp explicito, nunca omitido: omitir "tp" en un request action=6
+        # puede limpiar o preservar el TP existente segun el broker, asi que
+        # siempre lo fijamos explicitamente en vez de depender de ese
+        # comportamiento implicito. El runner nunca lleva un TP real en MT5
+        # (su unica salida mecanica es el trailing SL), asi que para el
+        # sigue siendo 0.0 -- pero la pierna tp1 SI tiene un TP fijo real en
+        # el broker (real production bug, group 132, 2026-09-14: mover BE a
+        # la pierna tp1 via este mismo helper, ya sea desde move_sl_be_now o
+        # el BE automatico de close_partial_now, mandaba tp=0.0
+        # incondicionalmente y borraba ese TP -- el precio cruzo tp1_price
+        # sin ninguna orden ahi que lo ejecutara, y la pierna quedo viva
+        # hasta que el precio retrocedio y toco el SL en BE en su lugar, un
+        # viaje de ida y vuelta completo que el TP fijo habria evitado).
+        tp_to_keep = runner.tp1_price if (runner.leg == "tp1" and runner.tp1_price is not None) else 0.0
+        req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": float(tp_to_keep)}
         ok = False
         for attempt in range(1, attempts + 1):
             try:

@@ -438,6 +438,16 @@ async def test_close_partial_now_applies_be_to_both_legs_automatically_even_with
     assert abs(runner_pos.sl - 2500.0) < 1e-6
     assert tm.trades[tp1_leg.ticket].be_applied is True
     assert tm.trades[runner_leg.ticket].be_applied is True
+    # Real production bug (group 132, 2026-09-14): moving the tp1 leg to BE
+    # reused _force_runner_sl, which always sends tp=0.0 on the order_send
+    # (correct for the runner, which never carries a real TP in MT5 -- its
+    # only exit is trailing) -- but applied to tp1 it wiped out tp1's real
+    # TP in the broker. The price then crossed tp1_price with no order
+    # there to fill it, and the leg sat open (mis-tracked as still needing
+    # its TP) until price reversed back to BE and closed it there instead
+    # -- a full round trip the fixed TP would have prevented. tp1's real TP
+    # must survive being moved to BE.
+    assert tp1_pos.tp == pytest.approx(2510.0)
 
 
 @pytest.mark.asyncio
