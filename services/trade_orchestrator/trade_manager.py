@@ -1391,49 +1391,64 @@ class TradeManager:
                     # the runner.
                     partial_legs = [t for t in legs if t.leg == "runner"]
                     for t in partial_legs:
-                        # Fix 1: validar POR PIERNA (cada una tiene su propio
-                        # volumen vivo) antes de tocar MT5 — ver
-                        # _check_partial_close_is_honourable para el bug de
-                        # dinero que esto evita.
-                        problem = await self._check_partial_close_is_honourable(
-                            client, t.ticket, t.symbol, effective_percent,
-                        )
-                        if problem is not None:
+                        # Real production incident (group 129, 2026-09-14): a
+                        # hung partial_close raised a bare asyncio.TimeoutError
+                        # that escaped this loop entirely and skipped the
+                        # automatic-BE step below (added for the group-128
+                        # fix) -- the position sat unprotected until the
+                        # call's background thread finally landed and closed
+                        # it externally. A timeout on one leg must not skip
+                        # the rest of this action, same as close_now's
+                        # per-leg isolation.
+                        try:
+                            # Fix 1: validar POR PIERNA (cada una tiene su propio
+                            # volumen vivo) antes de tocar MT5 — ver
+                            # _check_partial_close_is_honourable para el bug de
+                            # dinero que esto evita.
+                            problem = await self._check_partial_close_is_honourable(
+                                client, t.ticket, t.symbol, effective_percent,
+                            )
+                            if problem is not None:
+                                any_leg_failed = True
+                                # El texto debe nombrar la causa REAL. Antes decia
+                                # siempre "volumen menor al minimo operable" con
+                                # volumen/minimo en None cuando en realidad la
+                                # posicion ya no existia (p. ej. el SL salto justo
+                                # antes de que llegara el comando) — engañoso para
+                                # el operador, aunque el comportamiento de fondo
+                                # (abstenerse de actuar) siempre fue el correcto.
+                                if problem["reason"] == "position_not_found":
+                                    detail = "la posicion ya no existe en MT5 (pudo cerrarse por SL/TP o externamente)"
+                                elif problem["reason"] == "invalid_volume":
+                                    detail = "MT5 reporta un volumen invalido para la posicion"
+                                else:
+                                    detail = (f"{effective_percent:.0f}% de {problem['volume']} resultaria en un "
+                                              f"volumen menor al minimo operable {problem['volume_min']}")
+                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado: {detail})")
+                                log.error("[TM][MGMT] close_partial_now rechazado | ticket=%s leg=%s "
+                                          "group_id=%s percent=%s volume=%s close_vol=%s volume_min=%s motivo=%s",
+                                          t.ticket, t.leg, group_id, effective_percent, problem["volume"],
+                                          problem["close_vol"], problem["volume_min"], problem["reason"])
+                                continue
+                            ok = await self._call(client.partial_close, account, t.ticket, effective_percent)
+                            if not ok:
+                                any_leg_failed = True
+                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
+                                log.error("[TM][MGMT] partial_close (parcial %.0f%%) rechazado | ticket=%s leg=%s group_id=%s",
+                                          effective_percent, t.ticket, t.leg, group_id)
+                                continue
+                            deal_info = await self._get_close_deal_info(client, t.ticket)
+                            leg_results.append({
+                                "leg": t.leg,
+                                "close_price": deal_info["price"] if deal_info else None,
+                                "close_volume": deal_info["volume"] if deal_info else None,
+                                "pnl_money": deal_info["profit"] if deal_info else None,
+                            })
+                        except asyncio.TimeoutError:
                             any_leg_failed = True
-                            # El texto debe nombrar la causa REAL. Antes decia
-                            # siempre "volumen menor al minimo operable" con
-                            # volumen/minimo en None cuando en realidad la
-                            # posicion ya no existia (p. ej. el SL salto justo
-                            # antes de que llegara el comando) — engañoso para
-                            # el operador, aunque el comportamiento de fondo
-                            # (abstenerse de actuar) siempre fue el correcto.
-                            if problem["reason"] == "position_not_found":
-                                detail = "la posicion ya no existe en MT5 (pudo cerrarse por SL/TP o externamente)"
-                            elif problem["reason"] == "invalid_volume":
-                                detail = "MT5 reporta un volumen invalido para la posicion"
-                            else:
-                                detail = (f"{effective_percent:.0f}% de {problem['volume']} resultaria en un "
-                                          f"volumen menor al minimo operable {problem['volume_min']}")
-                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado: {detail})")
-                            log.error("[TM][MGMT] close_partial_now rechazado | ticket=%s leg=%s "
-                                      "group_id=%s percent=%s volume=%s close_vol=%s volume_min=%s motivo=%s",
-                                      t.ticket, t.leg, group_id, effective_percent, problem["volume"],
-                                      problem["close_vol"], problem["volume_min"], problem["reason"])
-                            continue
-                        ok = await self._call(client.partial_close, account, t.ticket, effective_percent)
-                        if not ok:
-                            any_leg_failed = True
-                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
-                            log.error("[TM][MGMT] partial_close (parcial %.0f%%) rechazado | ticket=%s leg=%s group_id=%s",
-                                      effective_percent, t.ticket, t.leg, group_id)
-                            continue
-                        deal_info = await self._get_close_deal_info(client, t.ticket)
-                        leg_results.append({
-                            "leg": t.leg,
-                            "close_price": deal_info["price"] if deal_info else None,
-                            "close_volume": deal_info["volume"] if deal_info else None,
-                            "pnl_money": deal_info["profit"] if deal_info else None,
-                        })
+                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
+                            log.error("[TM][MGMT] close_partial_now: timeout en ticket=%s leg=%s group_id=%s",
+                                      t.ticket, t.leg, group_id)
 
                     # Product decision 2026-09-14: BE protection is applied
                     # unconditionally after a close_partial_now, independent

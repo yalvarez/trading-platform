@@ -474,6 +474,47 @@ async def test_close_partial_now_still_applies_be_when_the_partial_itself_is_rej
 
 
 @pytest.mark.asyncio
+async def test_close_partial_now_still_applies_be_when_the_partial_call_times_out(monkeypatch):
+    """
+    Real production incident (group 129, 2026-09-14): the runner's
+    partial_close call hung past MT5_CALL_TIMEOUT_SECONDS. The bare
+    asyncio.TimeoutError propagated unhandled out of the per-leg loop
+    (unlike a clean broker rejection, which IS caught) straight past the
+    automatic-BE block added for the group-128 fix, and into the outer
+    per-group except -- so close_partial_now's automatic BE never ran at
+    all. The group's runner leg (and tp1, still open) sat unprotected until
+    the hung call finally landed in the background and closed the position
+    externally, moments later, at whatever price the market had reached --
+    not a controlled outcome. A timeout on the partial call must not skip
+    the automatic BE step.
+    """
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    group_id = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    tp1_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "tp1")
+    runner_leg = next(t for t in tm.trades.values() if t.group_id == group_id and t.leg == "runner")
+
+    def hung_partial_close(account, ticket, percent):
+        time.sleep(0.3)
+        return True
+
+    sim.partial_close = hung_partial_close
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    assert result["results"][0]["status"] in ("failed", "timeout")
+    # BE protection must still land on both legs despite the hung partial call.
+    tp1_pos = sim.positions_get(ticket=tp1_leg.ticket)[0]
+    runner_pos = sim.positions_get(ticket=runner_leg.ticket)[0]
+    assert abs(tp1_pos.sl - 2500.0) < 1e-6
+    assert abs(runner_pos.sl - 2500.0) < 1e-6
+    assert tm.trades[tp1_leg.ticket].be_applied is True
+    assert tm.trades[runner_leg.ticket].be_applied is True
+
+
+@pytest.mark.asyncio
 async def test_close_partial_now_applies_default_50_percent_when_no_percent_given():
     sim = SimuladorMT5()
     sim.price = 2500.0
