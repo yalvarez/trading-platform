@@ -1699,6 +1699,42 @@ async def test_open_group_aborts_when_price_never_enters_entry_range_within_wait
 
 
 @pytest.mark.asyncio
+async def test_open_group_notifies_and_returns_none_when_order_send_times_out(monkeypatch):
+    """
+    Real production incident (2026-09-14): a real signal ("XAUUSD BUY NOW")
+    hit a hung order_send past MT5_CALL_TIMEOUT_SECONDS while opening the
+    tp1 leg. The bare asyncio.TimeoutError propagated all the way out of
+    open_group unhandled, past the generic exception handler around signal
+    processing -- the signal was silently dropped: no open_aborted/
+    open_failed notification reached n8n or Telegram, the channel's user
+    never learned their signal didn't execute, and _next_group_id had
+    already been incremented, "burning" a group number with no trade
+    behind it. A timeout on order_send must be caught and reported like any
+    other open failure, not escape as a bare exception.
+    """
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    def hung_order_send(req):
+        time.sleep(0.3)
+        return None
+
+    sim.order_send = hung_order_send
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    assert len(tm.trades) == 0
+    events = [kwargs for event, kwargs in notifier.events if event in ("open_aborted", "open_failed")]
+    assert len(events) == 1
+    assert events[0].get("reason") in ("timeout", "mt5_timeout") or "timeout" in events[0].get("message", "").lower() \
+        or "no respondio" in events[0].get("message", "").lower()
+
+
+@pytest.mark.asyncio
 async def test_open_group_recovers_from_transient_empty_tick_on_first_price_read():
     """
     Reproduces a real production incident: mt5linux opens a fresh RPyC

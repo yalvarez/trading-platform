@@ -282,6 +282,28 @@ class TradeManager:
                 return None
         return None
 
+    async def _revert_opened_legs(self, account: dict, client, tickets: dict) -> bool:
+        """
+        Cierra (partial_close 100%) cualquier pierna ya abierta en `tickets`
+        cuando open_group aborta a mitad de camino (la segunda pierna
+        rechazada o con timeout). Cada cierre se aisla de los demas y de un
+        timeout propio -- un revert que se cuelga no debe silenciar el
+        hecho de que puede haber quedado una posicion huerfana sin gestion
+        (ver open_group: el mensaje al usuario cambia segun el resultado de
+        esto). Devuelve True solo si TODAS las piernas se revirtieron
+        confirmadamente.
+        """
+        all_ok = True
+        for t in tickets.values():
+            try:
+                ok = bool(await self._call(client.partial_close, account, t, 100))
+            except asyncio.TimeoutError:
+                log.error("[TM][OPEN] timeout revirtiendo pierna ticket=%s tras fallo de apertura", t)
+                ok = False
+            if not ok:
+                all_ok = False
+        return all_ok
+
     async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None, chat_id: Optional[str] = None) -> Optional[int]:
         """
         Abre dos posiciones (tp1_leg, runner_leg) con el mismo symbol/direction/SL,
@@ -368,15 +390,38 @@ class TradeManager:
                 "type_time": 0,
                 "type_filling": 1,
             }
-            res = await self._call(client.order_send, req)
+            # Real production incident (2026-09-14): a hung order_send raised
+            # a bare asyncio.TimeoutError that escaped open_group entirely --
+            # the signal was silently dropped with no open_aborted/
+            # open_failed notification reaching n8n or Telegram, and
+            # _next_group_id had already been incremented, burning a group
+            # number with no trade behind it. Caught here like any other
+            # open failure so the channel always learns why a signal didn't
+            # execute.
+            try:
+                res = await self._call(client.order_send, req)
+            except asyncio.TimeoutError:
+                log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s", leg, symbol, group_id)
+                reverted_all = await self._revert_opened_legs(account, client, tickets)
+                detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
+                          "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
+                          "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
+                await self._notify(
+                    "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason="timeout",
+                    message=f"Grupo {group_id} ({symbol}): MT5 no respondio a tiempo abriendo la pierna "
+                            f"'{leg}'. {detail}",
+                )
+                return None
             if not res or getattr(res, "retcode", None) != 10009:
                 log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s", leg, symbol, getattr(res, "retcode", None))
-                for t in tickets.values():
-                    await self._call(client.partial_close, account, t, 100)
+                reverted_all = await self._revert_opened_legs(account, client, tickets)
+                detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
+                          "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
+                          "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
                 await self._notify(
                     "open_failed", symbol=symbol, leg=leg, group_id=group_id,
                     message=f"Grupo {group_id} ({symbol}): fallo abriendo la pierna '{leg}' en MT5 "
-                            f"(retcode={getattr(res, 'retcode', None)}). Se revirtieron las piernas ya abiertas del grupo.",
+                            f"(retcode={getattr(res, 'retcode', None)}). {detail}",
                 )
                 return None
             tickets[leg] = int(res.order)
