@@ -88,7 +88,7 @@ def validate_trade_orchestrator() -> None:
 def validate_router_parser() -> None:
     """Valida variables requeridas por router_parser."""
     errors = []
-    for name in ("REDIS_URL",):
+    for name in ("REDIS_URL", "N8N_ACTION_API_KEY"):
         try:
             _require(name)
         except EnvError as e:
