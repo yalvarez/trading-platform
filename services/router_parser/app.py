@@ -59,10 +59,14 @@ async def execute_close_now_directly(
     Ejecuta close_now directo contra /mgmt/action de trade_orchestrator,
     sin pasar por n8n/Ollama -- el patron "TRADE INVALID/Close now" es
     literal y no requiere clasificacion. Reintenta ante error de red,
-    timeout o 5xx; NO reintenta ante 4xx (error de configuracion). Si se
-    agotan los reintentos o llega un 4xx, encola una notificacion en la
-    misma cola de reintentos que usa EventBus, para que el worker que ya
-    corre en trade_orchestrator la entregue -- nunca cae a n8n (ver
+    timeout o 5xx; NO reintenta ante 4xx (error de configuracion) NI ante
+    un 2xx cuyo body reporte status="failed" (mgmt_api.py devuelve HTTP 200
+    con {"status": "failed"} ante cualquier excepcion interna -- un 2xx no
+    es sinonimo de exito, hay que leer el body). Si se agotan los
+    reintentos, llega un 4xx, o llega un 2xx con status de fallo, encola
+    una notificacion en la misma cola de reintentos que usa EventBus, para
+    que el worker que ya corre en trade_orchestrator la entregue -- nunca
+    cae a n8n (ver
     docs/superpowers/specs/2026-09-17-direct-close-now-shortcut-design.md
     seccion 5).
     """
@@ -85,7 +89,29 @@ async def execute_close_now_directly(
             async with httpx.AsyncClient() as client:
                 resp = await client.post(mgmt_url, json=payload, headers=headers, timeout=10.0)
             if 200 <= resp.status_code < 300:
-                return True
+                # mgmt_api.py's mgmt_action() envuelve la llamada a
+                # apply_mgmt_action en un try/except generico y devuelve
+                # HTTP 200 con {"status": "failed", ...} ante CUALQUIER
+                # excepcion interna (timeout de MT5, cuenta sin resolver,
+                # etc.) -- un 2xx NO implica que el cierre haya ocurrido.
+                # Hay que inspeccionar el body para saberlo de verdad.
+                try:
+                    body = resp.json()
+                    body_status = body.get("status") if isinstance(body, dict) else None
+                except Exception:
+                    body_status = None
+                    body = None
+                if body_status in ("completed", "no_active_trade"):
+                    return True
+                # status="failed" (internal_error) o body no parseable: el
+                # HTTP 200 no dice nada util, asi que se trata como fallo
+                # terminal -- directo a la cola de notificacion, sin
+                # reintentar mas (si ya fallo por una excepcion interna,
+                # reintentar el mismo request no va a arreglarlo, y no
+                # queremos quemar el resto del presupuesto de reintentos
+                # en una llamada que ya sabemos rota).
+                last_error = f"HTTP 200 but status={body_status!r}"
+                break
             last_error = f"HTTP {resp.status_code}"
             if 400 <= resp.status_code < 500:
                 break  # config error, retrying won't help
@@ -123,24 +149,24 @@ async def dispatch_raw_message(
     """
     Un mensaje crudo de Streams.RAW, ya sea senal o gestion. Cuatro casos,
     mutuamente excluyentes:
-      1. Señal reconocida pero duplicada -- ya se proceso, no reenviar a n8n.
-      2. Señal reconocida -- publicar a Streams.SIGNALS.
-      3. Patron "TRADE INVALID/Close now" -- ejecutar close_now directo,
-         NUNCA reenviar a n8n (ver spec 2026-09-17).
+      1. Patron "TRADE INVALID/Close now" -- ejecutar close_now directo,
+         NUNCA reenviar a n8n (ver spec 2026-09-17). Se revisa ANTES que
+         process_raw_signal a proposito: CLOSE_NOW_RE exige que aparezcan
+         TANTO "TRADE INVALID" COMO "CLOSE NOW", por lo que es inambiguo
+         por construccion. TradePulseParser.FAST_RE, en cambio, NO esta
+         anclado a todo el mensaje -- matchea una linea tipo "XAUUSD SELL
+         NOW" en CUALQUIER parte de un mensaje multi-linea. Un mensaje real
+         puede citar/reenviar una señal previa arriba de una invalidacion
+         (p.ej. "XAUUSD SELL NOW\n\nTRADE INVALID, Close now"), y eso NO es
+         una nueva señal: es una orden de cierre. Si process_raw_signal se
+         consultara primero, ese texto abriria un trade nuevo en la
+         direccion equivocada en vez de ejecutar el cierre pedido -- peor
+         que el comportamiento pre-plan, donde el mismo texto ambiguo al
+         menos habria llegado a n8n/Ollama para clasificacion.
+      2. Señal reconocida pero duplicada -- ya se proceso, no reenviar a n8n.
+      3. Señal reconocida -- publicar a Streams.SIGNALS.
       4. Cualquier otro texto no vacio -- reenviar a n8n/Ollama.
     """
-    sig = await router.process_raw_signal(chat_id, text)
-    if sig is DUPLICATE_SIGNAL:
-        return
-    if sig:
-        trace_id = uuid.uuid4().hex[:8]
-        sig["chat_id"] = chat_id
-        sig["raw_text"] = text
-        sig["trace"] = trace_id
-        await xadd(redis_client, Streams.SIGNALS, sig)
-        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
-        return
-
     close_now = match_close_now(text)
     if close_now:
         if mgmt_url:
@@ -152,6 +178,18 @@ async def dispatch_raw_message(
             log.error("[CLOSE_NOW_DIRECT] TRADE_ORCHESTRATOR_MGMT_URL no configurada — reenviando a n8n como fallback: %r", text[:80])
             if n8n_webhook_url:
                 await forward_to_n8n(text, chat_id, n8n_webhook_url)
+        return
+
+    sig = await router.process_raw_signal(chat_id, text)
+    if sig is DUPLICATE_SIGNAL:
+        return
+    if sig:
+        trace_id = uuid.uuid4().hex[:8]
+        sig["chat_id"] = chat_id
+        sig["raw_text"] = text
+        sig["trace"] = trace_id
+        await xadd(redis_client, Streams.SIGNALS, sig)
+        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
         return
 
     if text.strip():

@@ -13,6 +13,7 @@ import pytest
 import httpx
 
 from services.router_parser.app import SignalRouter, forward_to_n8n, DUPLICATE_SIGNAL, execute_close_now_directly, dispatch_raw_message
+from parsers_management import match_close_now
 
 
 class FakeRedis:
@@ -138,6 +139,8 @@ async def test_execute_close_now_directly_posts_expected_payload(monkeypatch):
         captured["headers"] = headers
         class R:
             status_code = 200
+            def json(self):
+                return {"status": "completed", "results": []}
         return R()
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
@@ -164,6 +167,8 @@ async def test_execute_close_now_directly_retries_then_succeeds(monkeypatch):
         calls["count"] += 1
         class R:
             status_code = 200 if calls["count"] == 3 else 500
+            def json(self):
+                return {"status": "completed", "results": []}
         return R()
 
     async def fake_sleep(seconds):
@@ -202,6 +207,92 @@ async def test_execute_close_now_directly_does_not_retry_on_4xx(monkeypatch):
     assert ok is False
     assert calls["count"] == 1
     assert len(redis.queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_treats_200_with_failed_status_as_failure(monkeypatch):
+    """
+    Finding 2 (Important, final whole-branch review): mgmt_api.py's
+    mgmt_action() swallows any exception from apply_mgmt_action into an
+    HTTP 200 with {"status": "failed", ...} -- a 2xx status code alone does
+    not mean the close actually happened. Must not retry (the call already
+    failed with a real exception on trade_orchestrator's side; retrying the
+    same broken request won't help) and must enqueue a failure notification.
+    """
+    calls = {"count": 0}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        calls["count"] += 1
+        class R:
+            status_code = 200
+            def json(self):
+                return {"status": "failed", "reason": "internal_error", "detail": "boom"}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    redis = FakeRedisWithQueue()
+    ok = await execute_close_now_directly(
+        chat_id="-1003321565807", text="TRADE INVALID / Close now", direction_hint="SELL",
+        mgmt_url="http://x/mgmt/action", action_api_key="k", redis_client=redis,
+    )
+
+    assert ok is False
+    assert calls["count"] == 1  # no retry on a 200-but-failed body
+    assert len(redis.queue) == 1
+    key, raw = redis.queue[0]
+    assert key == "n8n_event_retry_queue"
+    item = json.loads(raw)
+    envelope = item["envelope"]
+    assert envelope["event_type"] == "mgmt_direct_close_failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_treats_200_with_completed_status_as_success(monkeypatch):
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        class R:
+            status_code = 200
+            def json(self):
+                return {"status": "completed", "results": [{"group_id": 149, "status": "closed"}]}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    redis = FakeRedisWithQueue()
+    ok = await execute_close_now_directly(
+        chat_id="-1003321565807", text="TRADE INVALID / Close now", direction_hint="SELL",
+        mgmt_url="http://x/mgmt/action", action_api_key="k", redis_client=redis,
+    )
+
+    assert ok is True
+    assert len(redis.queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_treats_200_with_no_active_trade_as_success(monkeypatch):
+    """
+    no_active_trade is a legitimate terminal state (e.g. direction_hint
+    filtered out every group, or there was genuinely nothing active for
+    this chat) -- not an error, so it must not retry and must not enqueue
+    a failure notification.
+    """
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        class R:
+            status_code = 200
+            def json(self):
+                return {"status": "no_active_trade"}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    redis = FakeRedisWithQueue()
+    ok = await execute_close_now_directly(
+        chat_id="-1003321565807", text="TRADE INVALID / Close now", direction_hint="SELL",
+        mgmt_url="http://x/mgmt/action", action_api_key="k", redis_client=redis,
+    )
+
+    assert ok is True
+    assert len(redis.queue) == 0
 
 
 @pytest.mark.asyncio
@@ -302,8 +393,13 @@ async def test_dispatch_raw_message_forwards_unrecognized_text_to_n8n(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_dispatch_raw_message_skips_close_now_check_for_recognized_signals(monkeypatch):
-    """A text that already parses as a signal must never be evaluated as a close_now candidate."""
+async def test_dispatch_raw_message_recognized_signal_with_no_close_now_pattern_still_publishes(monkeypatch):
+    """
+    A plain recognized signal with no close_now pattern anywhere in the text
+    must still publish to Streams.SIGNALS exactly as before the Finding-1
+    reordering (match_close_now is now checked FIRST, but it must return
+    None here and fall through to normal signal handling).
+    """
     forwarded = []
     direct_calls = []
 
@@ -336,6 +432,65 @@ async def test_dispatch_raw_message_skips_close_now_check_for_recognized_signals
     assert direct_calls == []
     assert forwarded == []
     assert len(published) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raw_message_close_now_pattern_wins_over_embedded_fast_signal_line(monkeypatch):
+    """
+    Finding 1 (Critical, final whole-branch review): TradePulseParser.FAST_RE
+    is not anchored to the whole message -- it matches a fast-signal line
+    like "XAUUSD SELL NOW" anywhere in a multi-line message, including one
+    that also carries an unambiguous "TRADE INVALID ... Close now" close
+    instruction (e.g. a quoted/forwarded prior signal line above the
+    invalidation, an ordinary Telegram habit on this channel). Uses the
+    REAL SignalRouter (not RecordingRouter) against REAL text, because the
+    bug depends on TradePulseParser's actual (non-anchored) regex behavior,
+    not a mock. Must call execute_close_now_directly, and must NOT publish
+    a signal to Streams.SIGNALS.
+    """
+    forwarded = []
+    direct_calls = []
+
+    async def fake_forward(text, chat_id, webhook_url):
+        forwarded.append((text, chat_id, webhook_url))
+
+    async def fake_execute(**kwargs):
+        direct_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("services.router_parser.app.forward_to_n8n", fake_forward)
+    monkeypatch.setattr("services.router_parser.app.execute_close_now_directly", fake_execute)
+
+    published = []
+    async def fake_xadd(r, stream, fields):
+        published.append((stream, fields))
+    monkeypatch.setattr("services.router_parser.app.xadd", fake_xadd)
+
+    text = "XAUUSD SELL NOW\n\nTRADE INVALID, Close now"
+
+    # Confirm the premise directly: the real parser DOES recognize this text
+    # as a fast signal, and match_close_now ALSO matches it.
+    probe_router = SignalRouter(FakeRedis(), dedup_ttl=120.0)
+    parsed = probe_router.parse_signal(text, chat_id="-1003321565807")
+    assert parsed is not None
+    assert parsed.is_fast is True
+    assert parsed.direction == "SELL"
+    assert match_close_now(text) == {"action": "close_now", "direction_hint": "SELL"}
+
+    router = SignalRouter(FakeRedis(), dedup_ttl=120.0)
+    await dispatch_raw_message(
+        router=router, redis_client=FakeRedis(), chat_id="-1003321565807",
+        text=text,
+        n8n_webhook_url="https://n8n.example.com/in",
+        mgmt_url="http://trade_orchestrator:8200/mgmt/action", action_api_key="test-key",
+    )
+
+    assert len(direct_calls) == 1
+    assert direct_calls[0]["chat_id"] == "-1003321565807"
+    assert direct_calls[0]["text"] == text
+    assert direct_calls[0]["direction_hint"] == "SELL"
+    assert forwarded == []
+    assert published == []
 
 
 @pytest.mark.asyncio
