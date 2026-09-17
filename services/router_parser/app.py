@@ -9,6 +9,7 @@ from services.common.signal_dedup import SignalDeduplicator
 from services.trade_orchestrator.n8n_retry_worker import enqueue as enqueue_n8n_event
 from parsers_base import SignalParser, ParseResult
 from parsers_tradepulse import TradePulseParser
+from parsers_management import match_close_now
 
 
 # Add container label to log format for Grafana filtering
@@ -115,6 +116,51 @@ async def _enqueue_close_now_failure(redis_client, *, chat_id: str, raw_text: st
         log.error("[CLOSE_NOW_DIRECT] no se pudo encolar la notificacion de fallo: %s", e)
 
 
+async def dispatch_raw_message(
+    *, router: "SignalRouter", redis_client, chat_id: str, text: str,
+    n8n_webhook_url: str, mgmt_url: str, action_api_key: str,
+) -> None:
+    """
+    Un mensaje crudo de Streams.RAW, ya sea senal o gestion. Cuatro casos,
+    mutuamente excluyentes:
+      1. Señal reconocida pero duplicada -- ya se proceso, no reenviar a n8n.
+      2. Señal reconocida -- publicar a Streams.SIGNALS.
+      3. Patron "TRADE INVALID/Close now" -- ejecutar close_now directo,
+         NUNCA reenviar a n8n (ver spec 2026-09-17).
+      4. Cualquier otro texto no vacio -- reenviar a n8n/Ollama.
+    """
+    sig = await router.process_raw_signal(chat_id, text)
+    if sig is DUPLICATE_SIGNAL:
+        return
+    if sig:
+        trace_id = uuid.uuid4().hex[:8]
+        sig["chat_id"] = chat_id
+        sig["raw_text"] = text
+        sig["trace"] = trace_id
+        await xadd(redis_client, Streams.SIGNALS, sig)
+        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
+        return
+
+    close_now = match_close_now(text)
+    if close_now:
+        if mgmt_url:
+            await execute_close_now_directly(
+                chat_id=chat_id, text=text, direction_hint=close_now["direction_hint"],
+                mgmt_url=mgmt_url, action_api_key=action_api_key, redis_client=redis_client,
+            )
+        else:
+            log.error("[CLOSE_NOW_DIRECT] TRADE_ORCHESTRATOR_MGMT_URL no configurada — reenviando a n8n como fallback: %r", text[:80])
+            if n8n_webhook_url:
+                await forward_to_n8n(text, chat_id, n8n_webhook_url)
+        return
+
+    if text.strip():
+        if n8n_webhook_url:
+            await forward_to_n8n(text, chat_id, n8n_webhook_url)
+        else:
+            log.warning("[N8N_FORWARD] N8N_INBOUND_WEBHOOK_URL no configurada — mensaje descartado: %r", text[:80])
+
+
 class SignalRouter:
     def __init__(self, redis_client, dedup_ttl=120.0):
         from parsers_tradepulse import TradePulseParser
@@ -218,6 +264,8 @@ async def main():
 
     from services.common.config import config as _config
     n8n_webhook_url = _config.get("N8N_INBOUND_WEBHOOK_URL", "")
+    mgmt_url = _config.get("TRADE_ORCHESTRATOR_MGMT_URL", "")
+    action_api_key = _config.get("N8N_ACTION_API_KEY", "")
 
     # Bucle robusto: reintenta creación de grupo si ocurre NOGROUP
     import asyncio
@@ -226,25 +274,11 @@ async def main():
             async for msg_id, fields in xreadgroup_loop(r, Streams.RAW, group, consumer):
                 text = fields.get("text", "")
                 chat_id = fields.get("chat_id", "")
-
                 try:
-                    sig = await router.process_raw_signal(chat_id, text)
-                    if sig is DUPLICATE_SIGNAL:
-                        # Reconocida pero descartada por dedup — ya se proceso la primera
-                        # vez, no reenviar a n8n como si fuera texto no reconocido.
-                        pass
-                    elif sig:
-                        trace_id = uuid.uuid4().hex[:8]
-                        sig["chat_id"] = chat_id
-                        sig["raw_text"] = text
-                        sig["trace"] = trace_id
-                        await xadd(r, Streams.SIGNALS, sig)
-                        log.info(f"[SIGNAL] trace={trace_id} {sig['provider_tag']} {sig['direction']} {sig['symbol']}")
-                    elif text.strip():
-                        if n8n_webhook_url:
-                            await forward_to_n8n(text, chat_id, n8n_webhook_url)
-                        else:
-                            log.warning("[N8N_FORWARD] N8N_INBOUND_WEBHOOK_URL no configurada — mensaje descartado: %r", text[:80])
+                    await dispatch_raw_message(
+                        router=router, redis_client=r, chat_id=chat_id, text=text,
+                        n8n_webhook_url=n8n_webhook_url, mgmt_url=mgmt_url, action_api_key=action_api_key,
+                    )
                 finally:
                     await xack(r, Streams.RAW, group, msg_id)
         except Exception as e:

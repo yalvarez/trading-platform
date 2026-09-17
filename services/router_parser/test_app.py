@@ -12,7 +12,7 @@ import json
 import pytest
 import httpx
 
-from services.router_parser.app import SignalRouter, forward_to_n8n, DUPLICATE_SIGNAL, execute_close_now_directly
+from services.router_parser.app import SignalRouter, forward_to_n8n, DUPLICATE_SIGNAL, execute_close_now_directly, dispatch_raw_message
 
 
 class FakeRedis:
@@ -234,3 +234,132 @@ async def test_execute_close_now_directly_enqueues_notification_after_exhausting
     assert "-1003321565807" in envelope["message"]
     assert "REVISAR LA CUENTA MANUALMENTE" in envelope["message"]
     assert envelope["payload"]["chat_id"] == "-1003321565807"
+
+
+class RecordingRouter:
+    """Stand-in for SignalRouter that returns a fixed process_raw_signal result."""
+    def __init__(self, result):
+        self.result = result
+
+    async def process_raw_signal(self, chat_id, text):
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raw_message_runs_close_now_directly_and_skips_n8n(monkeypatch):
+    forwarded = []
+    direct_calls = []
+
+    async def fake_forward(text, chat_id, webhook_url):
+        forwarded.append((text, chat_id, webhook_url))
+
+    async def fake_execute(chat_id, text, direction_hint, mgmt_url, action_api_key, redis_client):
+        direct_calls.append((chat_id, text, direction_hint))
+        return True
+
+    monkeypatch.setattr("services.router_parser.app.forward_to_n8n", fake_forward)
+    monkeypatch.setattr("services.router_parser.app.execute_close_now_directly", fake_execute)
+
+    router = RecordingRouter(None)  # not a recognized signal
+    redis = FakeRedis()
+    await dispatch_raw_message(
+        router=router, redis_client=redis, chat_id="-1003321565807",
+        text="XAUUSD SELL TRADE INVALID ❌\n\nClose now",
+        n8n_webhook_url="https://n8n.example.com/in",
+        mgmt_url="http://trade_orchestrator:8200/mgmt/action", action_api_key="test-key",
+    )
+
+    assert direct_calls == [("-1003321565807", "XAUUSD SELL TRADE INVALID ❌\n\nClose now", "SELL")]
+    assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raw_message_forwards_unrecognized_text_to_n8n(monkeypatch):
+    forwarded = []
+    direct_calls = []
+
+    async def fake_forward(text, chat_id, webhook_url):
+        forwarded.append((text, chat_id, webhook_url))
+
+    async def fake_execute(**kwargs):
+        direct_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("services.router_parser.app.forward_to_n8n", fake_forward)
+    monkeypatch.setattr("services.router_parser.app.execute_close_now_directly", fake_execute)
+
+    router = RecordingRouter(None)
+    redis = FakeRedis()
+    await dispatch_raw_message(
+        router=router, redis_client=redis, chat_id="-1",
+        text="HIT SL. GET READY FOR RECOVERY",
+        n8n_webhook_url="https://n8n.example.com/in",
+        mgmt_url="http://trade_orchestrator:8200/mgmt/action", action_api_key="test-key",
+    )
+
+    assert direct_calls == []
+    assert forwarded == [("HIT SL. GET READY FOR RECOVERY", "-1", "https://n8n.example.com/in")]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raw_message_skips_close_now_check_for_recognized_signals(monkeypatch):
+    """A text that already parses as a signal must never be evaluated as a close_now candidate."""
+    forwarded = []
+    direct_calls = []
+
+    async def fake_forward(text, chat_id, webhook_url):
+        forwarded.append((text, chat_id, webhook_url))
+
+    async def fake_execute(**kwargs):
+        direct_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("services.router_parser.app.forward_to_n8n", fake_forward)
+    monkeypatch.setattr("services.router_parser.app.execute_close_now_directly", fake_execute)
+
+    sig = {"symbol": "XAUUSD", "direction": "SELL", "provider_tag": "TRADE_PULSE", "format_tag": "TRADEPULSE"}
+    router = RecordingRouter(sig)
+    redis = FakeRedis()
+
+    published = []
+    async def fake_xadd(r, stream, fields):
+        published.append((stream, fields))
+    monkeypatch.setattr("services.router_parser.app.xadd", fake_xadd)
+
+    await dispatch_raw_message(
+        router=router, redis_client=redis, chat_id="-1",
+        text="XAUUSD SELL NOW",
+        n8n_webhook_url="https://n8n.example.com/in",
+        mgmt_url="http://trade_orchestrator:8200/mgmt/action", action_api_key="test-key",
+    )
+
+    assert direct_calls == []
+    assert forwarded == []
+    assert len(published) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raw_message_skips_duplicate_signal_without_forwarding_or_direct_call(monkeypatch):
+    forwarded = []
+    direct_calls = []
+
+    async def fake_forward(text, chat_id, webhook_url):
+        forwarded.append((text, chat_id, webhook_url))
+
+    async def fake_execute(**kwargs):
+        direct_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("services.router_parser.app.forward_to_n8n", fake_forward)
+    monkeypatch.setattr("services.router_parser.app.execute_close_now_directly", fake_execute)
+
+    router = RecordingRouter(DUPLICATE_SIGNAL)
+    redis = FakeRedis()
+    await dispatch_raw_message(
+        router=router, redis_client=redis, chat_id="-1", text="XAUUSD SELL NOW",
+        n8n_webhook_url="https://n8n.example.com/in",
+        mgmt_url="http://trade_orchestrator:8200/mgmt/action", action_api_key="test-key",
+    )
+
+    assert direct_calls == []
+    assert forwarded == []
