@@ -84,8 +84,10 @@ el mismo riesgo: no cierran posiciones enteras de grupos que no nombran.
   reintentos, sin pasar por n8n.
 - Notificación al operador cuando el atajo agota sus reintentos.
 - Parámetro `direction_hint` en `apply_mgmt_action` y en
-  `MgmtActionRequest`, que filtra los grupos por dirección.
+  `MgmtActionRequest`, que filtra los grupos por dirección **en la rama
+  `close_now` únicamente** (ver §6 para por qué no en las demás).
 - Notificación de los grupos excluidos por ese filtro.
+- `N8N_ACTION_API_KEY` pasa a ser requerida por `validate_router_parser()`.
 
 **Fuera de alcance:**
 - Cualquier otro patrón de gestión (BE, cierres parciales, correcciones de
@@ -164,18 +166,39 @@ Body: {
 }
 ```
 
+`direction_hint` se normaliza con `.upper()` antes de enviarse.
+`DIRECTION_RE` es case-insensitive y puede capturar `buy` en minúsculas
+(p. ej. `TRADE INVALID ... close now the buy position`), que el validador
+del endpoint rechazaría con 422.
+
 Se reutiliza `N8N_ACTION_API_KEY` — es la clave que ya protege ese endpoint;
 introducir una segunda credencial para el mismo endpoint no agrega
 seguridad y sí una variable más que mantener sincronizada.
 
 ### Configuración nueva
 
-`TRADE_ORCHESTRATOR_MGMT_URL` (ej. `http://trade_orchestrator:8000/mgmt/action`),
-en `services/common/config.py`, `.env.example` y `docker-compose`. Sin ella
-configurada, el atajo no puede operar: se registra un error y el mensaje se
-reenvía a n8n como antes (degradación explícita, no silenciosa — sin esta
-variable el sistema se comporta como hoy, con su ventana de carrera, pero
-al menos el mensaje no se pierde).
+`TRADE_ORCHESTRATOR_MGMT_URL`, con valor
+`http://trade_orchestrator:8200/mgmt/action` — el puerto es el que
+`app.py:205` levanta (`MGMT_API_PORT`, default 8200) y que
+`docker-compose.yml` publica como `8200:8200`; `trade_orchestrator` es el
+nombre de servicio en compose, resoluble por DNS en la red default.
+
+La variable se agrega a `.env` / `.env.example` y se lee con
+`config.get("TRADE_ORCHESTRATOR_MGMT_URL", "")`. No hay nada que declarar en
+`services/common/config.py`: `ConfigProvider.get` lee `os.environ`
+directamente.
+
+`router_parser` ya recibe `N8N_ACTION_API_KEY` sin cambios de compose —
+ambos servicios cargan el mismo `env_file: .env`. Pero
+`validate_router_parser()` (`services/common/env_validator.py`) hoy solo
+exige `REDIS_URL` y `DEDUP_TTL_SECONDS`: se le agrega `N8N_ACTION_API_KEY`
+como requerida, para que una clave ausente falle al arrancar y no en el
+primer cierre real con un 401.
+
+Sin `TRADE_ORCHESTRATOR_MGMT_URL` configurada, el atajo no puede operar: se
+registra un error y el mensaje se reenvía a n8n como antes (degradación
+explícita, no silenciosa — sin esta variable el sistema se comporta como
+hoy, con su ventana de carrera, pero al menos el mensaje no se pierde).
 
 Esta es la única situación en que un mensaje que matchea el patrón llega a
 n8n, y ocurre por configuración ausente, no por un fallo en tiempo de
@@ -188,18 +211,38 @@ timeout, y respuestas 5xx. **No** se reintenta ante 4xx (401 por clave mal
 configurada, 422 por payload inválido): son errores de configuración que un
 reintento no resuelve.
 
-Si los tres intentos fallan, o ante un 4xx, `router_parser` emite una
-notificación directa al operador por `N8N_EVENT_WEBHOOK_URL` — el webhook de
-eventos que ya alimenta los mensajes de Telegram, independiente de
-`trade_orchestrator`, así que sigue disponible aunque ese servicio esté
-caído:
+Si los tres intentos fallan, o ante un 4xx, `router_parser` encola una
+notificación para el operador llamando a
+`services.trade_orchestrator.n8n_retry_worker.enqueue(redis_client, envelope)`
+con un envelope de la misma forma que arma `EventBus.emit`:
 
+```python
+{
+    "event_id": str(uuid.uuid4()),
+    "event_type": "mgmt_direct_close_failed",
+    "channel": "both",
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "message": (f"🚨 CIERRE AUTOMÁTICO FALLIDO — Canal: {chat_id}\n"
+                f"Motivo: \"{raw_text}\"\n"
+                f"No se pudo ejecutar el cierre tras 3 intentos: {last_error}\n"
+                f"REVISAR LA CUENTA MANUALMENTE — las posiciones pueden seguir abiertas."),
+    "payload": {"chat_id": chat_id, "raw_text": raw_text,
+                "direction_hint": direction_hint, "error": last_error},
+}
 ```
-🚨 CIERRE AUTOMÁTICO FALLIDO — Canal: {chat_id}
-Motivo: "{raw_text}"
-No se pudo ejecutar el cierre tras 3 intentos: {último error}
-REVISAR LA CUENTA MANUALMENTE — las posiciones pueden seguir abiertas.
-```
+
+`enqueue` solo necesita el cliente Redis que `router_parser` ya tiene
+abierto, y el worker que drena la cola (`run_retry_worker`, lanzado en
+`trade_orchestrator/app.py:222`) aporta backoff y dead-letter sin código
+nuevo.
+
+**Limitación consciente:** el worker vive en `trade_orchestrator`. Si ese
+servicio está caído —el caso más probable de fallo del atajo— la
+notificación espera encolada hasta que vuelva. Se aceptó a cambio de no
+duplicar la lógica de entrega ni montar `./data` en `router_parser` (que
+hoy no lo monta, y sin ese volumen no puede escribir el audit log local que
+`EventBus` escribe antes de encolar). El evento queda en Redis, no se
+pierde; llega tarde.
 
 El mensaje **no** cae a n8n. Si `trade_orchestrator` está caído, n8n tampoco
 podría cerrar nada: llama al mismo endpoint. Lo único que agregaría el
@@ -218,23 +261,49 @@ Validado en el borde por el mismo motivo que `percent` ya lo está: el valor
 puede venir de una extracción sobre texto libre. Un valor fuera de
 `{BUY, SELL}` se rechaza con 422 antes de tocar posiciones.
 
-`apply_mgmt_action` agrega el kwarg `direction_hint: Optional[str] = None` y
-lo aplica **una sola vez**, justo después de resolver `group_ids` y antes
-del switch por acción:
+`apply_mgmt_action` agrega el kwarg `direction_hint: Optional[str] = None`.
+El filtro se aplica **dentro de la rama `close_now` únicamente**, sobre su
+propia copia de `group_ids`:
 
 ```python
-group_ids = self.find_active_groups_for_chat(chat_id)
-if direction_hint:
-    group_ids, excluded = self._filter_groups_by_direction(group_ids, direction_hint)
+if action == "close_now":
+    if direction_hint:
+        group_ids, excluded = self._filter_groups_by_direction(group_ids, direction_hint)
+        ...
 ```
-
-Filtrar ahí — y no dentro de cada rama — hace que toda acción se beneficie
-sin duplicar lógica, y mantiene una sola definición de "qué grupos toca esta
-acción".
 
 `_filter_groups_by_direction` compara contra `ManagedTrade.direction`
 (`trade_manager.py:50`). Las dos piernas de un grupo comparten dirección,
 así que basta inspeccionar cualquiera de ellas.
+
+### Por qué solo `close_now`, y no antes del switch
+
+La versión inicial de este diseño aplicaba el filtro una sola vez antes del
+switch por acción, para que toda acción se beneficiara sin duplicar lógica.
+Revisar el código descartó esa opción por dos motivos concretos:
+
+1. **`signal_correction` usa `group_ids[-1]`** — el grupo más reciente — por
+   decisión explícita del spec de chat_id-scoping (§5): una corrección de un
+   campo se refiere a la señal recién mandada. Filtrar antes del switch
+   cambiaría silenciosamente a qué grupo aplica una corrección.
+
+2. **`group_ids[-1]` sobre una lista vacía lanza `IndexError`.** El guard de
+   lista vacía está en `trade_manager.py:1306`, *antes* del punto donde iría
+   el filtro; un filtro que vaciara la lista después de ese guard llegaría a
+   `signal_correction` sin protección. El `IndexError` lo capturaría el
+   `except Exception` genérico de `mgmt_api.py:65`, devolviendo
+   `internal_error` sin notificar al operador.
+
+`move_sl_be_now` queda **deliberadamente sin filtrar** en este cambio: sigue
+aplicando BE a todos los grupos activos del chat, sin importar la dirección
+que el mensaje nombre. Es el mismo defecto latente que causó el incidente
+del 149/150, pero su consecuencia es acotada —mover un SL a breakeven
+protege capital; no cierra una posición ni realiza una pérdida— y el atajo
+directo no genera esta acción. Si un mensaje de BE mal dirigido llegara a
+causar un problema real, extender el filtro a esta rama es un cambio de dos
+líneas sobre el helper que este spec ya introduce.
+
+`note_sl_hit` (solo notifica) e `ignore` (no toca grupos) tampoco se filtran.
 
 ### Notificación de grupos excluidos
 
@@ -259,10 +328,14 @@ de Telegram del operador.
 
 ### Si el filtro deja cero grupos
 
-Se retorna `{"status": "no_active_trade"}` — el shape que ya existe para
-"no hay nada sobre lo que actuar" — y se emite `mgmt_no_active_trade` como
-hoy. El caso es real: un `SELL TRADE INVALID` cuando solo hay un BUY activo
-significa que el mensaje no aplica a nada abierto.
+Dentro de `close_now`, se retorna `{"status": "no_active_trade"}` — el shape
+que ya existe para "no hay nada sobre lo que actuar" — sin entrar al loop de
+cierre. El caso es real: un `SELL TRADE INVALID` cuando solo hay un BUY
+activo significa que el mensaje no aplica a nada abierto.
+
+Como el filtro vive dentro de la rama, el guard de `trade_manager.py:1306`
+sigue cubriendo su caso original (cero grupos para el chat) y ninguna otra
+acción puede recibir una lista vaciada por el filtro.
 
 ## 7. Comportamiento sobre el incidente del 2026-09-17
 
@@ -277,9 +350,18 @@ Con este diseño, la misma secuencia de mensajes produce:
 | 05:37:58 | *(no ocurre nada: no hay callback)* | Grupo 150 sigue abierto |
 
 Las dos protecciones son independientes y cada una habría bastado por sí
-sola: el atajo cierra el 149 antes de que el 150 exista, y el
-`direction_hint="SELL"` habría excluido al 150 (BUY) aunque el cierre
+sola para este incidente: el atajo cierra el 149 antes de que el 150 exista,
+y el `direction_hint="SELL"` habría excluido al 150 (BUY) aunque el cierre
 hubiera llegado tarde.
+
+No son redundantes, porque cubren fallos distintos. El atajo protege contra
+la latencia pero solo actúa sobre el patrón que su regex reconoce: un
+mensaje de cierre con otra redacción sigue yendo por n8n, con su ventana de
+carrera intacta. El `direction_hint` protege contra el alcance equivocado
+pero solo cuando el texto nombra una dirección y llega por una ruta que lo
+propague — hoy, únicamente el atajo. Un `close_now` clasificado por n8n
+sobre un mensaje sin dirección explícita sigue cerrando todos los grupos
+activos del chat, como hoy.
 
 ## 8. Testing
 
@@ -290,16 +372,21 @@ hubiera llegado tarde.
   `TRADE INVALID` (orden invertido).
 - `direction_hint` se extrae como `SELL` del mensaje real, como `BUY` de su
   variante, y como `None` cuando el texto no nombra dirección.
+- Una dirección en minúsculas en el texto se envía normalizada a mayúsculas.
 - Un texto que ya parsea como señal de apertura no se evalúa como cierre.
 - El atajo hace POST con el payload y el header esperados.
 - El atajo **no** llama a `forward_to_n8n` cuando la acción se ejecuta bien.
 - Reintentos: falla 5xx dos veces y acierta a la tercera → una sola acción
   ejecutada, sin notificación de fallo.
-- Tres fallos → notificación a `N8N_EVENT_WEBHOOK_URL`, y `forward_to_n8n`
-  nunca se llama.
-- Un 4xx no se reintenta; notifica de inmediato.
+- Tres fallos → se encola un envelope `mgmt_direct_close_failed` en
+  `n8n_event_retry_queue`, y `forward_to_n8n` nunca se llama.
+- Un 4xx no se reintenta; encola la notificación de inmediato.
 - Sin `TRADE_ORCHESTRATOR_MGMT_URL` configurada → se reenvía a n8n y se
   registra el error.
+
+**`services/common/test_env_validator.py`** (o el archivo que cubra el
+validador):
+- `validate_router_parser()` falla si falta `N8N_ACTION_API_KEY`.
 
 **`services/trade_orchestrator/test_mgmt_action_endpoint.py`:**
 - `direction_hint` ausente → comportamiento actual, sin cambios.
@@ -314,7 +401,13 @@ hubiera llegado tarde.
   sigue siendo el default).
 - El filtro emite `mgmt_direction_filtered` con los `group_ids` excluidos.
 - Filtro que deja cero grupos → `no_active_trade`, sin tocar MT5.
-- El filtro aplica también a `move_sl_be_now` (al vivir antes del switch).
+- **`signal_correction` con `direction_hint` presente sigue aplicando a
+  `group_ids[-1]` sin filtrar** — dos grupos de direcciones opuestas, una
+  corrección con `direction_hint="SELL"` aplica al más reciente aunque sea
+  BUY. Protege contra que un refactor futuro mueva el filtro antes del
+  switch y cambie esta semántica en silencio.
+- `move_sl_be_now` con `direction_hint` presente aplica BE a todos los
+  grupos del chat, sin filtrar (comportamiento declarado en §6).
 
 ## 9. Retrocompatibilidad
 
@@ -324,6 +417,11 @@ hubiera llegado tarde.
   que matchean el patrón; los demás siguen igual.
 - Ningún cambio en `ManagedTrade`, en la persistencia, ni en
   `find_active_groups_for_chat`.
+- **`router_parser` no arrancará sin `N8N_ACTION_API_KEY`** tras el cambio a
+  `validate_router_parser()`. La variable ya existe en `.env` (la exige
+  `validate_trade_orchestrator()` desde antes) y ambos servicios cargan el
+  mismo `env_file`, así que en el despliegue actual no hace falta agregarla
+  — pero un entorno que corra `router_parser` aislado sí deberá definirla.
 
 ### Consecuencia consciente
 
