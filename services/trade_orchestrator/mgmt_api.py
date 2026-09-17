@@ -38,6 +38,12 @@ class MgmtActionRequest(BaseModel):
     # apply_mgmt_action. None sigue siendo valido: significa "sin especificar,
     # usar el default de 50%".
     percent: Optional[float] = Field(default=None, gt=0, lt=100)
+    # Extraido por el regex de router_parser (patron "TRADE INVALID/Close
+    # now") o, en el futuro, por el flujo n8n/Ollama. Filtra que grupos
+    # toca close_now cuando el texto nombra una direccion (ver
+    # docs/superpowers/specs/2026-09-17-direct-close-now-shortcut-design.md
+    # seccion 6 para por que el filtro vive solo en close_now).
+    direction_hint: Optional[str] = Field(default=None, pattern="^(BUY|SELL)$")
 
 def create_mgmt_app(trade_manager) -> FastAPI:
     app = FastAPI(title="trade_orchestrator-mgmt")
@@ -61,6 +67,7 @@ def create_mgmt_app(trade_manager) -> FastAPI:
         try:
             result = await trade_manager.apply_mgmt_action(
                 action=req.action, chat_id=req.chat_id, raw_text=req.raw_text, correction=correction, percent=req.percent,
+                direction_hint=req.direction_hint,
             )
         except Exception as e:
             log.exception("[MGMT_API] apply_mgmt_action fallo inesperadamente: action=%s chat_id=%s", req.action, req.chat_id)

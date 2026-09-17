@@ -583,6 +583,24 @@ class TradeManager:
         )
         return group_ids
 
+    def _filter_groups_by_direction(self, group_ids: list[int], direction_hint: str) -> tuple[list[int], list[int]]:
+        """
+        Separa group_ids en (kept, excluded) segun si la direccion de sus
+        legs coincide con direction_hint. Las dos piernas de un grupo
+        comparten direccion, asi que basta inspeccionar cualquiera. Usado
+        exclusivamente por la rama close_now de apply_mgmt_action -- ver
+        docs/superpowers/specs/2026-09-17-direct-close-now-shortcut-design.md
+        seccion 6 para por que no se aplica a otras acciones.
+        """
+        kept, excluded = [], []
+        for group_id in group_ids:
+            leg = next((t for t in self.trades.values() if t.group_id == group_id), None)
+            if leg is not None and leg.direction == direction_hint:
+                kept.append(group_id)
+            else:
+                excluded.append(group_id)
+        return kept, excluded
+
     def group_age_seconds(self, group_id: int) -> Optional[float]:
         """
         Segundos desde que se abrio `group_id` (min opened_ts entre sus piernas),
@@ -1295,7 +1313,7 @@ class TradeManager:
             log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")
             await self._persist_group(runner.group_id)
 
-    async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict], percent: Optional[float] = None) -> dict:
+    async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict], percent: Optional[float] = None, direction_hint: Optional[str] = None) -> dict:
         """
         Ejecuta una decision de /mgmt/action (chat_id-scoping spec seccion 5).
         Resuelve TODOS los grupos activos del `chat_id` que mando el mensaje
@@ -1314,6 +1332,23 @@ class TradeManager:
             return {"status": "no_active_trade"}
 
         if action == "close_now":
+            if direction_hint:
+                group_ids, excluded = self._filter_groups_by_direction(group_ids, direction_hint)
+                if excluded:
+                    await self._notify(
+                        "mgmt_direction_filtered",
+                        chat_id=chat_id, direction_hint=direction_hint, excluded_group_ids=excluded, action=action,
+                        message=(f"Acción '{action}' limitada a grupos {direction_hint}. "
+                                 f"Grupos excluidos por dirección opuesta: {excluded}."),
+                    )
+                if not group_ids:
+                    log.info("[TM][MGMT] direction_hint=%s dejo cero grupos para chat_id=%s", direction_hint, chat_id)
+                    await self._notify(
+                        "mgmt_no_active_trade",
+                        message=f"Acción '{action}' recibida pero no hay trades activos de dirección {direction_hint} para este chat. Texto: {raw_text!r}",
+                        chat_id=chat_id, action=action,
+                    )
+                    return {"status": "no_active_trade"}
             results = []
             for group_id in group_ids:
                 try:

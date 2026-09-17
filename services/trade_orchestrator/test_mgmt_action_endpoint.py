@@ -122,3 +122,110 @@ def test_mgmt_action_still_accepts_an_omitted_percent(tm_and_client):
         "raw_text": "cierra parte", "correction": None,
     })
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("bad_direction", ["sell", "buy", "LONG", "BOTH", ""])
+def test_mgmt_action_rejects_invalid_direction_hint(tm_and_client, bad_direction):
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID,
+        "raw_text": "close now", "correction": None,
+        "direction_hint": bad_direction,
+    })
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("good_direction", ["BUY", "SELL"])
+def test_mgmt_action_accepts_valid_direction_hint(tm_and_client, good_direction):
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID,
+        "raw_text": "close now", "correction": None,
+        "direction_hint": good_direction,
+    })
+    assert resp.status_code == 200
+
+
+def test_mgmt_action_still_accepts_omitted_direction_hint(tm_and_client):
+    tm, client = tm_and_client
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID,
+        "raw_text": "close now", "correction": None,
+    })
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_direction_hint_filters_out_opposite_direction_group(tm_and_client):
+    """
+    Reproduces the 2026-09-17 incident: group 149 (SELL) and group 150 (BUY)
+    both active in the same chat_id. A close_now with direction_hint=SELL
+    (extracted from "XAUUSD SELL TRADE INVALID") must close only the SELL
+    group and leave the BUY group untouched.
+    """
+    tm, client = tm_and_client
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0, chat_id=CHAT_ID)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID, "raw_text": "XAUUSD SELL TRADE INVALID / Close now",
+        "correction": None, "direction_hint": "SELL",
+    })
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+    remaining_directions = {t.direction for t in tm.trades.values()}
+    assert remaining_directions == {"BUY"}
+
+
+@pytest.mark.asyncio
+async def test_close_now_without_direction_hint_closes_all_groups_of_the_chat(tm_and_client):
+    """Baseline: omitting direction_hint keeps today's behavior (close everything)."""
+    tm, client = tm_and_client
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0, chat_id=CHAT_ID)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID, "raw_text": "close now", "correction": None,
+    })
+
+    assert resp.status_code == 200
+    assert len(tm.trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_direction_hint_filter_to_zero_groups_returns_no_active_trade(tm_and_client):
+    """A SELL hint when only a BUY group is open means the message applies to nothing."""
+    tm, client = tm_and_client
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "close_now", "chat_id": CHAT_ID, "raw_text": "SELL TRADE INVALID / Close now",
+        "correction": None, "direction_hint": "SELL",
+    })
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "no_active_trade"
+    assert len(tm.trades) == 2  # the BUY group's two legs (tp1 + runner) are untouched, not closed
+
+
+@pytest.mark.asyncio
+async def test_signal_correction_ignores_direction_hint_and_still_targets_most_recent_group(tm_and_client):
+    """
+    signal_correction must keep using group_ids[-1] regardless of
+    direction_hint -- the filter lives only inside close_now (spec section
+    6). Two groups of opposite directions; the correction targets the most
+    recently opened one (BUY) even though direction_hint says SELL.
+    """
+    tm, client = tm_and_client
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="SELL", sl=2510.0, tp1=2490.0, tp2=2470.0, chat_id=CHAT_ID)
+    await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    most_recent_group_id = max(t.group_id for t in tm.trades.values())
+
+    resp = client.post("/mgmt/action", headers=HEADERS, json={
+        "action": "signal_correction", "chat_id": CHAT_ID, "raw_text": "tp1 es 2520",
+        "correction": {"field": "tp1", "value": 2520.0}, "direction_hint": "SELL",
+    })
+
+    assert resp.status_code == 200
+    assert resp.json()["group_id"] == most_recent_group_id
