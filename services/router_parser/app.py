@@ -1,9 +1,12 @@
 import os, re, json, logging, uuid
+import asyncio
 import datetime
+from datetime import timezone
 import httpx
 from services.common.config import Settings
 from services.common.redis_streams import redis_client, xadd, Streams, create_consumer_group, xreadgroup_loop, xack
 from services.common.signal_dedup import SignalDeduplicator
+from services.trade_orchestrator.n8n_retry_worker import enqueue as enqueue_n8n_event
 from parsers_base import SignalParser, ParseResult
 from parsers_tradepulse import TradePulseParser
 
@@ -43,6 +46,73 @@ async def forward_to_n8n(text: str, chat_id: str, webhook_url: str) -> None:
             log.warning("[N8N_FORWARD] webhook respondio status=%s chat_id=%s", resp.status_code, chat_id)
     except Exception as e:
         log.warning("[N8N_FORWARD] error reenviando a n8n: %s", e)
+
+
+CLOSE_NOW_RETRY_BACKOFF_SECONDS = [1, 2, 4]
+
+
+async def execute_close_now_directly(
+    chat_id: str, text: str, direction_hint, mgmt_url: str, action_api_key: str, redis_client,
+) -> bool:
+    """
+    Ejecuta close_now directo contra /mgmt/action de trade_orchestrator,
+    sin pasar por n8n/Ollama -- el patron "TRADE INVALID/Close now" es
+    literal y no requiere clasificacion. Reintenta ante error de red,
+    timeout o 5xx; NO reintenta ante 4xx (error de configuracion). Si se
+    agotan los reintentos o llega un 4xx, encola una notificacion en la
+    misma cola de reintentos que usa EventBus, para que el worker que ya
+    corre en trade_orchestrator la entregue -- nunca cae a n8n (ver
+    docs/superpowers/specs/2026-09-17-direct-close-now-shortcut-design.md
+    seccion 5).
+    """
+    payload = {"action": "close_now", "chat_id": chat_id, "raw_text": text}
+    if direction_hint:
+        payload["direction_hint"] = direction_hint
+    headers = {"X-N8N-Action-Key": action_api_key}
+
+    # 3 intentos totales, con backoff SOLO entre intentos (no antes del
+    # primero): intento 1 inmediato, intento 2 tras 1s, intento 3 tras 2s.
+    # CLOSE_NOW_RETRY_BACKOFF_SECONDS[attempt - 1] indexa el gap que
+    # PRECEDE al intento actual -- por eso el loop nunca consume el 4s
+    # final de la constante con solo 3 intentos; ese tercer valor queda
+    # disponible si el numero de intentos crece en el futuro.
+    last_error = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(CLOSE_NOW_RETRY_BACKOFF_SECONDS[attempt - 1])
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(mgmt_url, json=payload, headers=headers, timeout=10.0)
+            if 200 <= resp.status_code < 300:
+                return True
+            last_error = f"HTTP {resp.status_code}"
+            if 400 <= resp.status_code < 500:
+                break  # config error, retrying won't help
+        except Exception as e:
+            last_error = str(e)
+
+    await _enqueue_close_now_failure(redis_client, chat_id=chat_id, raw_text=text, direction_hint=direction_hint, error=last_error)
+    return False
+
+
+async def _enqueue_close_now_failure(redis_client, *, chat_id: str, raw_text: str, direction_hint, error: str) -> None:
+    envelope = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "mgmt_direct_close_failed",
+        "channel": "both",
+        "timestamp": datetime.datetime.now(timezone.utc).isoformat(),
+        "message": (
+            f"\U0001F6A8 CIERRE AUTOMÁTICO FALLIDO — Canal: {chat_id}\n"
+            f"Motivo: \"{raw_text}\"\n"
+            f"No se pudo ejecutar el cierre tras 3 intentos: {error}\n"
+            f"REVISAR LA CUENTA MANUALMENTE — las posiciones pueden seguir abiertas."
+        ),
+        "payload": {"chat_id": chat_id, "raw_text": raw_text, "direction_hint": direction_hint, "error": error},
+    }
+    try:
+        await enqueue_n8n_event(redis_client, envelope)
+    except Exception as e:
+        log.error("[CLOSE_NOW_DIRECT] no se pudo encolar la notificacion de fallo: %s", e)
 
 
 class SignalRouter:

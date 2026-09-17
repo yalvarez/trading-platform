@@ -6,10 +6,13 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(__file__))  # so `import app` / sibling imports work like the existing app.py does
 
+import asyncio
+import json
+
 import pytest
 import httpx
 
-from services.router_parser.app import SignalRouter, forward_to_n8n, DUPLICATE_SIGNAL
+from services.router_parser.app import SignalRouter, forward_to_n8n, DUPLICATE_SIGNAL, execute_close_now_directly
 
 
 class FakeRedis:
@@ -114,3 +117,120 @@ async def test_process_raw_signal_still_returns_none_for_truly_unrecognized_text
     r = SignalRouter(FakeRedis(), dedup_ttl=120.0)
     result = await r.process_raw_signal("-1003321565807", "Spam your feedbacks @trader_ahmed_2")
     assert result is None
+
+
+class FakeRedisWithQueue(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.queue = []
+
+    async def rpush(self, key, value):
+        self.queue.append((key, value))
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_posts_expected_payload(monkeypatch):
+    captured = {}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        class R:
+            status_code = 200
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    ok = await execute_close_now_directly(
+        chat_id="-1003321565807", text="XAUUSD SELL TRADE INVALID / Close now",
+        direction_hint="SELL", mgmt_url="http://trade_orchestrator:8200/mgmt/action",
+        action_api_key="test-key", redis_client=FakeRedisWithQueue(),
+    )
+
+    assert ok is True
+    assert captured["url"] == "http://trade_orchestrator:8200/mgmt/action"
+    assert captured["json"]["action"] == "close_now"
+    assert captured["json"]["chat_id"] == "-1003321565807"
+    assert captured["json"]["direction_hint"] == "SELL"
+    assert captured["headers"]["X-N8N-Action-Key"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_retries_then_succeeds(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        calls["count"] += 1
+        class R:
+            status_code = 200 if calls["count"] == 3 else 500
+        return R()
+
+    async def fake_sleep(seconds):
+        pass  # don't actually wait in tests
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    ok = await execute_close_now_directly(
+        chat_id="-1", text="TRADE INVALID / Close now", direction_hint=None,
+        mgmt_url="http://x/mgmt/action", action_api_key="k", redis_client=FakeRedisWithQueue(),
+    )
+
+    assert ok is True
+    assert calls["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_does_not_retry_on_4xx(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        calls["count"] += 1
+        class R:
+            status_code = 401
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    redis = FakeRedisWithQueue()
+    ok = await execute_close_now_directly(
+        chat_id="-1", text="TRADE INVALID / Close now", direction_hint=None,
+        mgmt_url="http://x/mgmt/action", action_api_key="wrong-key", redis_client=redis,
+    )
+
+    assert ok is False
+    assert calls["count"] == 1
+    assert len(redis.queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_close_now_directly_enqueues_notification_after_exhausting_retries(monkeypatch):
+    async def fake_post(self, url, json=None, headers=None, timeout=None):
+        class R:
+            status_code = 500
+        return R()
+
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    redis = FakeRedisWithQueue()
+    ok = await execute_close_now_directly(
+        chat_id="-1003321565807", text="TRADE INVALID / Close now", direction_hint="SELL",
+        mgmt_url="http://x/mgmt/action", action_api_key="k", redis_client=redis,
+    )
+
+    assert ok is False
+    assert len(redis.queue) == 1
+    key, raw = redis.queue[0]
+    assert key == "n8n_event_retry_queue"
+    item = json.loads(raw)
+    envelope = item["envelope"]
+    assert envelope["event_type"] == "mgmt_direct_close_failed"
+    assert envelope["channel"] == "both"
+    assert "-1003321565807" in envelope["message"]
+    assert "REVISAR LA CUENTA MANUALMENTE" in envelope["message"]
+    assert envelope["payload"]["chat_id"] == "-1003321565807"
