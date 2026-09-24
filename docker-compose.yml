@@ -22,7 +22,13 @@ services:
       - PASSWORD=${MT5_WEB_PASS}
     ports:
       - "3001:3000"
-      - "9081:8001"
+      # Solo loopback: 8001 es el servidor RPyC de mt5linux en modo classic
+      # (ejecucion de codigo arbitrario en la terminal = control total de la
+      # cuenta). Estuvo publicado en 0.0.0.0 con decenas de conexiones
+      # externas (incidente 2026-09-24). Los servicios lo usan por la red
+      # interna (mt5_acct1:8001); para acceso manual, tunel SSH:
+      #   ssh -L 9081:127.0.0.1:9081 root@illuminatis-vps
+      - "127.0.0.1:9081:8001"
     volumes:
       - mt5_acct1_config:/config
     healthcheck:
