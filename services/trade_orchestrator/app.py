@@ -78,9 +78,12 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
         log.error("[SIGNAL] No hay cuenta activa configurada. Abortando.")
         return
 
-    existing_group_id = tradeManager.find_active_group_for_symbol(symbol)
-
     if is_fast:
+        # Solo grupos del mismo canal: el grupo reciente de OTRO canal no hace
+        # que esta señal sea un duplicado. La direccion no se filtra aqui a
+        # proposito -- el cooldown anti-duplicado conserva su semantica previa
+        # dentro de cada canal.
+        existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id)
         if existing_group_id is not None:
             # find_active_group_for_symbol no tiene nocion de tiempo: sin este
             # cooldown, CUALQUIER señal fast nueva del mismo simbolo se ignoraria
@@ -142,6 +145,10 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     tp1 = float(tps[0]) if len(tps) > 0 else None
     tp2 = float(tps[1]) if len(tps) > 1 else None
 
+    # Mismo canal Y misma direccion: una señal completa solo completa/actualiza
+    # un grupo propio en su direccion -- nunca el grupo de otro canal, ni
+    # escribe niveles SELL en un grupo BUY (o viceversa).
+    existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction)
     if existing_group_id is not None:
         await tradeManager.update_group_signal(existing_group_id, sl=sl, tp1=tp1, tp2=tp2)
         return

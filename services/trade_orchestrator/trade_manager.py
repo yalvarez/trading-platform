@@ -542,12 +542,22 @@ class TradeManager:
         )
         await self._persist_group(group_id)
 
-    def find_active_group_for_symbol(self, symbol: str) -> Optional[int]:
+    def find_active_group_for_symbol(self, symbol: str, *, chat_id: Optional[str], direction: Optional[str] = None) -> Optional[int]:
         """
         Devuelve el group_id mas reciente con al menos una pierna abierta para
-        `symbol`, o None (dual-TP spec seccion 5.2 — respuesta 'no_active_trade').
+        `symbol` originado en `chat_id` (y, si viene, en `direction`), o None
+        (dual-TP spec seccion 5.2 — respuesta 'no_active_trade').
+        chat_id se compara exacto, incluido None == None (señales legacy sin
+        chat_id siguen encontrando sus propios grupos). Antes solo filtraba
+        por simbolo: con dos canales XAUUSD permitidos, una señal completa de
+        un canal sobrescribia SL/TP del grupo abierto del otro canal, y una
+        señal SELL podia escribir sus niveles en un grupo BUY.
         """
-        candidates = [t for t in self.trades.values() if t.symbol == symbol]
+        candidates = [
+            t for t in self.trades.values()
+            if t.symbol == symbol and t.chat_id == chat_id
+            and (direction is None or t.direction == direction.upper())
+        ]
         if not candidates:
             return None
         # Tie-break on group_id (an incrementing counter) since time.time() has

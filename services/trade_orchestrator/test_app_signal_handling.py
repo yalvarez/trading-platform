@@ -316,3 +316,89 @@ async def test_signal_without_chat_id_field_leaves_chat_id_none():
     assert len(tm.trades) == 2
     for t in tm.trades.values():
         assert t.chat_id is None
+
+
+# --- Cross-channel group lookup (2026-09-24): handle_signal_fields used to look up
+# the "existing group" by symbol alone, so a full signal from one channel could
+# overwrite the SL/TP of another channel's open XAUUSD group (TradePulse and the
+# test group are both allowed on the VPS today, both trading XAUUSD). ---
+
+CHAT_A = "-1003321565807"
+CHAT_B = "-5250557024"
+
+
+@pytest.mark.asyncio
+async def test_full_signal_from_other_channel_does_not_update_existing_group():
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    await handle_signal_fields({
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "", "chat_id": CHAT_A,
+    }, tm, ACCOUNTS)
+    group_a = next(iter(tm.trades.values())).group_id
+
+    await handle_signal_fields({
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2485.0", "tps": json.dumps([2505.0, 2520.0]), "entry_range": "", "chat_id": CHAT_B,
+    }, tm, ACCOUNTS)
+
+    legs_a = [t for t in tm.trades.values() if t.group_id == group_a]
+    assert len(legs_a) == 2
+    for t in legs_a:
+        assert t.planned_sl == 2490.0  # channel A's levels untouched
+        assert t.tp1_price == 2510.0
+        assert t.tp2_price == 2530.0
+    legs_b = [t for t in tm.trades.values() if t.chat_id == CHAT_B]
+    assert len(legs_b) == 2  # channel B opened its own group
+    assert {t.group_id for t in legs_b} != {group_a}
+
+
+@pytest.mark.asyncio
+async def test_fast_signal_not_blocked_by_other_channels_recent_group():
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    fast = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields({**fast, "chat_id": CHAT_A}, tm, ACCOUNTS)
+    assert len(tm.trades) == 2
+
+    # Channel B's fast signal arrives well within REOPEN_COOLDOWN_SECONDS of
+    # channel A's group -- it is NOT a duplicate of A's signal.
+    await handle_signal_fields({**fast, "chat_id": CHAT_B}, tm, ACCOUNTS)
+    assert len(tm.trades) == 4
+    assert sum(1 for t in tm.trades.values() if t.chat_id == CHAT_B) == 2
+
+
+@pytest.mark.asyncio
+async def test_full_signal_opposite_direction_same_channel_does_not_update_existing_group():
+    """A SELL full signal must never write its levels into an open BUY group
+    (SL/TP would land on the wrong side of the position)."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=DummyNotifier())
+
+    await handle_signal_fields({
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "", "chat_id": CHAT_A,
+    }, tm, ACCOUNTS)
+    buy_group = next(iter(tm.trades.values())).group_id
+
+    await handle_signal_fields({
+        "symbol": "XAUUSD", "direction": "SELL", "fast": "false",
+        "sl": "2510.0", "tps": json.dumps([2490.0, 2470.0]), "entry_range": "", "chat_id": CHAT_A,
+    }, tm, ACCOUNTS)
+
+    for t in (t for t in tm.trades.values() if t.group_id == buy_group):
+        assert t.direction == "BUY"
+        assert t.planned_sl == 2490.0
+        assert t.tp1_price == 2510.0
+    assert sum(1 for t in tm.trades.values() if t.direction == "SELL") == 2

@@ -992,10 +992,10 @@ async def test_find_active_group_for_symbol_returns_most_recent():
     tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
     g1 = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
-    found = tm.find_active_group_for_symbol("XAUUSD")
+    found = tm.find_active_group_for_symbol("XAUUSD", chat_id=None)
     assert found == g1
 
-    found_none = tm.find_active_group_for_symbol("EURUSD")
+    found_none = tm.find_active_group_for_symbol("EURUSD", chat_id=None)
     assert found_none is None
 
 
@@ -1528,7 +1528,7 @@ async def test_find_active_group_for_symbol_tie_breaks_on_group_id_when_opened_t
     for t in tm.trades.values():
         t.opened_ts = same_ts
 
-    found = tm.find_active_group_for_symbol("XAUUSD")
+    found = tm.find_active_group_for_symbol("XAUUSD", chat_id=None)
     assert found == g2  # the higher group_id (the actually-newer group) wins
 
 
