@@ -1,5 +1,6 @@
 from .trade_utils import safe_comment, parse_group_comment
 from .channel_names import resolve_channel_name
+from .mt5_pool import MT5ConnectionStuckError
 from .event_messages import (
     build_sl_hit_message,
     build_external_close_message,
@@ -196,6 +197,11 @@ class TradeManager:
                             raw_timeout, TradeManager.DEFAULT_MT5_CALL_TIMEOUT_SECONDS)
         try:
             return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout)
+        except MT5ConnectionStuckError as e:
+            # Subclase de asyncio.TimeoutError: se re-lanza igual para que todo el
+            # manejo de timeouts existente aplique, solo cambia el log.
+            log.error("[TM] MT5 call %s no ejecutada: %s", getattr(fn, "__name__", fn), e)
+            raise
         except asyncio.TimeoutError:
             log.error("[TM] MT5 call %s colgada tras %.0fs (timeout) — abortando esta operacion, el hilo puede seguir vivo en 2do plano",
                        getattr(fn, "__name__", fn), timeout)

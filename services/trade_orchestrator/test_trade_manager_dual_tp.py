@@ -1735,6 +1735,31 @@ async def test_open_group_notifies_and_returns_none_when_order_send_times_out(mo
 
 
 @pytest.mark.asyncio
+async def test_open_group_notifies_when_connection_is_stuck():
+    """PooledMT5Client raises MT5ConnectionStuckError (fail-fast when the account's
+    connection is stuck behind a hung call). It must flow through open_group's
+    existing timeout handling -- notify open_failed, never drop the signal silently."""
+    from services.trade_orchestrator.mt5_pool import MT5ConnectionStuckError
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    def stuck_order_send(req):
+        raise MT5ConnectionStuckError("MT5 mt5_acct1:8001 atascado (order_send)")
+
+    sim.order_send = stuck_order_send
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    assert len(tm.trades) == 0
+    events = [kwargs for event, kwargs in notifier.events if event == "open_failed"]
+    assert len(events) == 1
+    assert events[0].get("reason") == "timeout"
+
+
+@pytest.mark.asyncio
 async def test_open_group_recovers_from_transient_empty_tick_on_first_price_read():
     """
     Reproduces a real production incident: mt5linux opens a fresh RPyC
