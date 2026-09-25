@@ -8,6 +8,7 @@ from .event_messages import (
     build_tp1_hit_message,
     build_tp2_partial_closed_message,
     build_close_now_message,
+    build_opposite_signal_close_message,
     build_move_sl_be_applied_message,
     build_partial_failure_message,
     build_close_partial_now_message,
@@ -1371,6 +1372,142 @@ class TradeManager:
             log.info(f"Trailing SL actualizado para el runner del grupo {runner.group_id} (ticket={runner.ticket}): nuevo sl={self._fmt_price(new_sl)}, peak_multiple={multiple:.2f}.")
             await self._persist_group(runner.group_id)
 
+    async def _close_group_now(self, group_id: int, *, chat_id: str, raw_text: str, action: str,
+                               event_name: str = "mgmt_close_now",
+                               failure_event: str = "mgmt_close_now_partial_failure",
+                               message_builder=None) -> dict:
+        """
+        Cierra al 100% ambas piernas de un grupo y notifica el resultado. Compartido por
+        la rama close_now de apply_mgmt_action y por close_opposite_groups_before_tp1
+        (mismo cierre, reintentos y aislamiento por pierna; solo cambian el evento y el
+        mensaje). Nunca lanza: devuelve {"group_id", "status", ["reason"]}.
+        """
+        message_builder = message_builder or build_close_now_message
+        try:
+            legs = [t for t in self.trades.values() if t.group_id == group_id]
+            account = self._ensure_account_dict(legs[0].account_name)
+            if not account:
+                log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
+                await self._notify(
+                    "mgmt_account_unresolved",
+                    message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
+                    chat_id=chat_id, group_id=group_id, action=action,
+                )
+                return {"group_id": group_id, "status": "failed", "reason": "account_unresolved"}
+            client = self.mt5._client_for(account)
+            channel_name = resolve_channel_name(chat_id, self._channel_names())
+            leg_summaries = []
+            leg_results = []
+            any_leg_failed = False
+            for t in list(legs):
+                # Cada pierna se aisla en su propio try/except: un
+                # timeout en tp1 no debe impedir que se intente
+                # cerrar el runner tambien (ver docstring de
+                # _force_full_close para el incidente real que esto
+                # arregla).
+                # Mientras se cierra, el tick de run_forever no debe verla
+                # desaparecer de MT5 y reportarla tambien como
+                # external_close_detected (P&L duplicado en el audit log,
+                # grupos reales 146/149/150/160). Si el cierre falla, el
+                # finally la devuelve al tick normal.
+                self._mgmt_closing.add(t.ticket)
+                try:
+                    try:
+                        ok = await self._force_full_close(account, client, t.ticket)
+                    except MT5CallTimeoutError:
+                        any_leg_failed = True
+                        log.error("[TM][MGMT] close_now: timeout cerrando ticket=%s leg=%s group_id=%s",
+                                  t.ticket, t.leg, group_id)
+                        leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
+                        continue
+                    if not ok:
+                        any_leg_failed = True
+                        log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
+                                  t.ticket, t.leg, group_id)
+                        leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
+                        continue
+                    deal_info = await self._get_close_deal_info(client, t.ticket)
+                    close_price = deal_info["price"] if deal_info else None
+                    pnl_money = deal_info["profit"] if deal_info else None
+                    close_volume = deal_info["volume"] if deal_info else None
+                    leg_summaries.append(
+                        f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
+                        f"cierre {self._fmt_price(close_price)})"
+                    )
+                    leg_results.append({
+                        "leg": t.leg, "close_price": close_price,
+                        "close_volume": close_volume, "pnl_money": pnl_money,
+                    })
+                    self.trades.pop(t.ticket, None)
+                finally:
+                    self._mgmt_closing.discard(t.ticket)
+            if any_leg_failed:
+                message = build_partial_failure_message(
+                    channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries,
+                )
+                await self._notify(
+                    failure_event, channel="both", group_id=group_id, chat_id=chat_id,
+                    channel_name=channel_name, raw_text=raw_text, message=message,
+                )
+                return {"group_id": group_id, "status": "failed", "reason": "partial_close_rejected"}
+            total_pnl_money = sum(lr["pnl_money"] for lr in leg_results if lr["pnl_money"] is not None)
+            message = message_builder(
+                channel_name=channel_name, group_id=group_id, raw_text=raw_text,
+                leg_results=leg_results, total_pnl_money=total_pnl_money,
+            )
+            await self._notify(
+                event_name, channel="both", group_id=group_id, chat_id=chat_id,
+                channel_name=channel_name, raw_text=raw_text,
+                # Fix 5: sin estos kwargs, leg_results/total_pnl_money solo
+                # sobrevivian como prosa dentro de `message` y nunca llegaban
+                # al payload de auditoria ni a la Data Table de n8n.
+                # mgmt_close_partial_now ya lo hacia bien; este no.
+                leg_results=leg_results, total_pnl_money=total_pnl_money,
+                message=message,
+            )
+            await self._close_group_in_store(group_id)
+            return {"group_id": group_id, "status": "closed"}
+        except Exception as e:
+            log.error("[TM][MGMT] excepcion cerrando group_id=%s chat_id=%s: %s", group_id, chat_id, e)
+            return {"group_id": group_id, "status": "failed", "reason": "exception"}
+
+    async def close_opposite_groups_before_tp1(self, *, chat_id: Optional[str], symbol: str, direction: str) -> list[dict]:
+        """
+        Llega una señal `direction` de `chat_id`: cierra los grupos de ESE canal y
+        simbolo en la direccion contraria que aun no llegaron a TP1 (ninguna pierna
+        con be_applied). Los que ya estan protegidos en BE se dejan correr.
+
+        Caso real 2026-09-25: TradePulse mando SELL (grupo 167) y, sin ninguna orden
+        de cierre, BUY 2h40m despues; la SELL siguio abierta hasta su SL (-$88.20)
+        mientras la BUY tocaba TP1. Backtest de 3 meses: 16 casos asi; cerrar el
+        grupo contrario si aun no tocaba TP1 dio +$248 frente a dejarlo abierto
+        (cerrar tambien los que ya estaban en BE daba menos, +$220).
+        """
+        if chat_id is None:
+            return []
+        opposite = "SELL" if direction.upper() == "BUY" else "BUY"
+        targets = []
+        for group_id in self.find_active_groups_for_chat(chat_id):
+            legs = [t for t in self.trades.values() if t.group_id == group_id]
+            if not legs or legs[0].symbol != symbol or legs[0].direction != opposite:
+                continue
+            if any(t.be_applied for t in legs):
+                log.info("[TM][OPPOSITE] grupo %s %s ya protegido en BE, se deja correr pese a señal %s",
+                         group_id, opposite, direction.upper())
+                continue
+            targets.append(group_id)
+        results = []
+        for group_id in targets:
+            log.info("[TM][OPPOSITE] cerrando grupo %s %s por señal %s contraria (chat_id=%s)",
+                     group_id, opposite, direction.upper(), chat_id)
+            results.append(await self._close_group_now(
+                group_id, chat_id=chat_id, action="opposite_signal_close",
+                raw_text=f"Señal {direction.upper()} {symbol} recibida con este grupo {opposite} abierto y sin llegar a TP1",
+                event_name="opposite_signal_close", failure_event="opposite_signal_close_failure",
+                message_builder=build_opposite_signal_close_message,
+            ))
+        return results
+
     async def apply_mgmt_action(self, *, action: str, chat_id: str, raw_text: str, correction: Optional[dict], percent: Optional[float] = None, direction_hint: Optional[str] = None) -> dict:
         """
         Ejecuta una decision de /mgmt/action (chat_id-scoping spec seccion 5).
@@ -1409,95 +1546,7 @@ class TradeManager:
                     return {"status": "no_active_trade"}
             results = []
             for group_id in group_ids:
-                try:
-                    legs = [t for t in self.trades.values() if t.group_id == group_id]
-                    account = self._ensure_account_dict(legs[0].account_name)
-                    if not account:
-                        log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
-                        await self._notify(
-                            "mgmt_account_unresolved",
-                            message=f"No se pudo resolver la cuenta del grupo {group_id} al aplicar '{action}'.",
-                            chat_id=chat_id, group_id=group_id, action=action,
-                        )
-                        results.append({"group_id": group_id, "status": "failed", "reason": "account_unresolved"})
-                        continue
-                    client = self.mt5._client_for(account)
-                    channel_name = resolve_channel_name(chat_id, self._channel_names())
-                    leg_summaries = []
-                    leg_results = []
-                    any_leg_failed = False
-                    for t in list(legs):
-                        # Cada pierna se aisla en su propio try/except: un
-                        # timeout en tp1 no debe impedir que se intente
-                        # cerrar el runner tambien (ver docstring de
-                        # _force_full_close para el incidente real que esto
-                        # arregla).
-                        # Mientras se cierra, el tick de run_forever no debe verla
-                        # desaparecer de MT5 y reportarla tambien como
-                        # external_close_detected (P&L duplicado en el audit log,
-                        # grupos reales 146/149/150/160). Si el cierre falla, el
-                        # finally la devuelve al tick normal.
-                        self._mgmt_closing.add(t.ticket)
-                        try:
-                            try:
-                                ok = await self._force_full_close(account, client, t.ticket)
-                            except MT5CallTimeoutError:
-                                any_leg_failed = True
-                                log.error("[TM][MGMT] close_now: timeout cerrando ticket=%s leg=%s group_id=%s",
-                                          t.ticket, t.leg, group_id)
-                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
-                                continue
-                            if not ok:
-                                any_leg_failed = True
-                                log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
-                                          t.ticket, t.leg, group_id)
-                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
-                                continue
-                            deal_info = await self._get_close_deal_info(client, t.ticket)
-                            close_price = deal_info["price"] if deal_info else None
-                            pnl_money = deal_info["profit"] if deal_info else None
-                            close_volume = deal_info["volume"] if deal_info else None
-                            leg_summaries.append(
-                                f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
-                                f"cierre {self._fmt_price(close_price)})"
-                            )
-                            leg_results.append({
-                                "leg": t.leg, "close_price": close_price,
-                                "close_volume": close_volume, "pnl_money": pnl_money,
-                            })
-                            self.trades.pop(t.ticket, None)
-                        finally:
-                            self._mgmt_closing.discard(t.ticket)
-                    if any_leg_failed:
-                        message = build_partial_failure_message(
-                            channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries,
-                        )
-                        await self._notify(
-                            "mgmt_close_now_partial_failure", channel="both", group_id=group_id, chat_id=chat_id,
-                            channel_name=channel_name, raw_text=raw_text, message=message,
-                        )
-                        results.append({"group_id": group_id, "status": "failed", "reason": "partial_close_rejected"})
-                        continue
-                    total_pnl_money = sum(lr["pnl_money"] for lr in leg_results if lr["pnl_money"] is not None)
-                    message = build_close_now_message(
-                        channel_name=channel_name, group_id=group_id, raw_text=raw_text,
-                        leg_results=leg_results, total_pnl_money=total_pnl_money,
-                    )
-                    await self._notify(
-                        "mgmt_close_now", channel="both", group_id=group_id, chat_id=chat_id,
-                        channel_name=channel_name, raw_text=raw_text,
-                        # Fix 5: sin estos kwargs, leg_results/total_pnl_money solo
-                        # sobrevivian como prosa dentro de `message` y nunca llegaban
-                        # al payload de auditoria ni a la Data Table de n8n.
-                        # mgmt_close_partial_now ya lo hacia bien; este no.
-                        leg_results=leg_results, total_pnl_money=total_pnl_money,
-                        message=message,
-                    )
-                    await self._close_group_in_store(group_id)
-                    results.append({"group_id": group_id, "status": "closed"})
-                except Exception as e:
-                    log.error("[TM][MGMT] excepcion cerrando group_id=%s chat_id=%s: %s", group_id, chat_id, e)
-                    results.append({"group_id": group_id, "status": "failed", "reason": "exception"})
+                results.append(await self._close_group_now(group_id, chat_id=chat_id, raw_text=raw_text, action=action))
             return {"status": "completed", "results": results}
 
         if action == "close_partial_now":

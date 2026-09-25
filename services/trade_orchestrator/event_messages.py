@@ -106,6 +106,16 @@ def build_close_now_message(*, channel_name, group_id, raw_text, leg_results, to
     )
 
 
+def build_opposite_signal_close_message(*, channel_name, group_id, raw_text, leg_results, total_pnl_money) -> str:
+    legs_text = _fmt_leg_results(leg_results)
+    return (
+        f"🔁 CIERRE POR SEÑAL CONTRARIA — Canal: {channel_name} (grupo {group_id})\n"
+        f"Motivo: \"{raw_text}\"\n"
+        f"{legs_text}\n"
+        f"Total: {_fmt_money(total_pnl_money)}"
+    )
+
+
 def build_close_partial_now_message(*, channel_name, group_id, raw_text, percent_requested, leg_results) -> str:
     legs_text = _fmt_leg_results(leg_results)
     return (

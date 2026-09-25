@@ -402,3 +402,126 @@ async def test_full_signal_opposite_direction_same_channel_does_not_update_exist
         assert t.planned_sl == 2490.0
         assert t.tp1_price == 2510.0
     assert sum(1 for t in tm.trades.values() if t.direction == "SELL") == 2
+
+
+# --- Opposite-direction signal (2026-09-25). Real case: TradePulse sent SELL
+# (group 167) at 03:36 and, without any close instruction, BUY at 06:19. The SELL
+# stayed open until its SL (-$88.20) while the BUY hit TP1. 3-month backtest: 16
+# such cases; closing the opposite group when it had not reached TP1 yet was
+# +$248 vs leaving it open. ---
+
+class RecordingNotifier:
+    def __init__(self):
+        self.events = []
+
+    async def notify_trade_event(self, event, **kwargs):
+        self.events.append((event, kwargs))
+
+    async def notify(self, target, message):
+        pass
+
+
+def _fields(direction, chat_id, fast=True):
+    if fast:
+        return {"symbol": "XAUUSD", "direction": direction, "fast": "true", "sl": "", "tps": "[]", "entry_range": "", "chat_id": chat_id}
+    sl, tps = ("2490.0", [2510.0, 2530.0]) if direction == "BUY" else ("2510.0", [2490.0, 2470.0])
+    return {"symbol": "XAUUSD", "direction": direction, "fast": "false", "sl": sl, "tps": json.dumps(tps), "entry_range": "", "chat_id": chat_id}
+
+
+def _make_tm():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = RecordingNotifier()
+    return sim, notifier, TradeManager(DummyExecutor(sim, ACCOUNTS), notifier=notifier)
+
+
+@pytest.mark.asyncio
+async def test_opposite_signal_closes_same_channel_group_that_has_not_reached_tp1():
+    from services.trade_orchestrator.app import handle_signal_fields
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_A), tm, ACCOUNTS)
+    sell_group = next(iter(tm.trades.values())).group_id
+    sell_tickets = [t.ticket for t in tm.trades.values()]
+
+    await handle_signal_fields(_fields("BUY", CHAT_A), tm, ACCOUNTS)
+
+    assert all(t.group_id != sell_group for t in tm.trades.values())  # SELL group gone
+    assert all(tk not in sim.positions for tk in sell_tickets)       # really closed in MT5
+    assert sum(1 for t in tm.trades.values() if t.direction == "BUY") == 2  # BUY opened
+    closes = [kw for ev, kw in notifier.events if ev == "opposite_signal_close"]
+    assert len(closes) == 1 and closes[0]["group_id"] == sell_group
+    assert "total_pnl_money" in closes[0]
+    events = [ev for ev, _ in notifier.events]
+    assert events.index("opposite_signal_close") < len(events) - 1 - events[::-1].index("group_opened")  # closed before opening
+
+
+@pytest.mark.asyncio
+async def test_opposite_signal_keeps_group_already_protected_at_be():
+    """After TP1 the runner sits at BE and is left to run (e.g. 2026-09-23 runner +$227)."""
+    from services.trade_orchestrator.app import handle_signal_fields
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_A), tm, ACCOUNTS)
+    sell_group = next(iter(tm.trades.values())).group_id
+    for t in tm.trades.values():
+        t.be_applied = True
+
+    await handle_signal_fields(_fields("BUY", CHAT_A), tm, ACCOUNTS)
+
+    assert sum(1 for t in tm.trades.values() if t.group_id == sell_group) == 2
+    assert not [1 for ev, _ in notifier.events if ev == "opposite_signal_close"]
+
+
+@pytest.mark.asyncio
+async def test_opposite_signal_does_not_touch_other_channels():
+    from services.trade_orchestrator.app import handle_signal_fields
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_B), tm, ACCOUNTS)
+    other = next(iter(tm.trades.values())).group_id
+
+    await handle_signal_fields(_fields("BUY", CHAT_A), tm, ACCOUNTS)
+
+    assert sum(1 for t in tm.trades.values() if t.group_id == other) == 2
+
+
+@pytest.mark.asyncio
+async def test_opposite_signal_rule_can_be_disabled(monkeypatch):
+    from services.trade_orchestrator.app import handle_signal_fields
+    monkeypatch.setenv("CLOSE_ON_OPPOSITE_SIGNAL", "off")
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_A), tm, ACCOUNTS)
+    sell_group = next(iter(tm.trades.values())).group_id
+    await handle_signal_fields(_fields("BUY", CHAT_A), tm, ACCOUNTS)
+
+    assert sum(1 for t in tm.trades.values() if t.group_id == sell_group) == 2
+
+
+@pytest.mark.asyncio
+async def test_full_signal_without_fast_also_closes_opposite_group():
+    from services.trade_orchestrator.app import handle_signal_fields
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_A), tm, ACCOUNTS)
+    sell_group = next(iter(tm.trades.values())).group_id
+    await handle_signal_fields(_fields("BUY", CHAT_A, fast=False), tm, ACCOUNTS)
+
+    assert all(t.group_id != sell_group for t in tm.trades.values())
+    assert sum(1 for t in tm.trades.values() if t.direction == "BUY") == 2
+
+
+@pytest.mark.asyncio
+async def test_opposite_fast_within_cooldown_is_not_treated_as_duplicate():
+    """The duplicate guard used to ignore ANY fast for the symbol within
+    REOPEN_COOLDOWN_SECONDS, whatever its direction -- a quick flip by the channel
+    would neither close the old side nor open the new one."""
+    from services.trade_orchestrator.app import handle_signal_fields
+    sim, notifier, tm = _make_tm()
+
+    await handle_signal_fields(_fields("SELL", CHAT_A), tm, ACCOUNTS)
+    await handle_signal_fields(_fields("BUY", CHAT_A), tm, ACCOUNTS)  # seconds later
+
+    assert sum(1 for t in tm.trades.values() if t.direction == "BUY") == 2
+    assert sum(1 for t in tm.trades.values() if t.direction == "SELL") == 0

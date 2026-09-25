@@ -78,12 +78,19 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
         log.error("[SIGNAL] No hay cuenta activa configurada. Abortando.")
         return
 
+    # Señal contraria a un grupo abierto del mismo canal: cerrar primero los que
+    # aun no llegaron a TP1, luego abrir (ver close_opposite_groups_before_tp1,
+    # caso real 2026-09-25). CLOSE_ON_OPPOSITE_SIGNAL=off lo desactiva.
+    from services.common.config import config as _config
+    if str(_config.get("CLOSE_ON_OPPOSITE_SIGNAL", "before_tp1")).strip().lower() == "before_tp1":
+        await tradeManager.close_opposite_groups_before_tp1(chat_id=chat_id, symbol=symbol, direction=direction)
+
     if is_fast:
-        # Solo grupos del mismo canal: el grupo reciente de OTRO canal no hace
-        # que esta señal sea un duplicado. La direccion no se filtra aqui a
-        # proposito -- el cooldown anti-duplicado conserva su semantica previa
-        # dentro de cada canal.
-        existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id)
+        # Solo grupos del mismo canal Y la misma direccion: el grupo reciente de
+        # OTRO canal no hace que esta señal sea un duplicado, y una fast en la
+        # direccion contraria tampoco (antes cualquier fast dentro del cooldown
+        # se ignoraba, asi que un giro rapido del canal no cerraba ni abria nada).
+        existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction)
         if existing_group_id is not None:
             # find_active_group_for_symbol no tiene nocion de tiempo: sin este
             # cooldown, CUALQUIER señal fast nueva del mismo simbolo se ignoraria
