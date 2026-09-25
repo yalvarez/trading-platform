@@ -31,6 +31,31 @@ def build_channel_filter(accounts: list[dict]) -> tuple[set[str], bool]:
     return allowed_channels, any_account_defines_filter
 
 
+REDIS_RETRY_MAX_DELAY_SECONDS = 30
+
+
+async def connect_redis_with_retry(redis_url: str, *, connect=redis_client, sleep=asyncio.sleep):
+    """
+    Conecta a Redis reintentando indefinidamente con backoff creciente (tope
+    REDIS_RETRY_MAX_DELAY_SECONDS). Incidente real (2026-09-07): tras un
+    reinicio del host, Redis aun no estaba listo; el ingestor fallo 3 arranques
+    rapidos, supervisord lo dejo en FATAL y el contenedor siguio "Up" sin
+    recibir ningun mensaje de Telegram durante ~2 horas.
+    """
+    delay, attempt = 1, 0
+    while True:
+        attempt += 1
+        try:
+            r = await connect(redis_url)
+            if attempt > 1:
+                log.info("[REDIS] Conectado tras %d intentos.", attempt)
+            return r
+        except Exception as e:
+            log.warning("[REDIS] Redis no disponible (intento %d): %s -- reintentando en %ss", attempt, e, delay)
+            await sleep(delay)
+            delay = min(delay * 2, REDIS_RETRY_MAX_DELAY_SECONDS)
+
+
 async def main():
     from services.common.env_validator import validate_telegram_ingestor
     validate_telegram_ingestor()
@@ -46,7 +71,7 @@ async def main():
             await asyncio.sleep(600)  # Solo cada 10 minutos
 
     s = Settings.load()
-    r = await redis_client(s["redis_url"])
+    r = await connect_redis_with_retry(s["redis_url"])
 
     api_id = int(s["TG_API_ID"])
     api_hash = s["TG_API_HASH"]
