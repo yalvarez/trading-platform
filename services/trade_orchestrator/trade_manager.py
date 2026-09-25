@@ -1,4 +1,4 @@
-from .trade_utils import safe_comment, parse_group_comment
+from .trade_utils import safe_comment, parse_group_comment, pips_to_price
 from .channel_names import resolve_channel_name
 from .mt5_pool import MT5ConnectionStuckError
 from .event_messages import (
@@ -31,6 +31,26 @@ TP1_HITS = Counter('trade_tp1_hits_total', 'TP1 hits (runner moved to BE)')
 ACTIVE_TRADES = Gauge('active_trades', 'Active trades')
 
 MAGIC = 987654
+
+# MT5: ORDER_FILLING_* (valor del request) y bits de SYMBOL_FILLING_MODE
+# (lo que el simbolo acepta). Verificado en vivo 2026-09-24: Vantage XAUUSD
+# filling_mode=2 (solo IOC), ORDER_FILLING_FOK/IOC/RETURN = 0/1/2.
+ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
+SYMBOL_FILLING_FOK_BIT, SYMBOL_FILLING_IOC_BIT = 1, 2
+TRADE_RETCODE_INVALID_FILL = 10030
+
+
+def filling_modes_for(symbol_info) -> list[int]:
+    """Orden de type_filling a probar: primero los que el simbolo declara en su
+    bitmask filling_mode, luego el resto (IOC, FOK, RETURN) como respaldo."""
+    mask = getattr(symbol_info, "filling_mode", None)
+    declared = []
+    if isinstance(mask, int):
+        if mask & SYMBOL_FILLING_IOC_BIT:
+            declared.append(ORDER_FILLING_IOC)
+        if mask & SYMBOL_FILLING_FOK_BIT:
+            declared.append(ORDER_FILLING_FOK)
+    return declared + [m for m in (ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN) if m not in declared]
 
 
 class MT5CallTimeoutError(Exception):
@@ -87,6 +107,10 @@ class TradeManager:
         self.channel_names = channel_names or {}
         self.trades: dict[int, ManagedTrade] = {}
         self._next_group_id = 1
+        # Tickets que close_now esta cerrando: _tick_once_account no debe
+        # clasificarlos como cierre externo en la ventana entre el cierre en MT5
+        # y el pop de self.trades (ver apply_mgmt_action, rama close_now).
+        self._mgmt_closing: set[int] = set()
 
     def _ensure_account_dict(self, account):
         if isinstance(account, dict):
@@ -258,7 +282,11 @@ class TradeManager:
         point = 0.1 if is_gold else 0.00001
         if symbol_info and getattr(symbol_info, "point", None) is not None:
             point = float(getattr(symbol_info, "point", point))
-        pips_tolerance = tolerance_pips * point
+        # TOLERANCE_PIPS esta en pips, como el resto de *_PIPS: para oro 1 pip =
+        # 0.1 (pips_to_price), no el point del broker -- Vantage reporta
+        # point=0.01, lo que dejaba TOLERANCE_PIPS=10 en $0.10 en vez de $1.00
+        # (aborto real entry_range_missed 2026-09-17 05:38).
+        pips_tolerance = pips_to_price(symbol, tolerance_pips, point)
 
         def _price_in_range(p: float) -> bool:
             if is_buy:
@@ -377,6 +405,11 @@ class TradeManager:
                 return None
 
         order_type = 0 if direction.upper() == "BUY" else 1
+        try:
+            filling_modes = filling_modes_for(await self._call(client.symbol_info, symbol))
+        except Exception as e:
+            log.warning("[TM][OPEN] symbol_info no disponible para elegir filling mode (%s), usando orden por defecto", e)
+            filling_modes = filling_modes_for(None)
         group_id = self._next_group_id
         self._next_group_id += 1
 
@@ -394,7 +427,6 @@ class TradeManager:
                 "magic": MAGIC,
                 "comment": safe_comment(f"GRP{group_id}-{leg}", "TM"),
                 "type_time": 0,
-                "type_filling": 1,
             }
             # Real production incident (2026-09-14): a hung order_send raised
             # a bare asyncio.TimeoutError that escaped open_group entirely --
@@ -404,20 +436,30 @@ class TradeManager:
             # number with no trade behind it. Caught here like any other
             # open failure so the channel always learns why a signal didn't
             # execute.
-            try:
-                res = await self._call(client.order_send, req)
-            except asyncio.TimeoutError:
-                log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s", leg, symbol, group_id)
-                reverted_all = await self._revert_opened_legs(account, client, tickets)
-                detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
-                          "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
-                          "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
-                await self._notify(
-                    "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason="timeout",
-                    message=f"Grupo {group_id} ({symbol}): MT5 no respondio a tiempo abriendo la pierna "
-                            f"'{leg}'. {detail}",
-                )
-                return None
+            # type_filling sale de lo que el simbolo declara (filling_modes_for),
+            # y solo se reintenta con el siguiente modo ante INVALID_FILL: otro
+            # rechazo cualquiera nunca se reenvia (no duplicar ordenes).
+            for attempt, filling in enumerate(filling_modes):
+                req["type_filling"] = filling
+                try:
+                    res = await self._call(client.order_send, req)
+                except asyncio.TimeoutError:
+                    log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s", leg, symbol, group_id)
+                    reverted_all = await self._revert_opened_legs(account, client, tickets)
+                    detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
+                              "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
+                              "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
+                    await self._notify(
+                        "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason="timeout",
+                        message=f"Grupo {group_id} ({symbol}): MT5 no respondio a tiempo abriendo la pierna "
+                                f"'{leg}'. {detail}",
+                    )
+                    return None
+                if getattr(res, "retcode", None) == TRADE_RETCODE_INVALID_FILL and attempt < len(filling_modes) - 1:
+                    log.warning("[TM][OPEN] filling mode %s rechazado (10030) leg=%s symbol=%s -- probando %s",
+                                filling, leg, symbol, filling_modes[attempt + 1])
+                    continue
+                break
             if not res or getattr(res, "retcode", None) != 10009:
                 log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s", leg, symbol, getattr(res, "retcode", None))
                 reverted_all = await self._revert_opened_legs(account, client, tickets)
@@ -660,7 +702,7 @@ class TradeManager:
             # any other unexpected error -- must not abort processing for
             # every OTHER group on this same account in the same tick).
             for ticket in [t for t, mt in self.trades.items() if mt.account_name == account["name"]]:
-                if ticket in pos_by_ticket:
+                if ticket in pos_by_ticket or ticket in self._mgmt_closing:
                     continue
                 closed_trade = self.trades.pop(ticket)
                 try:
@@ -1390,33 +1432,42 @@ class TradeManager:
                         # cerrar el runner tambien (ver docstring de
                         # _force_full_close para el incidente real que esto
                         # arregla).
+                        # Mientras se cierra, el tick de run_forever no debe verla
+                        # desaparecer de MT5 y reportarla tambien como
+                        # external_close_detected (P&L duplicado en el audit log,
+                        # grupos reales 146/149/150/160). Si el cierre falla, el
+                        # finally la devuelve al tick normal.
+                        self._mgmt_closing.add(t.ticket)
                         try:
-                            ok = await self._force_full_close(account, client, t.ticket)
-                        except MT5CallTimeoutError:
-                            any_leg_failed = True
-                            log.error("[TM][MGMT] close_now: timeout cerrando ticket=%s leg=%s group_id=%s",
-                                      t.ticket, t.leg, group_id)
-                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
-                            continue
-                        if not ok:
-                            any_leg_failed = True
-                            log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
-                                      t.ticket, t.leg, group_id)
-                            leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
-                            continue
-                        deal_info = await self._get_close_deal_info(client, t.ticket)
-                        close_price = deal_info["price"] if deal_info else None
-                        pnl_money = deal_info["profit"] if deal_info else None
-                        close_volume = deal_info["volume"] if deal_info else None
-                        leg_summaries.append(
-                            f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
-                            f"cierre {self._fmt_price(close_price)})"
-                        )
-                        leg_results.append({
-                            "leg": t.leg, "close_price": close_price,
-                            "close_volume": close_volume, "pnl_money": pnl_money,
-                        })
-                        self.trades.pop(t.ticket, None)
+                            try:
+                                ok = await self._force_full_close(account, client, t.ticket)
+                            except MT5CallTimeoutError:
+                                any_leg_failed = True
+                                log.error("[TM][MGMT] close_now: timeout cerrando ticket=%s leg=%s group_id=%s",
+                                          t.ticket, t.leg, group_id)
+                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, timeout: MT5 no respondio)")
+                                continue
+                            if not ok:
+                                any_leg_failed = True
+                                log.error("[TM][MGMT] partial_close rechazado por el broker | ticket=%s leg=%s group_id=%s",
+                                          t.ticket, t.leg, group_id)
+                                leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
+                                continue
+                            deal_info = await self._get_close_deal_info(client, t.ticket)
+                            close_price = deal_info["price"] if deal_info else None
+                            pnl_money = deal_info["profit"] if deal_info else None
+                            close_volume = deal_info["volume"] if deal_info else None
+                            leg_summaries.append(
+                                f"{t.leg} (ticket={t.ticket}, apertura {self._fmt_price(t.entry_price)}, "
+                                f"cierre {self._fmt_price(close_price)})"
+                            )
+                            leg_results.append({
+                                "leg": t.leg, "close_price": close_price,
+                                "close_volume": close_volume, "pnl_money": pnl_money,
+                            })
+                            self.trades.pop(t.ticket, None)
+                        finally:
+                            self._mgmt_closing.discard(t.ticket)
                     if any_leg_failed:
                         message = build_partial_failure_message(
                             channel_name=channel_name, group_id=group_id, leg_summaries=leg_summaries,
@@ -1585,10 +1636,14 @@ class TradeManager:
                         channel_name=channel_name, group_id=group_id, raw_text=raw_text,
                         percent_requested=effective_percent, leg_results=leg_results,
                     )
+                    # total_pnl_money a nivel superior, como mgmt_close_now: antes el
+                    # P&L realizado del parcial solo vivia dentro de leg_results y
+                    # cualquier suma del audit log lo omitia.
+                    total_pnl_money = sum(lr["pnl_money"] for lr in leg_results if lr.get("pnl_money") is not None)
                     await self._notify(
                         "mgmt_close_partial_now", channel="both", group_id=group_id, chat_id=chat_id,
                         channel_name=channel_name, raw_text=raw_text, percent_requested=effective_percent,
-                        leg_results=leg_results, message=message,
+                        leg_results=leg_results, total_pnl_money=total_pnl_money, message=message,
                     )
                     await self._persist_group(group_id)
                     results.append({"group_id": group_id, "status": "applied"})

@@ -209,6 +209,37 @@ async def test_apply_mgmt_action_close_now_closes_single_group_before_tp1():
 
 
 @pytest.mark.asyncio
+async def test_close_now_legs_are_not_also_reported_as_external_closes():
+    """Real production data (groups 146/149/150/160): every leg closed by
+    close_now was ALSO reported as external_close_detected, doubling its P&L in
+    the audit log. Race: close_now closed the leg in MT5, then awaited the deal
+    info, and only then removed it from self.trades -- the concurrent
+    run_forever tick saw the position gone but still tracked and classified it
+    as an external close. Reproduced by running a tick in that exact window."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    original_deal_info = tm._get_close_deal_info
+
+    async def deal_info_with_concurrent_tick(client, ticket):
+        await tm._tick_once_account(ACCOUNT)  # the run_forever tick lands here
+        return await original_deal_info(client, ticket)
+
+    tm._get_close_deal_info = deal_info_with_concurrent_tick
+
+    result = await tm.apply_mgmt_action(action="close_now", chat_id=CHAT_ID, raw_text="Close now", correction=None)
+
+    assert result == {"status": "completed", "results": [{"group_id": group_id, "status": "closed"}]}
+    events = [event for event, _ in notifier.events]
+    assert "mgmt_close_now" in events
+    assert "external_close_detected" not in events
+    assert "sl_hit_detected" not in events and "tp1_hit" not in events
+
+
+@pytest.mark.asyncio
 async def test_apply_mgmt_action_close_now_closes_all_groups_of_the_same_chat():
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -408,6 +439,25 @@ async def test_close_partial_now_only_closes_the_runner_leg_leaving_tp1_untouche
     assert result["results"][0]["status"] == "applied"
     assert sim.positions[tp1_leg.ticket]["volume"] == pytest.approx(0.10)  # untouched
     assert sim.positions[runner_leg.ticket]["volume"] == pytest.approx(0.05)  # 50% closed
+
+
+@pytest.mark.asyncio
+async def test_close_partial_now_event_carries_total_pnl_money():
+    """The realized P&L of a partial only lived inside leg_results, while every
+    other closing event (tp1_hit, sl_hit_detected, mgmt_close_now...) exposes a
+    top-level amount -- any audit-log sum silently dropped partial profits."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+    await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+
+    await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra la mitad", correction=None, percent=50.0)
+
+    ev = next(kwargs for event, kwargs in notifier.events if event == "mgmt_close_partial_now")
+    expected = sum(lr["pnl_money"] for lr in ev["leg_results"] if lr.get("pnl_money") is not None)
+    assert "total_pnl_money" in ev
+    assert ev["total_pnl_money"] == pytest.approx(expected)
 
 
 @pytest.mark.asyncio
@@ -1647,6 +1697,42 @@ async def test_open_group_aborts_when_price_already_past_entry_range():
 
 
 @pytest.mark.asyncio
+async def test_entry_tolerance_uses_gold_pip_not_broker_point():
+    """Vantage reports XAUUSD point=0.01 (the simulator defaults to 0.1, which hid
+    this). TOLERANCE_PIPS is in pips like every other *_PIPS setting (gold pip =
+    0.1, same as DEFAULT_SL_XAUUSD_PIPS in app.py): 10 pips = $1.00, not $0.10.
+    Real abort 2026-09-17 05:38 (entry_range_missed) on a TradePulse full signal."""
+    sim = SimuladorMT5()
+    sim.point = 0.01
+    sim.price = 2505.5  # $0.50 above the BUY range's high edge
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(),
+                      config_provider=FakeConfigProvider(TOLERANCE_PIPS=10))
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2520.0, tp2=2540.0,
+        entry_range=(2495.0, 2505.0),
+    )
+
+    assert group_id is not None
+
+
+@pytest.mark.asyncio
+async def test_entry_tolerance_still_aborts_beyond_tolerance_with_broker_point():
+    sim = SimuladorMT5()
+    sim.point = 0.01
+    sim.price = 2506.5  # $1.50 above the high edge: beyond 10 pips ($1.00)
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier(),
+                      config_provider=FakeConfigProvider(TOLERANCE_PIPS=10))
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2520.0, tp2=2540.0,
+        entry_range=(2495.0, 2505.0),
+    )
+
+    assert group_id is None
+
+
+@pytest.mark.asyncio
 async def test_open_group_waits_and_executes_once_price_enters_entry_range():
     sim = SimuladorMT5()
     sim.price = 2490.0  # starts below the range, not yet past it favorably — worth waiting
@@ -1732,6 +1818,89 @@ async def test_open_group_notifies_and_returns_none_when_order_send_times_out(mo
     assert len(events) == 1
     assert events[0].get("reason") in ("timeout", "mt5_timeout") or "timeout" in events[0].get("message", "").lower() \
         or "no respondio" in events[0].get("message", "").lower()
+
+
+def _fake_result(retcode):
+    return type("Res", (), {"retcode": retcode, "order": 0, "comment": ""})()
+
+
+@pytest.mark.asyncio
+async def test_open_group_uses_filling_mode_declared_by_broker():
+    """type_filling was hardcoded to 1 (IOC). Vantage's XAUUSD declares only IOC
+    (filling_mode bitmask 2), so it works today -- but a broker/account allowing
+    only FOK (bitmask 1) would reject every open. Follow the symbol's bitmask."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    sim.filling_mode = 1  # FOK only
+    original_symbol_info = sim.symbol_info
+
+    def symbol_info_with_filling(symbol):
+        info = original_symbol_info(symbol)
+        info.filling_mode = sim.filling_mode
+        return info
+
+    sim.symbol_info = symbol_info_with_filling
+    sent = []
+    original_order_send = sim.order_send
+
+    def order_send_fok_only(req):
+        sent.append(req["type_filling"])
+        if req["type_filling"] != 0:
+            return _fake_result(10030)  # TRADE_RETCODE_INVALID_FILL
+        return original_order_send(req)
+
+    sim.order_send = order_send_fok_only
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is not None
+    assert sent == [0, 0]  # FOK first for both legs, no wasted rejected attempt
+
+
+@pytest.mark.asyncio
+async def test_open_group_retries_next_filling_mode_only_on_invalid_fill():
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    sent = []
+    original_order_send = sim.order_send
+
+    def order_send_return_only(req):
+        sent.append(req["type_filling"])
+        if req["type_filling"] != 2:
+            return _fake_result(10030)
+        return original_order_send(req)
+
+    sim.order_send = order_send_return_only
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is not None
+    assert sent == [1, 0, 2, 1, 0, 2]  # IOC -> FOK -> RETURN for each leg
+
+
+@pytest.mark.asyncio
+async def test_open_group_does_not_retry_other_rejections():
+    """Any rejection other than an invalid filling mode (e.g. 10021 no prices)
+    must NOT be resent with another mode -- same failure path as before."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    sent = []
+
+    def order_send_no_prices(req):
+        sent.append(req["type_filling"])
+        return _fake_result(10021)
+
+    sim.order_send = order_send_no_prices
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    assert sent == [1]
+    assert [e for e, _ in notifier.events].count("open_failed") == 1
 
 
 @pytest.mark.asyncio
