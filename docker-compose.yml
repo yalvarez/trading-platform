@@ -61,6 +61,33 @@ services:
     # el fix una vez — ver scripts/fix-mt5-linux-version.sh, que automatiza
     # ambos lados (Linux + Wine) y ambos paquetes (mt5linux + rpyc).
 
+  mt5_acct2:
+    # Segunda cuenta MT5. Mismo patron que mt5_acct1, con TODO lo que identifica
+    # a la terminal separado: nombre de contenedor, puertos de host y volumen
+    # propio (compartir mt5_acct1_config haria que ambas terminales pisaran la
+    # misma instalacion/sesion de la cuenta 1). Tras el PRIMER arranque del
+    # volumen nuevo hay que aplicar una vez el fix de versiones:
+    #   ./scripts/fix-mt5-linux-version.sh atp-mt5-acct2
+    # e iniciar sesion en la cuenta desde la VNC (puerto 3002). Los servicios la
+    # usan por la red interna como mt5_acct2:8001 (host/port en ACCOUNTS_JSON).
+    image: gmag11/metatrader5_vnc:2.3
+    container_name: atp-mt5-acct2
+    environment:
+      - CUSTOM_USER=${MT5_WEB_USER}
+      - PASSWORD=${MT5_WEB_PASS}
+    ports:
+      - "3002:3000"
+      # Solo loopback, igual que mt5_acct1 (RPyC classic = control total de la
+      # cuenta). Acceso manual: ssh -L 9082:127.0.0.1:9082 root@illuminatis-vps
+      - "127.0.0.1:9082:8001"
+    volumes:
+      - mt5_acct2_config:/config
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8001"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
   telegram_ingestor:
     build:
       context: .
@@ -168,3 +195,4 @@ services:
 volumes:
   redis_data:
   mt5_acct1_config:
+  mt5_acct2_config:
