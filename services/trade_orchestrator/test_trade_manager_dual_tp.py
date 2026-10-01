@@ -1929,6 +1929,148 @@ async def test_open_group_notifies_when_connection_is_stuck():
 
 
 @pytest.mark.asyncio
+async def test_open_group_timeout_reconciles_against_mt5_when_order_actually_filled(monkeypatch):
+    """
+    Real production bug (groups 170/171, 2026-09-29): a timeout on order_send
+    means "no response arrived in time," NOT "the order didn't execute" --
+    MT5 can have filled the order server-side regardless. The old
+    _revert_opened_legs only ever closed tickets already in the in-memory
+    `tickets` dict -- on a timeout opening the FIRST leg (tp1), that dict is
+    still empty, so revert trivially "succeeds" over zero positions while a
+    real one sits unmanaged in MT5. open_group must now query MT5 directly
+    (by the GRP{id}-{leg} comment, since no ticket was ever saved) before
+    deciding nothing happened.
+    """
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    real_order_send = sim.order_send
+
+    def order_send_fills_but_response_lost(req):
+        # Simulates MT5 actually executing the order server-side while the
+        # response never reaches the caller in time -- exactly what a real
+        # network/RPyC timeout means.
+        real_order_send(req)
+        time.sleep(0.3)
+        return None
+
+    sim.order_send = order_send_fills_but_response_lost
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    # The leg that "timed out" actually filled in MT5 -- open_group must have
+    # found it and continued normally instead of reporting total failure.
+    assert group_id is not None
+    assert len(tm.trades) == 2
+    assert len(sim.positions) == 2  # nothing was wrongly reverted
+    for t in tm.trades.values():
+        assert t.group_id == group_id
+
+
+@pytest.mark.asyncio
+async def test_open_group_timeout_still_reverts_when_order_genuinely_never_filled(monkeypatch):
+    """Companion to the above: when the order really didn't execute (the
+    common case), behavior must stay exactly as before -- no phantom
+    position, open_failed notified, signal dropped cleanly."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    def hung_order_send(req):
+        time.sleep(0.3)
+        return None
+
+    sim.order_send = hung_order_send
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    assert len(tm.trades) == 0
+    assert len(sim.positions) == 0
+    events = [kwargs for event, kwargs in notifier.events if event == "open_failed"]
+    assert len(events) == 1
+    # Must not falsely claim a revert happened when nothing needed reverting.
+    assert "se revirtieron" not in events[0]["message"].lower() or "no hab" in events[0]["message"].lower() \
+        or "no habia" in events[0]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_open_group_timeout_on_second_leg_reconciles_first_leg_ticket_for_revert(monkeypatch):
+    """When tp1 opens fine but runner times out AND genuinely never filled,
+    the real tp1 ticket (already known) must still get reverted -- this path
+    was already correct before the fix, must stay correct after."""
+    monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    real_order_send = sim.order_send
+    call_count = {"n": 0}
+
+    def order_send_second_leg_hangs(req):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return real_order_send(req)  # tp1 opens fine
+        time.sleep(0.3)  # runner: genuinely never reaches MT5
+        return None
+
+    sim.order_send = order_send_second_leg_hangs
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    assert len(tm.trades) == 0
+    assert len(sim.positions) == 0  # tp1 was correctly reverted
+
+
+@pytest.mark.asyncio
+async def test_open_group_notifies_open_failed_on_unexpected_exception_after_tp1_opens():
+    """
+    Real production bug (group 133, 2026-09-14): the entire group_opened
+    event went missing from the audit log -- not just the runner's
+    notification. open_group's leg loop only ever caught asyncio.TimeoutError
+    and a bad retcode; any OTHER exception (here simulated as the runner leg
+    raising something unrelated, e.g. a bug in a downstream call) propagated
+    out of open_group entirely, caught only by a generic log.exception in
+    app.py that emits zero business event. tp1 had already opened for real
+    in MT5 with ZERO internal tracking. Must now notify open_failed instead
+    of vanishing silently, and the message must flag that tp1 is a real
+    orphaned position in MT5.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    notifier = DummyNotifier()
+    tm = TradeManager(DummyExecutor(sim), notifier=notifier)
+
+    real_order_send = sim.order_send
+    call_count = {"n": 0}
+
+    def order_send_runner_raises(req):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return real_order_send(req)  # tp1 opens for real
+        raise RuntimeError("unexpected RPyC EOFError-like failure")
+
+    sim.order_send = order_send_runner_raises
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is None
+    events = [kwargs for event, kwargs in notifier.events if event == "open_failed"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "unexpected_error"
+    # tp1's real orphaned position must be surfaced, not silently lost.
+    assert "si se abrieron en mt5" in events[0]["message"].lower()
+    assert len(sim.positions) == 1  # tp1 really is still open in MT5, unmanaged
+
+
+@pytest.mark.asyncio
 async def test_open_group_recovers_from_transient_empty_tick_on_first_price_read():
     """
     Reproduces a real production incident: mt5linux opens a fresh RPyC

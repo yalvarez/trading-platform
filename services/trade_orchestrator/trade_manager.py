@@ -333,6 +333,35 @@ class TradeManager:
                 return None
         return None
 
+    async def _find_position_by_group_comment(self, client, group_id: int, leg: str):
+        """
+        Busca en MT5 una posicion viva cuyo comment coincida exactamente con
+        safe_comment(f"GRP{group_id}-{leg}") -- el identificador unico que
+        open_group ya pone en toda orden que abre (ver parse_group_comment).
+        Usado tras un timeout/retcode malo en order_send: un timeout significa
+        "la respuesta no llego a tiempo", NO "la orden no se ejecuto" -- MT5
+        puede haber llenado la orden del lado del broker igual. Sin esto, el
+        unico rastro de una pierna recien abierta es el `tickets` dict que
+        open_group construye en memoria, que por definicion NUNCA se puebla
+        para la pierna que justamente tuvo el timeout -- dejando esa posicion
+        real huerfana, sin gestion, mientras open_group cree (y notifica) que
+        "se revirtio" algo que nunca llego a intentar revertir (casos reales
+        2026-09-29, grupos 170/171).
+        Retorna el objeto posicion si la encuentra, None si no existe o si la
+        propia consulta falla (vuelve a ser un caso ambiguo, no uno resuelto).
+        """
+        target_comment = safe_comment(f"GRP{group_id}-{leg}")
+        try:
+            positions = await self._call(client.positions_get) or []
+        except Exception as e:
+            log.warning("[TM][OPEN] fallo consultando positions_get para reconciliar group_id=%s leg=%s: %s",
+                        group_id, leg, e)
+            return None
+        for pos in positions:
+            if getattr(pos, "comment", None) == target_comment:
+                return pos
+        return None
+
     async def _revert_opened_legs(self, account: dict, client, tickets: dict) -> bool:
         """
         Cierra (partial_close 100%) cualquier pierna ya abierta en `tickets`
@@ -430,6 +459,43 @@ class TradeManager:
         group_id = self._next_group_id
         self._next_group_id += 1
 
+        try:
+            return await self._open_group_legs(
+                account, client, group_id, symbol=symbol, direction=direction, order_type=order_type,
+                sl=sl, tp1=tp1, tp2=tp2, price=price, chat_id=chat_id, filling_modes=filling_modes,
+            )
+        except Exception as e:
+            # Real production bug (group 133, 2026-09-14): open_group's leg
+            # loop only ever caught asyncio.TimeoutError and a bad retcode --
+            # ANY other exception (an RPyC EOFError, a bug in _notify/
+            # build_group_opened_message, anything) escaped this function
+            # entirely, caught only by app.py's generic
+            # `except Exception: log.exception(...)` around signal
+            # processing, which emits NO business event. tp1 can have
+            # already opened for real in MT5 at that point with ZERO
+            # internal tracking (never inserted into self.trades) -- totally
+            # unmanaged and unreported, the group_id simply vanishes from
+            # the audit log with no trace. Every path through leg-opening
+            # must end in at least one notification, even an unexpected one.
+            log.error("[TM][OPEN] excepcion inesperada abriendo group_id=%s symbol=%s: %s",
+                      group_id, symbol, e, exc_info=True)
+            real_tp1 = await self._find_position_by_group_comment(client, group_id, "tp1")
+            real_runner = await self._find_position_by_group_comment(client, group_id, "runner")
+            orphan_note = ""
+            if real_tp1 is not None or real_runner is not None:
+                tickets_found = [t for t in (real_tp1, real_runner) if t is not None]
+                orphan_note = (f" ADVERTENCIA: {len(tickets_found)} pierna(s) SI se abrieron en MT5 "
+                                f"(tickets={[int(t.ticket) for t in tickets_found]}) y quedaron sin gestion -- "
+                                f"revisar manualmente.")
+            await self._notify(
+                "open_failed", symbol=symbol, group_id=group_id, reason="unexpected_error",
+                message=f"Grupo {group_id} ({symbol}): error inesperado abriendo el grupo ({e}).{orphan_note}",
+            )
+            return None
+
+    async def _open_group_legs(self, account: dict, client, group_id: int, *, symbol: str, direction: str,
+                                order_type: int, sl: float, tp1: Optional[float], tp2: Optional[float],
+                                price: float, chat_id: Optional[str], filling_modes: list) -> Optional[int]:
         tickets = {}
         for leg in ("tp1", "runner"):
             req = {
@@ -456,37 +522,49 @@ class TradeManager:
             # type_filling sale de lo que el simbolo declara (filling_modes_for),
             # y solo se reintenta con el siguiente modo ante INVALID_FILL: otro
             # rechazo cualquiera nunca se reenvia (no duplicar ordenes).
+            timed_out = False
             for attempt, filling in enumerate(filling_modes):
                 req["type_filling"] = filling
                 try:
                     res = await self._call(client.order_send, req)
                 except asyncio.TimeoutError:
                     log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s", leg, symbol, group_id)
-                    reverted_all = await self._revert_opened_legs(account, client, tickets)
-                    detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
-                              "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
-                              "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
-                    await self._notify(
-                        "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason="timeout",
-                        message=f"Grupo {group_id} ({symbol}): MT5 no respondio a tiempo abriendo la pierna "
-                                f"'{leg}'. {detail}",
-                    )
-                    return None
+                    timed_out = True
+                    res = None
+                    break
                 if getattr(res, "retcode", None) == TRADE_RETCODE_INVALID_FILL and attempt < len(filling_modes) - 1:
                     log.warning("[TM][OPEN] filling mode %s rechazado (10030) leg=%s symbol=%s -- probando %s",
                                 filling, leg, symbol, filling_modes[attempt + 1])
                     continue
                 break
-            if not res or getattr(res, "retcode", None) != 10009:
-                log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s", leg, symbol, getattr(res, "retcode", None))
+
+            if timed_out or not res or getattr(res, "retcode", None) != 10009:
+                # Ni un timeout ni un retcode malo prueban que la orden no se
+                # ejecuto -- la respuesta pudo perderse mientras MT5 si la
+                # procesaba. Reconciliar contra MT5 real por el comment unico
+                # de esta pierna ANTES de asumir fallo (ver
+                # _find_position_by_group_comment: casos reales 170/171).
+                real_pos = await self._find_position_by_group_comment(client, group_id, leg)
+                if real_pos is not None:
+                    log.warning("[TM][OPEN] leg=%s symbol=%s group_id=%s parecia fallida pero SI existe en MT5 "
+                                "(ticket=%s) -- continuando como si order_send hubiera respondido a tiempo.",
+                                leg, symbol, group_id, real_pos.ticket)
+                    tickets[leg] = int(real_pos.ticket)
+                    continue
+
+                reason = "timeout" if timed_out else None
+                log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s (confirmado ausente en MT5)",
+                          leg, symbol, None if timed_out else getattr(res, "retcode", None))
                 reverted_all = await self._revert_opened_legs(account, client, tickets)
-                detail = ("Se revirtieron las piernas ya abiertas del grupo." if reverted_all else
+                detail = ("Se revirtieron las piernas ya abiertas del grupo." if (reverted_all and tickets) else
+                          "No habia piernas abiertas que revertir." if not tickets else
                           "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
                           "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
+                reason_text = "MT5 no respondio a tiempo" if timed_out else \
+                    f"fallo en MT5 (retcode={getattr(res, 'retcode', None)})"
                 await self._notify(
-                    "open_failed", symbol=symbol, leg=leg, group_id=group_id,
-                    message=f"Grupo {group_id} ({symbol}): fallo abriendo la pierna '{leg}' en MT5 "
-                            f"(retcode={getattr(res, 'retcode', None)}). {detail}",
+                    "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason=reason,
+                    message=f"Grupo {group_id} ({symbol}): {reason_text} abriendo la pierna '{leg}'. {detail}",
                 )
                 return None
             tickets[leg] = int(res.order)
