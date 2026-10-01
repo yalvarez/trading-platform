@@ -224,9 +224,9 @@ async def test_close_now_legs_are_not_also_reported_as_external_closes():
 
     original_deal_info = tm._get_close_deal_info
 
-    async def deal_info_with_concurrent_tick(client, ticket):
+    async def deal_info_with_concurrent_tick(client, ticket, managed_trade=None):
         await tm._tick_once_account(ACCOUNT)  # the run_forever tick lands here
-        return await original_deal_info(client, ticket)
+        return await original_deal_info(client, ticket, managed_trade)
 
     tm._get_close_deal_info = deal_info_with_concurrent_tick
 

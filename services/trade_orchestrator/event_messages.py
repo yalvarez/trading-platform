@@ -96,6 +96,17 @@ def build_external_close_message(*, channel_name, group_id, symbol, direction, l
     )
 
 
+def build_external_partial_close_message(*, channel_name, group_id, symbol, direction, leg, closed_volume,
+                                          remaining_volume, pnl_money) -> str:
+    return (
+        f"\U0001F6A8 CIERRE PARCIAL EXTERNO DETECTADO — Canal: {channel_name} (grupo {group_id})\n"
+        f"{symbol} {_fmt_direction(direction)} ({leg})\n"
+        f"Cerrado por fuera del sistema: {closed_volume} lots (quedan {remaining_volume} lots abiertos)\n"
+        f"Resultado: {_fmt_money(pnl_money)}\n"
+        f"La posicion sigue abierta con el volumen restante bajo gestion normal."
+    )
+
+
 def build_close_now_message(*, channel_name, group_id, raw_text, leg_results, total_pnl_money) -> str:
     legs_text = _fmt_leg_results(leg_results)
     return (

@@ -4,6 +4,7 @@ from .mt5_pool import MT5ConnectionStuckError
 from .event_messages import (
     build_sl_hit_message,
     build_external_close_message,
+    build_external_partial_close_message,
     build_group_opened_message,
     build_tp1_hit_message,
     build_tp2_partial_closed_message,
@@ -90,6 +91,21 @@ class ManagedTrade:
     peak_multiple: float = 0.0
     opened_ts: float = field(default_factory=lambda: time.time())
     chat_id: Optional[str] = None
+    # Volumen vivo visto la ultima vez que se proceso este ticket en el tick
+    # loop, tras aplicar cualquier cierre parcial que el propio sistema haya
+    # iniciado (TP2 partial, close_partial_now). Una caida de volumen entre
+    # dos ticks que NO coincide con ninguna de esas acciones del sistema es
+    # un cierre parcial externo (el usuario cerrando manualmente desde MT5) --
+    # ver _tick_once_account. None hasta el primer tick que vea la posicion.
+    last_known_volume: Optional[float] = None
+    # Marca de tiempo (deal.time, epoch) del deal de salida mas reciente ya
+    # sumado a un evento de auditoria para este ticket (TP1/SL/cierre externo
+    # total o parcial). _get_close_deal_info usa esto para sumar TODOS los
+    # deals de salida nuevos desde la ultima auditoria, no solo el ultimo --
+    # sin esto, una posicion cerrada en varios partials externos antes de
+    # desaparecer del todo pierde el P&L de los partials intermedios (solo
+    # se ve el del ultimo deal). Ver caso real grupo 169, 2026-09-28.
+    last_audited_deal_time: int = 0
 
     @property
     def tp2_partial_skipped(self) -> bool:
@@ -776,6 +792,44 @@ class TradeManager:
 
             ACTIVE_TRADES.set(len(self.trades))
 
+            # Cierre parcial externo: el ticket SIGUE en positions_get (no es
+            # el caso de arriba) pero su volumen vivo bajo respecto al ultimo
+            # tick, sin que el propio sistema lo haya pedido (TP2 partial y
+            # close_partial_now actualizan last_known_volume ellos mismos
+            # justo despues de actuar -- ver sus docstrings/comentarios). El
+            # usuario cerrando manualmente una porcion desde MT5 es el caso
+            # real que motiva esto (grupos 168/172, 2026-09-2x: el audit log
+            # nunca se entero porque el ticket seguia vivo).
+            for ticket, t in [(tk, mt) for tk, mt in self.trades.items() if mt.account_name == account["name"]]:
+                try:
+                    pos = pos_by_ticket.get(ticket)
+                    if not pos:
+                        continue
+                    live_volume = float(pos.volume)
+                    if t.last_known_volume is None:
+                        t.last_known_volume = live_volume
+                        continue
+                    if live_volume < t.last_known_volume - 1e-9:
+                        closed_volume = t.last_known_volume - live_volume
+                        deal_info = await self._get_close_deal_info(client, ticket, t)
+                        channel_name = resolve_channel_name(t.chat_id, self._channel_names())
+                        pnl_money = deal_info["profit"] if deal_info else None
+                        message = build_external_partial_close_message(
+                            channel_name=channel_name, group_id=t.group_id, symbol=t.symbol, direction=t.direction,
+                            leg=t.leg, closed_volume=round(closed_volume, 2), remaining_volume=round(live_volume, 2),
+                            pnl_money=pnl_money,
+                        )
+                        await self._notify(
+                            "external_partial_close_detected", channel="both", group_id=t.group_id,
+                            chat_id=t.chat_id, channel_name=channel_name, symbol=t.symbol, direction=t.direction,
+                            leg=t.leg, closed_volume=round(closed_volume, 2), remaining_volume=round(live_volume, 2),
+                            pnl_money=pnl_money, message=message,
+                        )
+                    t.last_known_volume = live_volume
+                except Exception as e:
+                    log.error("[TM] error detectando cierre parcial externo ticket=%s group_id=%s: %s",
+                              ticket, t.group_id, e, exc_info=True)
+
             for ticket, t in [(tk, mt) for tk, mt in self.trades.items() if mt.account_name == account["name"]]:
                 try:
                     pos = pos_by_ticket.get(ticket)
@@ -807,7 +861,7 @@ class TradeManager:
         cualquier otra causa detectada aqui (fuera de TP genuino y SL) se
         trata como 'external': nadie del sistema lo pidio.
         """
-        info = await self._get_close_deal_info(client, closed_trade.ticket)
+        info = await self._get_close_deal_info(client, closed_trade.ticket, closed_trade)
         if info is None:
             # Deal aun no propago o fallo de red -- comportamiento previo:
             # asumir TP1 para no bloquear el BE automatico en el caso comun.
@@ -853,7 +907,7 @@ class TradeManager:
         if not runner:
             return
 
-        deal_info = await self._get_close_deal_info(client, tp1_leg.ticket)
+        deal_info = await self._get_close_deal_info(client, tp1_leg.ticket, tp1_leg)
         channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
         close_price = deal_info["price"] if deal_info else None
         pnl_money = deal_info["profit"] if deal_info else None
@@ -930,13 +984,25 @@ class TradeManager:
                 channel_name=channel_name, message=failed_message,
             )
 
-    async def _get_close_deal_info(self, client, ticket: int) -> Optional[dict]:
+    async def _get_close_deal_info(self, client, ticket: int, managed_trade: Optional["ManagedTrade"] = None) -> Optional[dict]:
         """
-        Busca el deal real de salida (DEAL_ENTRY_OUT=1) de `ticket` en el
+        Busca los deals de salida (DEAL_ENTRY_OUT=1) de `ticket` en el
         historial de MT5, con toda la informacion necesaria para
-        auditoria/notificacion: precio, causa (reason), P&L real, volumen
-        cerrado, comision y swap. Nunca debe tumbar el flujo de notificacion
-        -- cualquier fallo (de red, o el deal aun no propago) devuelve None.
+        auditoria/notificacion: precio (del deal mas reciente, usado para
+        clasificar TP/SL/externo), causa (reason, del mas reciente), y P&L/
+        volumen/comision/swap SUMADOS de todos los deals de salida nuevos
+        desde la ultima vez que se audito este ticket. Nunca debe tumbar el
+        flujo de notificacion -- cualquier fallo (de red, o el deal aun no
+        propago) devuelve None.
+
+        managed_trade, si viene, filtra por deal.time > last_audited_deal_time
+        y lo actualiza al deal mas reciente encontrado -- sin esto (o en
+        llamadas sin managed_trade, p.ej. tests viejos) se usa el ultimo deal
+        unicamente, el comportamiento previo. Necesario porque una posicion
+        puede acumular varios cierres parciales (manuales o del TP2 partial)
+        antes de cerrarse del todo: tomar solo el ultimo deal perdia el P&L
+        de los anteriores (caso real grupo 169, 2026-09-28, un cierre externo
+        de dos partials donde solo se audito el segundo).
         """
         try:
             deals = await self._call(client.history_deals_get, position=ticket)
@@ -948,14 +1014,18 @@ class TradeManager:
         out_deals = [d for d in deals if getattr(d, "entry", None) == 1]
         if not out_deals:
             return None
-        closing = max(out_deals, key=lambda d: getattr(d, "time", 0))
+        since = managed_trade.last_audited_deal_time if managed_trade else 0
+        new_deals = [d for d in out_deals if getattr(d, "time", 0) > since] or out_deals
+        closing = max(new_deals, key=lambda d: getattr(d, "time", 0))
+        if managed_trade is not None:
+            managed_trade.last_audited_deal_time = int(getattr(closing, "time", since))
         return {
             "price": float(closing.price),
             "reason": getattr(closing, "reason", None),
-            "profit": float(getattr(closing, "profit", 0.0) or 0.0),
-            "volume": float(getattr(closing, "volume", 0.0) or 0.0),
-            "commission": float(getattr(closing, "commission", 0.0) or 0.0),
-            "swap": float(getattr(closing, "swap", 0.0) or 0.0),
+            "profit": sum(float(getattr(d, "profit", 0.0) or 0.0) for d in new_deals),
+            "volume": sum(float(getattr(d, "volume", 0.0) or 0.0) for d in new_deals),
+            "commission": sum(float(getattr(d, "commission", 0.0) or 0.0) for d in new_deals),
+            "swap": sum(float(getattr(d, "swap", 0.0) or 0.0) for d in new_deals),
         }
 
     async def _get_close_price(self, client, ticket: int) -> Optional[float]:
@@ -1244,7 +1314,7 @@ class TradeManager:
                       runner.ticket, runner.group_id)
             return
         runner.tp2_partial_applied = True
-        deal_info = await self._get_close_deal_info(client, runner.ticket)
+        deal_info = await self._get_close_deal_info(client, runner.ticket, runner)
         channel_name = resolve_channel_name(runner.chat_id, self._channel_names())
         close_price = deal_info["price"] if deal_info else None
         pnl_money = deal_info["profit"] if deal_info else None
@@ -1258,6 +1328,11 @@ class TradeManager:
         # volume*0.5 para no atarse a que el 50% de arriba nunca cambie.
         post_close = await self._call(client.positions_get, ticket=runner.ticket)
         remaining_volume = float(post_close[0].volume) if post_close else getattr(pos, "volume", None)
+        # Igual que en close_partial_now: evita que el tick loop confunda esta
+        # caida de volumen (iniciada por el propio sistema) con un cierre
+        # parcial externo en el proximo tick.
+        if remaining_volume is not None:
+            runner.last_known_volume = remaining_volume
         message = build_tp2_partial_closed_message(
             channel_name=channel_name, group_id=runner.group_id, symbol=runner.symbol, direction=runner.direction,
             close_price=close_price, close_volume=close_volume, pnl_money=pnl_money, remaining_volume=remaining_volume,
@@ -1433,7 +1508,7 @@ class TradeManager:
                                   t.ticket, t.leg, group_id)
                         leg_summaries.append(f"{t.leg} (ticket={t.ticket}, rechazado)")
                         continue
-                    deal_info = await self._get_close_deal_info(client, t.ticket)
+                    deal_info = await self._get_close_deal_info(client, t.ticket, t)
                     close_price = deal_info["price"] if deal_info else None
                     pnl_money = deal_info["profit"] if deal_info else None
                     close_volume = deal_info["volume"] if deal_info else None
@@ -1650,7 +1725,15 @@ class TradeManager:
                                 log.error("[TM][MGMT] partial_close (parcial %.0f%%) rechazado | ticket=%s leg=%s group_id=%s",
                                           effective_percent, t.ticket, t.leg, group_id)
                                 continue
-                            deal_info = await self._get_close_deal_info(client, t.ticket)
+                            deal_info = await self._get_close_deal_info(client, t.ticket, t)
+                            # t sigue abierto con menos volumen (no es un cierre
+                            # total) -- sin esto, el tick loop veria caer el
+                            # volumen en vivo en el proximo tick y lo marcaria
+                            # como cierre parcial externo, duplicando este
+                            # mismo P&L en un segundo evento de auditoria.
+                            remaining_pos = await self._call(client.positions_get, ticket=t.ticket)
+                            if remaining_pos:
+                                t.last_known_volume = float(remaining_pos[0].volume)
                             leg_results.append({
                                 "leg": t.leg,
                                 "close_price": deal_info["price"] if deal_info else None,
