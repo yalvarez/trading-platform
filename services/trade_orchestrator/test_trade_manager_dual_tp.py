@@ -617,6 +617,33 @@ async def test_close_partial_now_applies_explicit_percent():
 
 
 @pytest.mark.asyncio
+async def test_close_partial_now_applies_to_all_groups_of_the_same_chat():
+    """apply_mgmt_action now processes group_ids in parallel (asyncio.gather)
+    -- verify close_partial_now still correctly applies to EVERY group of
+    the chat, not just the first/last, and results map back to the right
+    group_id regardless of completion order."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+    g1 = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    g2 = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id=CHAT_ID)
+    other_chat_group = await tm.open_group(ACCOUNT_BIG_LOT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0, chat_id="other-chat")
+    g1_runner = next(t for t in tm.trades.values() if t.group_id == g1 and t.leg == "runner")
+    g2_runner = next(t for t in tm.trades.values() if t.group_id == g2 and t.leg == "runner")
+    other_runner = next(t for t in tm.trades.values() if t.group_id == other_chat_group and t.leg == "runner")
+
+    result = await tm.apply_mgmt_action(action="close_partial_now", chat_id=CHAT_ID, raw_text="cierra 30%", correction=None, percent=30.0)
+
+    results_by_group = {r["group_id"]: r for r in result["results"]}
+    assert results_by_group[g1]["status"] == "applied"
+    assert results_by_group[g2]["status"] == "applied"
+    assert sim.positions[g1_runner.ticket]["volume"] == pytest.approx(0.07)  # 30% of 0.10 closed
+    assert sim.positions[g2_runner.ticket]["volume"] == pytest.approx(0.07)
+    # The other chat's group must be untouched (full 0.10 still open).
+    assert sim.positions[other_runner.ticket]["volume"] == pytest.approx(0.10)
+
+
+@pytest.mark.asyncio
 async def test_close_partial_now_notifies_success_event_with_both_channel():
     sim = SimuladorMT5()
     sim.price = 2500.0

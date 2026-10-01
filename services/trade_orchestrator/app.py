@@ -109,10 +109,26 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     if str(_config.get("CLOSE_ON_OPPOSITE_SIGNAL", "before_tp1")).strip().lower() == "before_tp1":
         await tradeManager.close_opposite_groups_before_tp1(chat_id=chat_id, symbol=symbol, direction=direction)
 
-    for account in target_accounts:
-        await _handle_signal_for_account(fields, tradeManager, account, symbol=symbol, direction=direction,
-                                          chat_id=chat_id, is_fast=is_fast, sl_raw=sl_raw, tps=tps,
-                                          entry_range=entry_range)
+    # Paralelo entre cuentas: cada una abre/actualiza su propio grupo de forma
+    # independiente (tickets y group_id propios -- ver _accounts_for_signal y
+    # open_group). Un loop secuencial aqui deja una ventana de latencia entre
+    # cuentas (caso real 2026-10-01: ~0.77s entre acct1 y acct2 con solo 2
+    # cuentas) que crece linealmente con el numero de cuentas, en un activo
+    # (oro) donde el precio puede moverse de forma significativa en ese lapso.
+    # _handle_signal_for_account no propaga excepciones de negocio sin
+    # notificar (ver open_group's unexpected-exception guard), asi que gather
+    # no necesita return_exceptions -- pero una excepcion genuinamente
+    # inesperada aqi no debe tumbar el procesamiento de las demas cuentas.
+    results = await asyncio.gather(
+        *(_handle_signal_for_account(fields, tradeManager, account, symbol=symbol, direction=direction,
+                                      chat_id=chat_id, is_fast=is_fast, sl_raw=sl_raw, tps=tps,
+                                      entry_range=entry_range)
+          for account in target_accounts),
+        return_exceptions=True,
+    )
+    for account, result in zip(target_accounts, results):
+        if isinstance(result, Exception):
+            log.error("[SIGNAL] excepcion procesando senal para cuenta %s: %s", account.get("name"), result, exc_info=result)
 
 
 async def _handle_signal_for_account(fields: dict, tradeManager: TradeManager, account: dict, *, symbol, direction,

@@ -287,6 +287,51 @@ async def test_full_signal_replicates_to_every_active_account_without_allowed_ch
 
 
 @pytest.mark.asyncio
+async def test_one_account_failing_does_not_block_the_other_accounts_opening():
+    """handle_signal_fields now opens accounts in parallel via asyncio.gather
+    (caso real 2026-10-01: latencia acumulada entre cuentas en un activo
+    volatil). A genuinely unexpected exception for one account's client must
+    not prevent the other account's group from opening -- return_exceptions
+    isolates it, and the exception is only logged."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    class ExplodingClient:
+        def symbol_select(self, *a, **kw):
+            raise RuntimeError("unexpected client failure")
+
+    class MultiClientExecutor:
+        def __init__(self, sim, accounts, broken_account_name):
+            self.sim = sim
+            self.accounts = accounts
+            self.magic = 987654
+            self.broken_account_name = broken_account_name
+
+        def _client_for(self, account):
+            if account["name"] == self.broken_account_name:
+                return ExplodingClient()
+            return self.sim
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": True, "host": "y", "port": 2, "fixed_lot": 0.02},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(MultiClientExecutor(sim, accounts, broken_account_name="acct1"), notifier=DummyNotifier())
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+    }
+    await handle_signal_fields(full_fields, tm, accounts)
+
+    # acct1 blew up, but acct2 must still have opened its group normally.
+    assert len(tm.trades) == 2
+    account_names = {t.account_name for t in tm.trades.values()}
+    assert account_names == {"acct2"}
+
+
+@pytest.mark.asyncio
 async def test_signal_only_goes_to_accounts_whose_allowed_channels_include_the_chat_id():
     """acct2 restricts allowed_channels to a different chat_id -> a signal from
     chat_id=111 must open only on acct1, not acct2."""
