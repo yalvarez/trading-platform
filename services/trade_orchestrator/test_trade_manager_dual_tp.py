@@ -2071,6 +2071,56 @@ async def test_open_group_notifies_open_failed_on_unexpected_exception_after_tp1
 
 
 @pytest.mark.asyncio
+async def test_open_group_with_fast_pips_computes_sl_tp_against_its_own_fresh_price():
+    """
+    Real production incident (group 176, 2026-10-01): a fast signal's SL/TP
+    used to be computed in app.py against an EARLIER price fetch, then
+    passed to open_group as fixed absolute prices -- open_group fetches its
+    OWN price again right before sending the order, so if price moved
+    between the two fetches, the SL/TP no longer sits at the intended
+    distance from the price actually used in the order. A stricter broker
+    stops_level (acct2/STARTRADER's 35 vs acct1/Vantage's 20) can then
+    reject the order (retcode 10016) while the same signal succeeds
+    elsewhere. Passing raw pip offsets instead of pre-computed prices lets
+    open_group compute SL/TP against the SAME price it uses for the order,
+    eliminating the drift window entirely.
+    """
+    sim = SimuladorMT5()
+    sim.price = 2500.0  # open_group's own price fetch will see this
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(
+        ACCOUNT, symbol="XAUUSD", direction="BUY", sl=None, tp1=None, tp2=None,
+        fast_pips={"sl": 60, "tp1": 40, "tp2_extra": 40}, chat_id=CHAT_ID,
+    )
+
+    assert group_id is not None
+    by_leg = {t.leg: t for t in tm.trades.values()}
+    # SL/TP must be computed against sim.price (2500.0), not some earlier value.
+    assert by_leg["tp1"].planned_sl == pytest.approx(2494.0)   # 2500 - 60*0.1
+    assert by_leg["tp1"].tp1_price == pytest.approx(2504.0)    # 2500 + 40*0.1
+    assert by_leg["tp1"].tp2_price == pytest.approx(2508.0)    # tp1 + 40*0.1
+
+
+@pytest.mark.asyncio
+async def test_open_group_without_fast_pips_keeps_using_absolute_sl_tp_as_before():
+    """Full signals (real SL/TP1/TP2 from the channel) must be completely
+    unaffected -- fast_pips omitted means the old absolute-price behavior,
+    unchanged."""
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim), notifier=DummyNotifier())
+
+    group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
+
+    assert group_id is not None
+    by_leg = {t.leg: t for t in tm.trades.values()}
+    assert by_leg["tp1"].planned_sl == 2490.0
+    assert by_leg["tp1"].tp1_price == 2510.0
+    assert by_leg["tp1"].tp2_price == 2530.0
+
+
+@pytest.mark.asyncio
 async def test_open_group_recovers_from_transient_empty_tick_on_first_price_read():
     """
     Reproduces a real production incident: mt5linux opens a fresh RPyC

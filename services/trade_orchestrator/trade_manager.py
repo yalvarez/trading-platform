@@ -1,4 +1,4 @@
-from .trade_utils import safe_comment, parse_group_comment, pips_to_price
+from .trade_utils import safe_comment, parse_group_comment, pips_to_price, calcular_sl_default, calcular_tp_default
 from .channel_names import resolve_channel_name
 from .mt5_pool import MT5ConnectionStuckError
 from .event_messages import (
@@ -384,7 +384,9 @@ class TradeManager:
                 all_ok = False
         return all_ok
 
-    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: float, tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None, chat_id: Optional[str] = None) -> Optional[int]:
+    async def open_group(self, account: dict, *, symbol: str, direction: str, sl: Optional[float],
+                          tp1: Optional[float], tp2: Optional[float], entry_range: Optional[tuple] = None,
+                          chat_id: Optional[str] = None, fast_pips: Optional[dict] = None) -> Optional[int]:
         """
         Abre dos posiciones (tp1_leg, runner_leg) con el mismo symbol/direction/SL,
         vinculadas por un group_id nuevo. Ver dual-TP spec seccion 3.
@@ -403,6 +405,18 @@ class TradeManager:
           senal no trae chat_id (legacy) o si open_group se llama sin el
           (p. ej. en tests existentes) -- un grupo con chat_id=None queda
           huerfano de gestion automatica via /mgmt/action.
+        - fast_pips, si viene ({"sl": pips, "tp1": pips, "tp2_extra": pips}),
+          IGNORA los sl/tp1/tp2 absolutos recibidos y los recalcula aqui mismo
+          contra el precio que esta funcion ya obtiene mas abajo -- evita el
+          bug real de produccion (grupo 176, 2026-10-01) donde una senal fast
+          calculaba SL/TP absolutos en app.py contra un fetch de precio
+          PREVIO, y luego open_group volvia a pedir el precio para la orden
+          real: si el precio se movio entre ambos fetches, el SL/TP quedaba a
+          una distancia incorrecta del precio real de ejecucion -- suficiente
+          para violar el stops_level de una cuenta mas estricta (STARTRADER,
+          35) mientras la misma senal abria sin problema en otra mas laxa
+          (Vantage, 20). Con fast_pips, SL/TP se calculan contra el MISMO
+          precio usado para el order_send, sin ventana de drift.
         Retorna el group_id nuevo, o None si se aborto (unit invalido, SL invalido,
         sin precio disponible, o el precio nunca entro/ya paso el rango).
         """
@@ -410,7 +424,7 @@ class TradeManager:
         if not account:
             return None
 
-        if tp1 is not None and tp2 is not None:
+        if fast_pips is None and tp1 is not None and tp2 is not None:
             unit = (tp2 - tp1) if direction.upper() == "BUY" else (tp1 - tp2)
             if unit <= 0:
                 log.error("[TM][OPEN] Abortado: unit invalido (tp1=%s tp2=%s dir=%s) symbol=%s", tp1, tp2, direction, symbol)
@@ -420,7 +434,7 @@ class TradeManager:
                 )
                 return None
 
-        if sl is None or float(sl) == 0.0:
+        if fast_pips is None and (sl is None or float(sl) == 0.0):
             log.error("[TM][OPEN] Abortado: SL invalido symbol=%s", symbol)
             await self._notify(
                 "open_aborted", symbol=symbol, reason="invalid_sl",
@@ -447,6 +461,25 @@ class TradeManager:
                 await self._notify(
                     "open_aborted", symbol=symbol, reason="entry_range_missed", entry_range=list(entry_range),
                     message=f"Señal {direction.upper()} {symbol} no ejecutada: el precio no entro en el rango de entrada {lo}-{hi} dentro del tiempo de espera.",
+                )
+                return None
+
+        if fast_pips is not None:
+            # Calculado AQUI, contra el `price` que esta misma funcion acaba
+            # de fijar (no un fetch anterior en app.py) -- ver docstring.
+            point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
+            sl = calcular_sl_default(symbol, direction, price, point, float(fast_pips.get("sl", 0) or 0))
+            tp1_pips = float(fast_pips.get("tp1", 0) or 0)
+            tp1 = calcular_tp_default(symbol, direction, price, point, tp1_pips) if tp1_pips > 0 else None
+            tp2 = None
+            if tp1 is not None:
+                tp2_extra_pips = float(fast_pips.get("tp2_extra", 0) or 0)
+                tp2 = calcular_tp_default(symbol, direction, tp1, point, tp2_extra_pips) if tp2_extra_pips > 0 else None
+            if sl is None or float(sl) == 0.0:
+                log.error("[TM][OPEN] Abortado: SL invalido (fast_pips) symbol=%s", symbol)
+                await self._notify(
+                    "open_aborted", symbol=symbol, reason="invalid_sl",
+                    message=f"Señal {direction.upper()} {symbol} no ejecutada: SL invalido o ausente.",
                 )
                 return None
 
@@ -511,6 +544,14 @@ class TradeManager:
                 "comment": safe_comment(f"GRP{group_id}-{leg}", "TM"),
                 "type_time": 0,
             }
+            # DEBUG unicamente (no toca el flujo): deja el request exacto en el
+            # log para poder confirmar numericamente la causa de un futuro
+            # retcode 10016/INVALID_STOPS sin reconstruirlo a mano -- caso real
+            # grupo 176, 2026-10-01 (cuenta STARTRADER rechazo una senal fast
+            # que SI abrio en Vantage; no se pudo confirmar con certeza si fue
+            # drift de precio entre el fetch de app.py y el de open_group, o
+            # alguna otra diferencia de cuenta, por falta de este log).
+            log.debug("[TM][OPEN] req account=%s group_id=%s leg=%s req=%s", account.get("name"), group_id, leg, req)
             # Real production incident (2026-09-14): a hung order_send raised
             # a bare asyncio.TimeoutError that escaped open_group entirely --
             # the signal was silently dropped with no open_aborted/

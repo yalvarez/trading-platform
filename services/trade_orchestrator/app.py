@@ -157,27 +157,39 @@ async def _handle_signal_for_account(fields: dict, tradeManager: TradeManager, a
         # Si la señal completa llega despues, update_group_signal sobreescribe
         # ambos con los valores reales (ver trade_manager.py), y el trailing
         # sigue desde donde iba (peak_multiple se reescala, no se resetea).
-        client = tradeManager.mt5._client_for(account)
-        price = client.tick_price(symbol, direction)
         from services.common.config import config as _config
-        point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
-        from .trade_utils import calcular_sl_default, calcular_tp_default
-        if sl is None:
-            default_sl_pips = float(_config.get("DEFAULT_SL_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_SL_PIPS", 100))
-            sl = calcular_sl_default(symbol, direction, price, point, default_sl_pips)
+        if sl is not None:
+            # Caso raro: la propia senal fast ya trae un SL absoluto (el
+            # parser de TradePulse hoy nunca marca is_fast=True junto con un
+            # SL real, pero el campo es independiente -- no se descarta).
+            # Sigue el camino viejo (un solo fetch de precio aqui mismo,
+            # mismo riesgo de drift que antes para este caso puntual) porque
+            # un sl ya absoluto no es convertible a "pips desde el precio
+            # fresco de open_group" sin perder su significado.
+            client = tradeManager.mt5._client_for(account)
+            price = client.tick_price(symbol, direction)
+            point = 0.1 if symbol.upper().startswith("XAU") else 0.00001
+            from .trade_utils import calcular_tp_default
+            default_tp_pips = float(_config.get("DEFAULT_TP_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_TP_PIPS", 100))
+            default_tp1 = calcular_tp_default(symbol, direction, price, point, default_tp_pips) if default_tp_pips > 0 else None
+            default_tp2 = None
+            if default_tp1 is not None:
+                tp2_extra_pips = float(_config.get("DEFAULT_TP2_EXTRA_PIPS", 40))
+                default_tp2 = calcular_tp_default(symbol, direction, default_tp1, point, tp2_extra_pips)
+            await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2, chat_id=chat_id)
+            return
+
+        # Caso comun (100% de las senales fast reales de TradePulse hoy): SL/TP
+        # sinteticos en pips, calculados por open_group contra SU propio fetch
+        # de precio -- elimina el drift entre dos fetches separados (ver
+        # docstring de open_group, caso real grupo 176).
+        default_sl_pips = float(_config.get("DEFAULT_SL_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_SL_PIPS", 100))
         default_tp_pips = float(_config.get("DEFAULT_TP_XAUUSD_PIPS", 100)) if symbol.upper().startswith("XAU") else float(_config.get("DEFAULT_TP_PIPS", 100))
-        default_tp1 = calcular_tp_default(symbol, direction, price, point, default_tp_pips) if default_tp_pips > 0 else None
-        default_tp2 = None
-        if default_tp1 is not None:
-            # tp2 = tp1 + N pips (not "+1 point"): a 1-point unit made
-            # _apply_trailing's peak_multiple hypersensitive to tiny price
-            # ticks, sending an SL order_send on nearly every tick (~15 in
-            # 2 minutes observed live, group_id=23). DEFAULT_TP2_EXTRA_PIPS
-            # gives tp1/tp2 a real, configurable distance — the same order
-            # of magnitude a genuine signal's TP1/TP2 pair would have.
-            tp2_extra_pips = float(_config.get("DEFAULT_TP2_EXTRA_PIPS", 40))
-            default_tp2 = calcular_tp_default(symbol, direction, default_tp1, point, tp2_extra_pips)
-        await tradeManager.open_group(account, symbol=symbol, direction=direction, sl=sl, tp1=default_tp1, tp2=default_tp2, chat_id=chat_id)
+        tp2_extra_pips = float(_config.get("DEFAULT_TP2_EXTRA_PIPS", 40))
+        await tradeManager.open_group(
+            account, symbol=symbol, direction=direction, sl=None, tp1=None, tp2=None, chat_id=chat_id,
+            fast_pips={"sl": default_sl_pips, "tp1": default_tp_pips, "tp2_extra": tp2_extra_pips},
+        )
         return
 
     sl = float(sl_raw) if sl_raw else None
