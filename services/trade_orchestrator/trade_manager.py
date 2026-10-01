@@ -591,7 +591,8 @@ class TradeManager:
         )
         await self._persist_group(group_id)
 
-    def find_active_group_for_symbol(self, symbol: str, *, chat_id: Optional[str], direction: Optional[str] = None) -> Optional[int]:
+    def find_active_group_for_symbol(self, symbol: str, *, chat_id: Optional[str], direction: Optional[str] = None,
+                                      account_name: Optional[str] = None) -> Optional[int]:
         """
         Devuelve el group_id mas reciente con al menos una pierna abierta para
         `symbol` originado en `chat_id` (y, si viene, en `direction`), o None
@@ -601,11 +602,17 @@ class TradeManager:
         por simbolo: con dos canales XAUUSD permitidos, una señal completa de
         un canal sobrescribia SL/TP del grupo abierto del otro canal, y una
         señal SELL podia escribir sus niveles en un grupo BUY.
+        account_name, si viene, restringe la busqueda a grupos de esa cuenta
+        -- necesario quando la misma senal se replica en varias cuentas: sin
+        esto, dos cuentas con grupos activos para el mismo chat_id/symbol/
+        direction resolverian siempre al mismo group_id (el mas reciente
+        entre TODAS las cuentas), dejando el otro grupo sin actualizar.
         """
         candidates = [
             t for t in self.trades.values()
             if t.symbol == symbol and t.chat_id == chat_id
             and (direction is None or t.direction == direction.upper())
+            and (account_name is None or t.account_name == account_name)
         ]
         if not candidates:
             return None

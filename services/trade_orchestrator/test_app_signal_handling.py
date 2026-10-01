@@ -255,6 +255,136 @@ async def test_full_signal_without_prior_fast_opens_group_directly():
 # --- chat_id-scoping: handle_signal_fields must propagate chat_id to open_group ---
 
 @pytest.mark.asyncio
+async def test_full_signal_replicates_to_every_active_account_without_allowed_channels():
+    """Two active accounts, neither restricts allowed_channels -> both must
+    receive the same signal (default is 'all channels' when unset, so existing
+    single-account setups keep working unchanged)."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": True, "host": "y", "port": 2, "fixed_lot": 0.02},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, accounts), notifier=DummyNotifier())
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+    }
+    await handle_signal_fields(full_fields, tm, accounts)
+
+    assert len(tm.trades) == 4  # 2 legs x 2 accounts
+    account_names = {t.account_name for t in tm.trades.values()}
+    assert account_names == {"acct1", "acct2"}
+    group_ids_by_account = {}
+    for t in tm.trades.values():
+        group_ids_by_account.setdefault(t.account_name, set()).add(t.group_id)
+    assert len(group_ids_by_account["acct1"]) == 1
+    assert len(group_ids_by_account["acct2"]) == 1
+    assert group_ids_by_account["acct1"] != group_ids_by_account["acct2"]  # independent groups
+
+
+@pytest.mark.asyncio
+async def test_signal_only_goes_to_accounts_whose_allowed_channels_include_the_chat_id():
+    """acct2 restricts allowed_channels to a different chat_id -> a signal from
+    chat_id=111 must open only on acct1, not acct2."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": True, "host": "y", "port": 2, "fixed_lot": 0.02, "allowed_channels": ["222"]},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, accounts), notifier=DummyNotifier())
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+        "chat_id": "111",
+    }
+    await handle_signal_fields(full_fields, tm, accounts)
+
+    assert len(tm.trades) == 2  # only acct1's pair
+    account_names = {t.account_name for t in tm.trades.values()}
+    assert account_names == {"acct1"}
+
+
+@pytest.mark.asyncio
+async def test_inactive_account_never_receives_signals():
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": False, "host": "y", "port": 2, "fixed_lot": 0.02},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, accounts), notifier=DummyNotifier())
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+    }
+    await handle_signal_fields(full_fields, tm, accounts)
+
+    assert len(tm.trades) == 2
+    assert {t.account_name for t in tm.trades.values()} == {"acct1"}
+
+
+@pytest.mark.asyncio
+async def test_fast_signal_replicates_to_every_eligible_account():
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": True, "host": "y", "port": 2, "fixed_lot": 0.02},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, accounts), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, accounts)
+
+    assert len(tm.trades) == 4
+    assert {t.account_name for t in tm.trades.values()} == {"acct1", "acct2"}
+
+
+@pytest.mark.asyncio
+async def test_update_existing_group_signal_applies_per_account_not_just_first():
+    """A full signal arriving after a fast signal already opened groups on both
+    accounts must update BOTH groups' SL/TP, not just the first account's."""
+    from services.trade_orchestrator.app import handle_signal_fields
+
+    accounts = [
+        {"name": "acct1", "active": True, "host": "x", "port": 1, "fixed_lot": 0.05},
+        {"name": "acct2", "active": True, "host": "y", "port": 2, "fixed_lot": 0.02},
+    ]
+    sim = SimuladorMT5()
+    sim.price = 2500.0
+    tm = TradeManager(DummyExecutor(sim, accounts), notifier=DummyNotifier())
+
+    fast_fields = {"symbol": "XAUUSD", "direction": "BUY", "fast": "true", "sl": "", "tps": "[]", "entry_range": ""}
+    await handle_signal_fields(fast_fields, tm, accounts)
+    assert len(tm.trades) == 4
+
+    full_fields = {
+        "symbol": "XAUUSD", "direction": "BUY", "fast": "false",
+        "sl": "2490.0", "tps": json.dumps([2510.0, 2530.0]), "entry_range": "",
+    }
+    await handle_signal_fields(full_fields, tm, accounts)
+
+    assert len(tm.trades) == 4  # updated in place, not duplicated
+    for t in tm.trades.values():
+        assert t.tp1_price == 2510.0
+        assert t.tp2_price == 2530.0
+        assert t.planned_sl == 2490.0
+
+
+@pytest.mark.asyncio
 async def test_fast_signal_propagates_chat_id_to_both_legs():
     """router_parser already tags every parsed signal with chat_id
     (services/router_parser/app.py: sig["chat_id"] = chat_id) -- this is the

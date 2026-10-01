@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import logging.handlers
+from typing import Optional
 
 from services.common.config import Settings
 from services.common.redis_streams import redis_client, xread_loop, Streams
@@ -58,11 +59,32 @@ def parse_channel_names_json(raw: str) -> dict:
         return {}
 
 
+def _accounts_for_signal(accounts: list[dict], chat_id: Optional[str]) -> list[dict]:
+    """
+    Cuentas activas elegibles para una senal de `chat_id`. Una cuenta sin
+    allowed_channels configurado acepta cualquier canal (default: comportamiento
+    de una sola cuenta de siempre, sin filtrar nada). Una cuenta CON
+    allowed_channels solo recibe senales de chat_id presentes en esa lista
+    (comparacion por string, ya que chat_id llega como string desde Streams
+    pero ACCOUNTS_JSON puede traerlo como int).
+    """
+    eligible = []
+    for a in accounts:
+        if not a.get("active"):
+            continue
+        allowed = a.get("allowed_channels")
+        if allowed and str(chat_id) not in {str(c) for c in allowed}:
+            continue
+        eligible.append(a)
+    return eligible
+
+
 async def handle_signal_fields(fields: dict, tradeManager: TradeManager, accounts: list[dict]) -> None:
     """
     Procesa un mensaje de Streams.SIGNALS (senal fast o completa de TradePulse)
     y lo traduce a open_group/update_group_signal en el TradeManager
-    (dual-TP spec seccion 3).
+    (dual-TP spec seccion 3), replicando en cada cuenta activa elegible para
+    el chat_id de la senal (ver _accounts_for_signal).
     """
     symbol = fields.get("symbol")
     direction = fields.get("direction")
@@ -73,24 +95,34 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     entry_range_raw = fields.get("entry_range", "")
     entry_range = tuple(json.loads(entry_range_raw)) if entry_range_raw and entry_range_raw != "[]" else None
 
-    account = next((a for a in accounts if a.get("active")), None)
-    if not account:
-        log.error("[SIGNAL] No hay cuenta activa configurada. Abortando.")
+    target_accounts = _accounts_for_signal(accounts, chat_id)
+    if not target_accounts:
+        log.error("[SIGNAL] Ninguna cuenta activa elegible para chat_id=%s. Abortando.", chat_id)
         return
 
     # Señal contraria a un grupo abierto del mismo canal: cerrar primero los que
     # aun no llegaron a TP1, luego abrir (ver close_opposite_groups_before_tp1,
     # caso real 2026-09-25). CLOSE_ON_OPPOSITE_SIGNAL=off lo desactiva.
+    # Account-agnostico: cierra el/los grupo(s) de ese chat_id/symbol/direction
+    # en cualquier cuenta donde esten abiertos, no solo en target_accounts.
     from services.common.config import config as _config
     if str(_config.get("CLOSE_ON_OPPOSITE_SIGNAL", "before_tp1")).strip().lower() == "before_tp1":
         await tradeManager.close_opposite_groups_before_tp1(chat_id=chat_id, symbol=symbol, direction=direction)
 
+    for account in target_accounts:
+        await _handle_signal_for_account(fields, tradeManager, account, symbol=symbol, direction=direction,
+                                          chat_id=chat_id, is_fast=is_fast, sl_raw=sl_raw, tps=tps,
+                                          entry_range=entry_range)
+
+
+async def _handle_signal_for_account(fields: dict, tradeManager: TradeManager, account: dict, *, symbol, direction,
+                                      chat_id, is_fast, sl_raw, tps, entry_range) -> None:
     if is_fast:
         # Solo grupos del mismo canal Y la misma direccion: el grupo reciente de
         # OTRO canal no hace que esta señal sea un duplicado, y una fast en la
         # direccion contraria tampoco (antes cualquier fast dentro del cooldown
         # se ignoraba, asi que un giro rapido del canal no cerraba ni abria nada).
-        existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction)
+        existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction, account_name=account["name"])
         if existing_group_id is not None:
             # find_active_group_for_symbol no tiene nocion de tiempo: sin este
             # cooldown, CUALQUIER señal fast nueva del mismo simbolo se ignoraria
@@ -155,7 +187,7 @@ async def handle_signal_fields(fields: dict, tradeManager: TradeManager, account
     # Mismo canal Y misma direccion: una señal completa solo completa/actualiza
     # un grupo propio en su direccion -- nunca el grupo de otro canal, ni
     # escribe niveles SELL en un grupo BUY (o viceversa).
-    existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction)
+    existing_group_id = tradeManager.find_active_group_for_symbol(symbol, chat_id=chat_id, direction=direction, account_name=account["name"])
     if existing_group_id is not None:
         await tradeManager.update_group_signal(existing_group_id, sl=sl, tp1=tp1, tp2=tp2)
         return
