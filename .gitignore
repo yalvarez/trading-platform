@@ -46,6 +46,12 @@ build/
 
 # Logs
 *.log
+*.log.*
 logs/
 .superpowers
 services/telegram_ingestor/telegram_ingestor.session
+
+# Exports de historial de Telegram (scripts/export_telegram_history.py), para analisis/backtests.
+data/telegram_history/
+data/backtests/
+data/telegram_capture/
