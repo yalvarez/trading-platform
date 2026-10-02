@@ -8,6 +8,7 @@ from .event_messages import (
     build_group_opened_message,
     build_tp1_hit_message,
     build_tp2_partial_closed_message,
+    build_tp2_hit_message,
     build_close_now_message,
     build_opposite_signal_close_message,
     build_move_sl_be_applied_message,
@@ -115,7 +116,16 @@ class ManagedTrade:
 
 
 class TradeManager:
-    def __init__(self, mt5_executor, *, notifier=None, event_bus=None, config_provider=None, state_store=None, channel_names=None):
+    RUNNER_MODES = ("fixed_tp2", "trailing")
+
+    def __init__(self, mt5_executor, *, notifier=None, event_bus=None, config_provider=None, state_store=None,
+                 channel_names=None, runner_mode: str = "trailing"):
+        # fixed_tp2 (strategy C, 3-month backtest 2026-10-02): runner keeps a real
+        # broker TP at tp2 and its SL stays at BE after tp1 -- no TP2 partial, no
+        # trailing. trailing: the previous mechanic (TP2 50% partial + trailing).
+        if runner_mode not in self.RUNNER_MODES:
+            raise ValueError(f"runner_mode invalido: {runner_mode!r} (validos: {self.RUNNER_MODES})")
+        self.runner_mode = runner_mode
         self.mt5 = mt5_executor
         self.notifier = notifier
         self.event_bus = event_bus
@@ -128,6 +138,13 @@ class TradeManager:
         # clasificarlos como cierre externo en la ventana entre el cierre en MT5
         # y el pop de self.trades (ver apply_mgmt_action, rama close_now).
         self._mgmt_closing: set[int] = set()
+
+    def _broker_tp_for_leg(self, leg: str, tp1: Optional[float], tp2: Optional[float]) -> float:
+        if leg == "tp1":
+            return float(tp1) if tp1 is not None else 0.0
+        if self.runner_mode == "fixed_tp2" and tp2 is not None:
+            return float(tp2)
+        return 0.0
 
     def _ensure_account_dict(self, account):
         if isinstance(account, dict):
@@ -538,7 +555,7 @@ class TradeManager:
                 "type": order_type,
                 "price": float(price),
                 "sl": float(sl),
-                "tp": float(tp1) if (leg == "tp1" and tp1 is not None) else 0.0,
+                "tp": self._broker_tp_for_leg(leg, tp1, tp2),
                 "deviation": 50,
                 "magic": MAGIC,
                 "comment": safe_comment(f"GRP{group_id}-{leg}", "TM"),
@@ -646,9 +663,9 @@ class TradeManager:
         """
         Aplica valores nuevos de SL/TP1/TP2 a ambas piernas de un grupo existente.
         Usado tanto para el update fast->full (dual-TP spec seccion 3) como para
-        signal_correction via /mgmt/action (dual-TP spec seccion 5.2) — una
-        correccion de tp2 solo actualiza la referencia usada por el trailing,
-        nunca toca MT5 directamente para la pierna runner.
+        signal_correction via /mgmt/action (dual-TP spec seccion 5.2). En
+        runner_mode=fixed_tp2 un cambio de tp2 mueve el TP real del runner en
+        MT5; en trailing solo actualiza la referencia usada por el trailing.
         """
         legs = [t for t in self.trades.values() if t.group_id == group_id]
         if not legs:
@@ -686,7 +703,7 @@ class TradeManager:
                 t.tp2_price = float(tp2)
 
             new_sl = t.planned_sl
-            new_tp = t.tp1_price if (t.leg == "tp1" and t.tp1_price is not None) else 0.0
+            new_tp = self._broker_tp_for_leg(t.leg, t.tp1_price, t.tp2_price)
 
             # Never regress a live SL that's already better than the new planned_sl
             # ONLY once real management (BE/trailing) has actually moved it — that's
@@ -864,6 +881,19 @@ class TradeManager:
                     cause = classification["cause"]
                     if cause == "tp1":
                         await self._on_tp1_leg_closed(account, client, closed_trade)
+                    elif cause == "tp2":
+                        channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
+                        message = build_tp2_hit_message(
+                            channel_name=channel_name, group_id=closed_trade.group_id, symbol=closed_trade.symbol,
+                            direction=closed_trade.direction, close_price=classification["price"],
+                            close_volume=classification["volume"], pnl_money=classification["profit"],
+                        )
+                        await self._notify(
+                            "tp2_hit", channel="both", group_id=closed_trade.group_id, chat_id=closed_trade.chat_id,
+                            channel_name=channel_name, symbol=closed_trade.symbol, direction=closed_trade.direction,
+                            leg=closed_trade.leg, close_price=classification["price"], close_volume=classification["volume"],
+                            pnl_money=classification["profit"], message=message,
+                        )
                     elif cause == "sl":
                         channel_name = resolve_channel_name(closed_trade.chat_id, self._channel_names())
                         message = build_sl_hit_message(
@@ -952,7 +982,7 @@ class TradeManager:
             for ticket, t in [(tk, mt) for tk, mt in self.trades.items() if mt.account_name == account["name"]]:
                 try:
                     pos = pos_by_ticket.get(ticket)
-                    if not pos or t.leg != "runner" or not t.be_applied:
+                    if self.runner_mode != "trailing" or not pos or t.leg != "runner" or not t.be_applied:
                         continue
                     await self._apply_tp2_partial_close(account, client, t, pos)
                     # Re-fetch: partial_close above may have changed this position's
@@ -989,6 +1019,8 @@ class TradeManager:
         reason = info["reason"]
         if reason == self.DEAL_REASON_TP and closed_trade.leg == "tp1":
             cause = "tp1"
+        elif reason == self.DEAL_REASON_TP and closed_trade.leg == "runner":
+            cause = "tp2"
         elif reason == self.DEAL_REASON_SL:
             cause = "sl"
         elif reason is not None:
@@ -1263,9 +1295,8 @@ class TradeManager:
         # tp explicito, nunca omitido: omitir "tp" en un request action=6
         # puede limpiar o preservar el TP existente segun el broker, asi que
         # siempre lo fijamos explicitamente en vez de depender de ese
-        # comportamiento implicito. El runner nunca lleva un TP real en MT5
-        # (su unica salida mecanica es el trailing SL), asi que para el
-        # sigue siendo 0.0 -- pero la pierna tp1 SI tiene un TP fijo real en
+        # comportamiento implicito. El runner lleva TP real en tp2 solo en
+        # runner_mode=fixed_tp2 (en trailing es 0.0) -- y la pierna tp1 SI tiene un TP fijo real en
         # el broker (real production bug, group 132, 2026-09-14: mover BE a
         # la pierna tp1 via este mismo helper, ya sea desde move_sl_be_now o
         # el BE automatico de close_partial_now, mandaba tp=0.0
@@ -1273,7 +1304,7 @@ class TradeManager:
         # sin ninguna orden ahi que lo ejecutara, y la pierna quedo viva
         # hasta que el precio retrocedio y toco el SL en BE en su lugar, un
         # viaje de ida y vuelta completo que el TP fijo habria evitado).
-        tp_to_keep = runner.tp1_price if (runner.leg == "tp1" and runner.tp1_price is not None) else 0.0
+        tp_to_keep = self._broker_tp_for_leg(runner.leg, runner.tp1_price, runner.tp2_price)
         req = {"action": 6, "position": runner.ticket, "sl": float(new_sl), "tp": float(tp_to_keep)}
         ok = False
         for attempt in range(1, attempts + 1):

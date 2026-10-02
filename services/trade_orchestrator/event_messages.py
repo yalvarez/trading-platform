@@ -50,6 +50,15 @@ def build_tp1_hit_message(*, channel_name, group_id, symbol, direction, close_pr
     )
 
 
+def build_tp2_hit_message(*, channel_name, group_id, symbol, direction, close_price, close_volume, pnl_money) -> str:
+    return (
+        f"\U0001F3AF TP2 ALCANZADO — Canal: {channel_name} (grupo {group_id})\n"
+        f"{symbol} {_fmt_direction(direction)}\n"
+        f"Runner cerrado: {close_volume} lots @ {_fmt_price(close_price)}\n"
+        f"Resultado: {_fmt_money(pnl_money)} USD"
+    )
+
+
 def build_tp1_hit_be_failed_message(*, channel_name, group_id, symbol, direction, runner_ticket) -> str:
     """
     TP1 se alcanzo pero el runner NO pudo moverse a breakeven tras 3 intentos:

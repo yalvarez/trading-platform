@@ -264,10 +264,12 @@ async def main():
         config_provider=_config,
     )
     state_store = TradeStateStore(r, os.path.join(os.path.dirname(__file__), "..", "..", "data", "trade_state.jsonl"))
+    runner_mode = str(_config.get("RUNNER_MODE", "fixed_tp2")).strip().lower()
     tradeManager = TradeManager(
         tradeExecutor, event_bus=event_bus, config_provider=_config, state_store=state_store,
-        channel_names=channel_names,
+        channel_names=channel_names, runner_mode=runner_mode,
     )
+    log.info("[TM] runner_mode=%s", runner_mode)
 
     reconciliation_summary = await tradeManager.reconcile_from_mt5(accounts)
     log.info("[RECONCILE] al arranque: %s", reconciliation_summary)
