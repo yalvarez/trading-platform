@@ -20,13 +20,15 @@ import datetime as dt
 import json
 import os
 
-from dotenv import dotenv_values
 from telethon import TelegramClient
 
 CHANNELS = {
     "tradepulse": -1003321565807,
     "ahmed": -1002841150806,
     "goldbrothers": -1003816701426,
+    "veritas": -1003236994394,
+    "torofx": -1001558718570,
+    "dailysig": -1002025086488,
 }
 
 
@@ -43,8 +45,20 @@ def _msg_to_dict(m) -> dict:
     }
 
 
+def _read_env(path: str = ".env") -> dict:
+    """Lee KEY=VALUE de .env sin depender de python-dotenv (no esta en todas las imagenes)."""
+    env = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip("'\"")
+    return env
+
+
 async def export(session: str, days: int, out_dir: str, names: list[str]) -> None:
-    env = dotenv_values(".env")
+    env = _read_env()
     client = TelegramClient(session, int(env["TG_API_ID"]), env["TG_API_HASH"])
     await client.connect()
     if not await client.is_user_authorized():
@@ -59,8 +73,10 @@ async def export(session: str, days: int, out_dir: str, names: list[str]) -> Non
                 break
             msgs.append(_msg_to_dict(m))
         msgs.reverse()
+        entity = await client.get_entity(chat_id)
         doc = {
             "channel": name,
+            "title": getattr(entity, "title", None),
             "chat_id": chat_id,
             "exported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "since": since.isoformat(),
