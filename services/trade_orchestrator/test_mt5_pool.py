@@ -145,3 +145,79 @@ def test_symbol_info_goes_through_the_lock(pooled_client):
     assert client.symbol_info("XAUUSD") == "info"
     instance.symbol_info.assert_called_once_with("XAUUSD")
     instance.mt5.symbol_info.assert_not_called()
+
+
+# --- No resending non-idempotent calls (2026-10-05). Production evidence: in
+# every log since 2026-09-14 the pool resent order_send after "result expired"
+# 22 times -- 19 trailing SL moves (harmless to repeat) and 3 opens (groups
+# 170, 171, 204). All 3 opens executed TWICE in MT5: "result expired" means the
+# request DID reach the terminal and only the answer was lost, so the resend
+# always duplicated the position and never rescued a missed one. ---
+
+def _pool_with_failing_first_call(method_name, *, fail_with=Exception("result expired")):
+    """PooledMT5Client whose first underlying `method_name` call raises, and a
+    reconnected client that would succeed -- to observe whether it resends."""
+    patcher = patch("services.common.mt5_client.MT5Client")
+    MockMT5Client = patcher.start()
+    first, reconnected = MagicMock(name="first"), MagicMock(name="reconnected")
+    MockMT5Client.side_effect = [first, reconnected]
+    getattr(first, method_name).side_effect = fail_with
+    getattr(reconnected, method_name).return_value = "resent-result"
+    client = PooledMT5Client("mt5_acct1", 8001)
+    return client, first, reconnected, patcher
+
+
+def test_order_send_opening_a_position_is_never_resent_after_an_error():
+    client, first, reconnected, patcher = _pool_with_failing_first_call("order_send")
+    try:
+        with pytest.raises(Exception, match="result expired"):
+            client.order_send({"action": 1, "symbol": "XAUUSD", "volume": 0.02})
+        first.order_send.assert_called_once()
+        reconnected.order_send.assert_not_called()
+    finally:
+        patcher.stop()
+
+
+def test_order_send_still_reconnects_after_a_non_resent_failure():
+    """Not resending must not leave the dead connection in place: the next
+    call has to go through the reconnected client."""
+    client, first, reconnected, patcher = _pool_with_failing_first_call("order_send")
+    try:
+        with pytest.raises(Exception):
+            client.order_send({"action": 1})
+        reconnected.positions_get.return_value = ["pos"]
+        assert client.positions_get() == ["pos"]
+    finally:
+        patcher.stop()
+
+
+def test_order_send_modifying_sl_tp_is_still_resent_after_reconnect():
+    """action=6 (TRADE_ACTION_SLTP) sets absolute SL/TP values: sending it twice
+    leaves the position exactly as sending it once -- safe to resend, and the 19
+    real trailing resends since 2026-09-14 relied on it."""
+    client, first, reconnected, patcher = _pool_with_failing_first_call("order_send")
+    try:
+        assert client.order_send({"action": 6, "position": 1, "sl": 1.0, "tp": 2.0}) == "resent-result"
+        reconnected.order_send.assert_called_once()
+    finally:
+        patcher.stop()
+
+
+def test_partial_close_is_never_resent_after_an_error():
+    """A resent 50% partial would close 50% of the remainder too (~75% total)."""
+    client, first, reconnected, patcher = _pool_with_failing_first_call("partial_close")
+    try:
+        with pytest.raises(Exception, match="result expired"):
+            client.partial_close({}, 123, 50)
+        first.partial_close.assert_called_once()
+        reconnected.partial_close.assert_not_called()
+    finally:
+        patcher.stop()
+
+
+def test_read_calls_are_still_resent_after_reconnect():
+    client, first, reconnected, patcher = _pool_with_failing_first_call("positions_get")
+    try:
+        assert client.positions_get() == "resent-result"
+    finally:
+        patcher.stop()

@@ -228,13 +228,26 @@ class PooledMT5Client:
             raise MT5ConnectionStuckError(f"MT5 {self.host}:{self.port} atascado ({method}) tambien en la conexion nueva")
         return conn
 
-    def _call(self, method: str, *args, **kwargs):
-        """Ejecuta un metodo del cliente, reconectando si es necesario."""
+    def _call(self, method: str, *args, resend: bool = True, **kwargs):
+        """Ejecuta un metodo del cliente, reconectando si es necesario.
+
+        resend=False: tras un error se reconecta igual (la siguiente llamada usa
+        la conexion nueva) pero NO se reenvia la llamada, se relanza el error.
+        Para operaciones no idempotentes (abrir, cierre parcial): un "result
+        expired" significa que la orden SI llego a la terminal y solo se perdio
+        la respuesta -- reenviarla duplico la posicion en los 3 casos reales
+        (grupos 170, 171, 204), sin rescatar nunca una orden perdida.
+        """
         conn = self._acquire_replacing_if_stuck(method)
         try:
             try:
                 return getattr(conn.client, method)(*args, **kwargs)
             except Exception as e:
+                if not resend:
+                    log.warning("[PooledMT5Client] Error en %s.%s: %s — reconectando SIN reenviar "
+                                "(operacion no idempotente, puede haberse ejecutado)", self.host, method, e)
+                    self._reconnect(conn)
+                    raise
                 log.warning("[PooledMT5Client] Error en %s.%s: %s — intentando reconexion", self.host, method, e)
                 if self._reconnect(conn):
                     try:
@@ -264,11 +277,14 @@ class PooledMT5Client:
     def positions_get(self, *args, **kwargs):
         return self._call("positions_get", *args, **kwargs)
 
+    TRADE_ACTION_SLTP = 6
+
     def order_send(self, req: dict):
-        return self._call("order_send", req)
+        # Solo modificar SL/TP (valores absolutos) es seguro de repetir.
+        return self._call("order_send", req, resend=req.get("action") == self.TRADE_ACTION_SLTP)
 
     def partial_close(self, account: dict, ticket: int, percent: int) -> bool:
-        return self._call("partial_close", account, ticket, percent)
+        return self._call("partial_close", account, ticket, percent, resend=False)
 
     def get_pip_size(self, symbol: str) -> float:
         return self._call("get_pip_size", symbol)
