@@ -194,6 +194,27 @@ class TradeManager:
         except (TypeError, ValueError):
             return default
 
+    def _cap_tp1(self, symbol: str, direction: str, entry: Optional[float], tp1: Optional[float]) -> Optional[float]:
+        """
+        TP1_MAX_DISTANCE (precio, 0/vacio = off): acerca un TP1 mas lejano que
+        eso desde la entrada. TP2 no se toca. Backtest 3 meses 2026-10-05: el
+        TP1 tipico de TradePulse esta a ~30; con tope 35 cambian 16 de 106
+        grupos, +$190 y mejora tanto jun-ago como sep (caso real grupos
+        206/207: TP1 a 49, el precio llego a la mitad y volvio al SL).
+        """
+        max_dist = self._cfg_float("TP1_MAX_DISTANCE", 0.0)
+        if tp1 is None or entry is None or max_dist <= 0:
+            return tp1
+        is_buy = direction.upper() == "BUY"
+        dist = (tp1 - entry) if is_buy else (entry - tp1)
+        if dist <= max_dist:
+            return tp1
+        digits = 2 if symbol.upper().startswith("XAU") else 5
+        capped = round(entry + max_dist if is_buy else entry - max_dist, digits)
+        log.info("[TM] TP1 recortado por TP1_MAX_DISTANCE=%s: %s -> %s (entrada %s, %s)",
+                 max_dist, tp1, capped, entry, direction.upper())
+        return capped
+
     def _broker_tp_for_leg(self, leg: str, tp1: Optional[float], tp2: Optional[float]) -> float:
         if leg == "tp1":
             return float(tp1) if tp1 is not None else 0.0
@@ -555,6 +576,9 @@ class TradeManager:
                 )
                 return None
 
+        if fast_pips is None:
+            tp1 = self._cap_tp1(symbol, direction, price, tp1)
+
         order_type = 0 if direction.upper() == "BUY" else 1
         try:
             filling_modes = filling_modes_for(await self._call(client.symbol_info, symbol))
@@ -840,6 +864,11 @@ class TradeManager:
         MT5; en trailing solo actualiza la referencia usada por el trailing.
         """
         pending = self._pending.get(group_id)
+        legs = [t for t in self.trades.values() if t.group_id == group_id]
+        if tp1 is not None and (legs or pending is not None):
+            ref = legs[0] if legs else pending
+            entry = legs[0].entry_price if legs else pending.price
+            tp1 = self._cap_tp1(ref.symbol, ref.direction, entry, float(tp1))
         if pending is not None:
             # Los niveles nuevos se aplican a la pierna en cuanto MT5 la confirme
             # (_adopt_pending_leg), igual que si hubiera abierto a tiempo.
@@ -849,7 +878,6 @@ class TradeManager:
                 pending.tp1 = float(tp1)
             if tp2 is not None:
                 pending.tp2 = float(tp2)
-        legs = [t for t in self.trades.values() if t.group_id == group_id]
         if not legs:
             if pending is not None:
                 log.info("[TM] group %s (pendiente de confirmacion) actualizado: sl=%s tp1=%s tp2=%s",
