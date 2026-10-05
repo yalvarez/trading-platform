@@ -115,6 +115,40 @@ class ManagedTrade:
         return self.tp2_partial_skipped_volume is not None
 
 
+@dataclass
+class PendingGroup:
+    """
+    Grupo cuya apertura quedo sin confirmar: order_send no respondio a tiempo
+    (o lanzo un error de conexion) y MT5 tampoco mostraba la posicion. Eso NO
+    prueba que la orden no se ejecuto -- caso real grupo 204 (2026-10-05): la
+    terminal de Vantage estuvo colgada ~100s y lleno la orden 99s despues de
+    enviada, cuando el grupo ya se habia dado por fallido; la posicion quedo
+    sin gestion (sin la actualizacion de la señal completa, fuera del alcance
+    del close_now). Mientras esta pendiente el grupo sigue siendo visible para
+    la señal completa, el filtro de duplicados fast y los cierres del canal;
+    _reconcile_untracked_positions lo adopta en cuanto la posicion aparece.
+    """
+    group_id: int
+    account_name: str
+    symbol: str
+    direction: str
+    chat_id: Optional[str]
+    sl: float
+    tp1: Optional[float]
+    tp2: Optional[float]
+    price: float  # precio con el que se envio la orden
+    unconfirmed_legs: set  # enviadas, sin confirmacion de MT5
+    unsent_legs: list  # nunca enviadas (las que seguian a la pierna sin confirmar)
+    failure_kind: str  # "timeout" (la orden llego a la terminal) | "error" (pudo no llegar)
+    created_ts: float
+    deadline_ts: float
+    expired: bool = False
+    cancel_reason: Optional[str] = None  # texto del cierre del canal recibido mientras estaba pendiente
+    resend_attempted: bool = False
+    be_requested: bool = False  # el canal pidio BE/parcial antes de que hubiera piernas confirmadas
+    notes: list = field(default_factory=list)
+
+
 class TradeManager:
     RUNNER_MODES = ("fixed_tp2", "trailing")
 
@@ -138,6 +172,27 @@ class TradeManager:
         # clasificarlos como cierre externo en la ventana entre el cierre en MT5
         # y el pop de self.trades (ver apply_mgmt_action, rama close_now).
         self._mgmt_closing: set[int] = set()
+        # Aperturas sin confirmar (ver PendingGroup) y grupos con open_group en
+        # curso (sus posiciones existen en MT5 antes de entrar a self.trades: la
+        # reconciliacion del tick no debe tomarlas por huerfanas).
+        self._pending: dict[int, PendingGroup] = {}
+        self._opening_groups: set[int] = set()
+        # (account_name, ticket) -> primera vez vista en MT5 sin estar en
+        # self.trades. Solo se adopta tras adopt_grace_seconds: una foto de
+        # positions_get tomada justo antes de que close_now cierre una pierna
+        # todavia la muestra, y no debe re-adoptarse.
+        self._untracked_seen: dict[tuple, float] = {}
+        self.adopt_grace_seconds = 3.0
+        # Grupos cuyo tp1 ya cerro en TP: un runner adoptado despues (tardio u
+        # huerfano) se mueve a BE al adoptarlo, como habria pasado a tiempo.
+        self._tp1_hit_groups: set[int] = set()
+
+    def _cfg_float(self, key: str, default: float) -> float:
+        raw = self.config_provider.get(key, None) if self.config_provider else os.getenv(key)
+        try:
+            return float(raw) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
 
     def _broker_tp_for_leg(self, leg: str, tp1: Optional[float], tp2: Optional[float]) -> float:
         if leg == "tp1":
@@ -534,33 +589,141 @@ class TradeManager:
             orphan_note = ""
             if real_tp1 is not None or real_runner is not None:
                 tickets_found = [t for t in (real_tp1, real_runner) if t is not None]
+                untracked = {leg for leg, t in (("tp1", real_tp1), ("runner", real_runner))
+                             if t is not None and int(t.ticket) not in self.trades}
+                if untracked and group_id in self._pending:
+                    self._pending[group_id].unconfirmed_legs.update(untracked)
+                elif untracked:
+                    # La reconciliacion del tick las adopta por este registro:
+                    # con su canal y niveles, no como huerfanas sin canal.
+                    now = time.time()
+                    self._pending[group_id] = PendingGroup(
+                        group_id=group_id, account_name=account["name"], symbol=symbol,
+                        direction=direction.upper(), chat_id=chat_id, sl=float(sl), tp1=tp1, tp2=tp2,
+                        price=float(price), unconfirmed_legs=untracked, unsent_legs=[], failure_kind="timeout",
+                        created_ts=now, deadline_ts=now + self._pending_timeout_seconds("timeout"),
+                    )
+                managed = all(int(t.ticket) in self.trades for t in tickets_found)
                 orphan_note = (f" ADVERTENCIA: {len(tickets_found)} pierna(s) SI se abrieron en MT5 "
-                                f"(tickets={[int(t.ticket) for t in tickets_found]}) y quedaron sin gestion -- "
-                                f"revisar manualmente.")
+                                f"(tickets={[int(t.ticket) for t in tickets_found]}) y " +
+                                ("quedaron bajo gestion." if managed else
+                                 "se pondran bajo gestion automaticamente en unos segundos -- revisar el aviso."))
             await self._notify(
                 "open_failed", symbol=symbol, group_id=group_id, reason="unexpected_error",
                 message=f"Grupo {group_id} ({symbol}): error inesperado abriendo el grupo ({e}).{orphan_note}",
             )
             return None
 
+    def _leg_request(self, account: dict, group_id: int, leg: str, *, symbol: str, order_type: int, price: float,
+                     sl: float, tp1: Optional[float], tp2: Optional[float]) -> dict:
+        return {
+            "action": 1,
+            "symbol": symbol,
+            "volume": float(account.get("fixed_lot", 0.01) or 0.01),
+            "type": order_type,
+            "price": float(price),
+            "sl": float(sl),
+            "tp": self._broker_tp_for_leg(leg, tp1, tp2),
+            "deviation": 50,
+            "magic": MAGIC,
+            "comment": safe_comment(f"GRP{group_id}-{leg}", "TM"),
+            "type_time": 0,
+        }
+
+    async def _send_open_order(self, client, req: dict, filling_modes: list, *, leg: str, group_id: int):
+        """
+        Envia la orden de apertura de una pierna. Devuelve (res, outcome):
+        outcome "sent" (hay respuesta de MT5, buena o mala), "not_sent" (el pool
+        fallo antes de enviarla: MT5ConnectionStuckError), "timeout" (enviada,
+        sin respuesta a tiempo -- la terminal la tiene y puede ejecutarla
+        tarde) o "error" (excepcion de conexion: pudo llegar o no).
+        type_filling sale de lo que el simbolo declara (filling_modes_for), y
+        solo se reintenta con el siguiente modo ante INVALID_FILL: otro rechazo
+        cualquiera nunca se reenvia (no duplicar ordenes).
+        """
+        res = None
+        for attempt, filling in enumerate(filling_modes):
+            req["type_filling"] = filling
+            try:
+                res = await self._call(client.order_send, req)
+            except MT5ConnectionStuckError:
+                return None, "not_sent"
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                # TimeoutError builtin: el "result expired" de rpyc (en Python 3.10
+                # no es asyncio.TimeoutError). La orden llego a la terminal.
+                log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s: %s",
+                          leg, req["symbol"], group_id, e or "sin respuesta")
+                return None, "timeout"
+            except Exception as e:
+                log.error("[TM][OPEN] error de conexion abriendo leg=%s symbol=%s group_id=%s: %s",
+                          leg, req["symbol"], group_id, e)
+                return None, "error"
+            if getattr(res, "retcode", None) == TRADE_RETCODE_INVALID_FILL and attempt < len(filling_modes) - 1:
+                log.warning("[TM][OPEN] filling mode %s rechazado (10030) leg=%s symbol=%s -- probando %s",
+                            filling, leg, req["symbol"], filling_modes[attempt + 1])
+                continue
+            break
+        return res, "sent"
+
+    def _insert_leg(self, account: dict, group_id: int, leg: str, ticket: int, *, symbol: str, direction: str,
+                    sl: float, tp1: Optional[float], tp2: Optional[float], entry_price: float,
+                    chat_id: Optional[str]) -> ManagedTrade:
+        trade = ManagedTrade(
+            account_name=account["name"],
+            ticket=ticket,
+            symbol=symbol,
+            direction=direction.upper(),
+            group_id=group_id,
+            leg=leg,
+            planned_sl=float(sl),
+            tp1_price=float(tp1) if tp1 is not None else None,
+            tp2_price=float(tp2) if tp2 is not None else None,
+            entry_price=float(entry_price),
+            chat_id=chat_id,
+        )
+        self.trades[ticket] = trade
+        TRADES_OPENED.inc()
+        ACTIVE_TRADES.set(len(self.trades))
+        return trade
+
+    async def _notify_group_opened(self, account: dict, group_id: int, *, symbol: str, direction: str, sl: float,
+                                   tp1: Optional[float], tp2: Optional[float], entry_price: float,
+                                   chat_id: Optional[str], note: str = "") -> None:
+        legs = {t.leg: t.ticket for t in self.trades.values() if t.group_id == group_id}
+        channel_name = resolve_channel_name(chat_id, self._channel_names())
+        message = build_group_opened_message(
+            channel_name=channel_name, group_id=group_id, symbol=symbol, direction=direction,
+            entry_price=entry_price, sl=sl, tp1=tp1, tp2=tp2, volume=account.get("fixed_lot", 0.01),
+        )
+        if note:
+            message = f"{message}\n{note}"
+        await self._notify(
+            "group_opened", channel="both", group_id=group_id, symbol=symbol, direction=direction,
+            tp1_ticket=legs.get("tp1"), runner_ticket=legs.get("runner"), sl=sl, tp1=tp1, tp2=tp2,
+            chat_id=chat_id, channel_name=channel_name, entry_price=entry_price, volume=account.get("fixed_lot", 0.01),
+            message=message,
+        )
+
     async def _open_group_legs(self, account: dict, client, group_id: int, *, symbol: str, direction: str,
                                 order_type: int, sl: float, tp1: Optional[float], tp2: Optional[float],
                                 price: float, chat_id: Optional[str], filling_modes: list) -> Optional[int]:
+        self._opening_groups.add(group_id)
+        try:
+            return await self._open_group_legs_inner(
+                account, client, group_id, symbol=symbol, direction=direction, order_type=order_type,
+                sl=sl, tp1=tp1, tp2=tp2, price=price, chat_id=chat_id, filling_modes=filling_modes,
+            )
+        finally:
+            self._opening_groups.discard(group_id)
+
+    async def _open_group_legs_inner(self, account: dict, client, group_id: int, *, symbol: str, direction: str,
+                                      order_type: int, sl: float, tp1: Optional[float], tp2: Optional[float],
+                                      price: float, chat_id: Optional[str], filling_modes: list) -> Optional[int]:
         tickets = {}
-        for leg in ("tp1", "runner"):
-            req = {
-                "action": 1,
-                "symbol": symbol,
-                "volume": float(account.get("fixed_lot", 0.01) or 0.01),
-                "type": order_type,
-                "price": float(price),
-                "sl": float(sl),
-                "tp": self._broker_tp_for_leg(leg, tp1, tp2),
-                "deviation": 50,
-                "magic": MAGIC,
-                "comment": safe_comment(f"GRP{group_id}-{leg}", "TM"),
-                "type_time": 0,
-            }
+        legs_order = ("tp1", "runner")
+        for leg in legs_order:
+            req = self._leg_request(account, group_id, leg, symbol=symbol, order_type=order_type, price=price,
+                                    sl=sl, tp1=tp1, tp2=tp2)
             # DEBUG unicamente (no toca el flujo): deja el request exacto en el
             # log para poder confirmar numericamente la causa de un futuro
             # retcode 10016/INVALID_STOPS sin reconstruirlo a mano -- caso real
@@ -572,91 +735,100 @@ class TradeManager:
             # Real production incident (2026-09-14): a hung order_send raised
             # a bare asyncio.TimeoutError that escaped open_group entirely --
             # the signal was silently dropped with no open_aborted/
-            # open_failed notification reaching n8n or Telegram, and
-            # _next_group_id had already been incremented, burning a group
-            # number with no trade behind it. Caught here like any other
-            # open failure so the channel always learns why a signal didn't
-            # execute.
-            # type_filling sale de lo que el simbolo declara (filling_modes_for),
-            # y solo se reintenta con el siguiente modo ante INVALID_FILL: otro
-            # rechazo cualquiera nunca se reenvia (no duplicar ordenes).
-            timed_out = False
-            for attempt, filling in enumerate(filling_modes):
-                req["type_filling"] = filling
-                try:
-                    res = await self._call(client.order_send, req)
-                except asyncio.TimeoutError:
-                    log.error("[TM][OPEN] timeout abriendo leg=%s symbol=%s group_id=%s", leg, symbol, group_id)
-                    timed_out = True
-                    res = None
-                    break
-                if getattr(res, "retcode", None) == TRADE_RETCODE_INVALID_FILL and attempt < len(filling_modes) - 1:
-                    log.warning("[TM][OPEN] filling mode %s rechazado (10030) leg=%s symbol=%s -- probando %s",
-                                filling, leg, symbol, filling_modes[attempt + 1])
-                    continue
-                break
+            # open_failed notification reaching n8n or Telegram. Every
+            # outcome of _send_open_order below ends in a notification.
+            res, outcome = await self._send_open_order(client, req, filling_modes, leg=leg, group_id=group_id)
 
-            if timed_out or not res or getattr(res, "retcode", None) != 10009:
-                # Ni un timeout ni un retcode malo prueban que la orden no se
-                # ejecuto -- la respuesta pudo perderse mientras MT5 si la
-                # procesaba. Reconciliar contra MT5 real por el comment unico
-                # de esta pierna ANTES de asumir fallo (ver
-                # _find_position_by_group_comment: casos reales 170/171).
-                real_pos = await self._find_position_by_group_comment(client, group_id, leg)
-                if real_pos is not None:
-                    log.warning("[TM][OPEN] leg=%s symbol=%s group_id=%s parecia fallida pero SI existe en MT5 "
-                                "(ticket=%s) -- continuando como si order_send hubiera respondido a tiempo.",
-                                leg, symbol, group_id, real_pos.ticket)
-                    tickets[leg] = int(real_pos.ticket)
-                    continue
+            if outcome == "sent" and res and getattr(res, "retcode", None) == 10009:
+                tickets[leg] = int(res.order)
+                continue
 
-                reason = "timeout" if timed_out else None
-                log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s (confirmado ausente en MT5)",
-                          leg, symbol, None if timed_out else getattr(res, "retcode", None))
-                reverted_all = await self._revert_opened_legs(account, client, tickets)
-                detail = ("Se revirtieron las piernas ya abiertas del grupo." if (reverted_all and tickets) else
-                          "No habia piernas abiertas que revertir." if not tickets else
-                          "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
-                          "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
-                reason_text = "MT5 no respondio a tiempo" if timed_out else \
-                    f"fallo en MT5 (retcode={getattr(res, 'retcode', None)})"
-                await self._notify(
-                    "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason=reason,
-                    message=f"Grupo {group_id} ({symbol}): {reason_text} abriendo la pierna '{leg}'. {detail}",
+            # Ni un timeout ni un retcode malo prueban que la orden no se
+            # ejecuto -- la respuesta pudo perderse mientras MT5 si la
+            # procesaba. Reconciliar contra MT5 real por el comment unico
+            # de esta pierna ANTES de asumir fallo (ver
+            # _find_position_by_group_comment: casos reales 170/171).
+            real_pos = await self._find_position_by_group_comment(client, group_id, leg)
+            if real_pos is not None:
+                log.warning("[TM][OPEN] leg=%s symbol=%s group_id=%s parecia fallida pero SI existe en MT5 "
+                            "(ticket=%s) -- continuando como si order_send hubiera respondido a tiempo.",
+                            leg, symbol, group_id, real_pos.ticket)
+                tickets[leg] = int(real_pos.ticket)
+                continue
+
+            if outcome in ("timeout", "error"):
+                # La orden pudo llegar a la terminal y ejecutarse tarde (grupo
+                # 204: 99s despues). No se da por fallida ni se revierte lo ya
+                # abierto: queda pendiente y la reconciliacion del tick la
+                # adopta si aparece (ver PendingGroup).
+                remaining = list(legs_order[legs_order.index(leg) + 1:])
+                return await self._register_pending_group(
+                    account, group_id, leg, remaining, tickets, failure_kind=outcome, symbol=symbol,
+                    direction=direction, sl=sl, tp1=tp1, tp2=tp2, price=price, chat_id=chat_id,
                 )
-                return None
-            tickets[leg] = int(res.order)
+
+            # Rechazo limpio de MT5 (retcode) o el pool ni siquiera la envio
+            # (conexion atascada): la orden de esta pierna no existe.
+            not_sent = outcome == "not_sent"
+            log.error("[TM][OPEN] Fallo abriendo leg=%s symbol=%s retcode=%s",
+                      leg, symbol, None if not_sent else getattr(res, "retcode", None))
+            reverted_all = await self._revert_opened_legs(account, client, tickets)
+            detail = ("Se revirtieron las piernas ya abiertas del grupo." if (reverted_all and tickets) else
+                      "No habia piernas abiertas que revertir." if not tickets else
+                      "ADVERTENCIA: MT5 no confirmo a tiempo si las piernas ya abiertas del grupo "
+                      "se revirtieron -- revisar manualmente si quedo una posicion huerfana sin gestion.")
+            reason_text = "MT5 no respondio a tiempo" if not_sent else \
+                f"fallo en MT5 (retcode={getattr(res, 'retcode', None)})"
+            await self._notify(
+                "open_failed", symbol=symbol, leg=leg, group_id=group_id, reason="timeout" if not_sent else None,
+                message=f"Grupo {group_id} ({symbol}): {reason_text} abriendo la pierna '{leg}'. {detail}",
+            )
+            return None
 
         for leg, ticket in tickets.items():
-            self.trades[ticket] = ManagedTrade(
-                account_name=account["name"],
-                ticket=ticket,
-                symbol=symbol,
-                direction=direction.upper(),
-                group_id=group_id,
-                leg=leg,
-                planned_sl=float(sl),
-                tp1_price=float(tp1) if tp1 is not None else None,
-                tp2_price=float(tp2) if tp2 is not None else None,
-                entry_price=float(price),
-                chat_id=chat_id,
-            )
-        TRADES_OPENED.inc(2)
-        ACTIVE_TRADES.set(len(self.trades))
+            self._insert_leg(account, group_id, leg, ticket, symbol=symbol, direction=direction, sl=sl,
+                             tp1=tp1, tp2=tp2, entry_price=price, chat_id=chat_id)
         log.info("[TM] group %s opened: tp1=%s runner=%s symbol=%s dir=%s sl=%s tp1_price=%s tp2_price=%s",
                   group_id, tickets["tp1"], tickets["runner"], symbol, direction, sl, tp1, tp2)
-        channel_name = resolve_channel_name(chat_id, self._channel_names())
-        message = build_group_opened_message(
-            channel_name=channel_name, group_id=group_id, symbol=symbol, direction=direction,
-            entry_price=price, sl=sl, tp1=tp1, tp2=tp2, volume=account.get("fixed_lot", 0.01),
-        )
-        await self._notify(
-            "group_opened", channel="both", group_id=group_id, symbol=symbol, direction=direction,
-            tp1_ticket=tickets["tp1"], runner_ticket=tickets["runner"], sl=sl, tp1=tp1, tp2=tp2,
-            chat_id=chat_id, channel_name=channel_name, entry_price=price, volume=account.get("fixed_lot", 0.01),
-            message=message,
-        )
+        await self._notify_group_opened(account, group_id, symbol=symbol, direction=direction, sl=sl, tp1=tp1,
+                                        tp2=tp2, entry_price=price, chat_id=chat_id)
         await self._persist_group(group_id)
+        return group_id
+
+    def _pending_timeout_seconds(self, failure_kind: str) -> float:
+        timeout = self._cfg_float("OPEN_PENDING_TIMEOUT_SECONDS", 180.0)
+        # Un error de conexion inmediato casi siempre significa que la orden no
+        # salio: no hace falta esperar tanto como tras un cuelgue de la terminal.
+        return min(timeout, 30.0) if failure_kind == "error" else timeout
+
+    async def _register_pending_group(self, account: dict, group_id: int, leg: str, unsent_legs: list,
+                                      tickets: dict, *, failure_kind: str, symbol: str, direction: str, sl: float,
+                                      tp1: Optional[float], tp2: Optional[float], price: float,
+                                      chat_id: Optional[str]) -> int:
+        now = time.time()
+        timeout = self._pending_timeout_seconds(failure_kind)
+        self._pending[group_id] = PendingGroup(
+            group_id=group_id, account_name=account["name"], symbol=symbol, direction=direction.upper(),
+            chat_id=chat_id, sl=float(sl), tp1=tp1, tp2=tp2, price=float(price), unconfirmed_legs={leg},
+            unsent_legs=list(unsent_legs), failure_kind=failure_kind, created_ts=now, deadline_ts=now + timeout,
+        )
+        for opened_leg, ticket in tickets.items():
+            self._insert_leg(account, group_id, opened_leg, ticket, symbol=symbol, direction=direction, sl=sl,
+                             tp1=tp1, tp2=tp2, entry_price=price, chat_id=chat_id)
+        if tickets:
+            await self._persist_group(group_id)
+        log.warning("[TM][OPEN] group_id=%s leg=%s sin confirmar (%s) -- pendiente hasta %.0fs, ya abiertas=%s",
+                    group_id, leg, failure_kind, timeout, list(tickets))
+        channel_name = resolve_channel_name(chat_id, self._channel_names())
+        opened_note = (f" La pierna {', '.join(tickets)} ya esta abierta y bajo gestion." if tickets else "")
+        await self._notify(
+            "open_pending", channel="both", group_id=group_id, symbol=symbol, direction=direction.upper(),
+            leg=leg, reason=failure_kind, chat_id=chat_id, channel_name=channel_name, account=account["name"],
+            message=(f"⏳ APERTURA SIN CONFIRMAR — Canal: {channel_name} (grupo {group_id}, cuenta {account['name']})\n"
+                     f"{symbol} {direction.upper()}: MT5 no confirmo a tiempo la pierna '{leg}'. La orden pudo "
+                     f"ejecutarse igual: se vigila MT5 durante {timeout:.0f}s y, si aparece, queda bajo gestion "
+                     f"normal (señal completa y cierres del canal incluidos).{opened_note}"),
+        )
         return group_id
 
     async def update_group_signal(self, group_id: int, *, sl: Optional[float], tp1: Optional[float], tp2: Optional[float]) -> None:
@@ -667,8 +839,26 @@ class TradeManager:
         runner_mode=fixed_tp2 un cambio de tp2 mueve el TP real del runner en
         MT5; en trailing solo actualiza la referencia usada por el trailing.
         """
+        pending = self._pending.get(group_id)
+        if pending is not None:
+            # Los niveles nuevos se aplican a la pierna en cuanto MT5 la confirme
+            # (_adopt_pending_leg), igual que si hubiera abierto a tiempo.
+            if sl is not None:
+                pending.sl = float(sl)
+            if tp1 is not None:
+                pending.tp1 = float(tp1)
+            if tp2 is not None:
+                pending.tp2 = float(tp2)
         legs = [t for t in self.trades.values() if t.group_id == group_id]
         if not legs:
+            if pending is not None:
+                log.info("[TM] group %s (pendiente de confirmacion) actualizado: sl=%s tp1=%s tp2=%s",
+                         group_id, sl, tp1, tp2)
+                await self._notify(
+                    "group_updated", group_id=group_id, sl=sl, tp1=tp1, tp2=tp2,
+                    message=f"Grupo {group_id} (pendiente de confirmacion en MT5) actualizado: sl={sl}, tp1={tp1}, tp2={tp2}.",
+                )
+                return
             log.warning("[TM][UPDATE] group_id=%s no tiene piernas activas", group_id)
             return
         account = self._ensure_account_dict(legs[0].account_name)
@@ -761,10 +951,19 @@ class TradeManager:
         entre TODAS las cuentas), dejando el otro grupo sin actualizar.
         """
         candidates = [
-            t for t in self.trades.values()
+            (t.opened_ts, t.group_id) for t in self.trades.values()
             if t.symbol == symbol and t.chat_id == chat_id
             and (direction is None or t.direction == direction.upper())
             and (account_name is None or t.account_name == account_name)
+        ]
+        # Un grupo pendiente de confirmacion tambien cuenta: sin esto la señal
+        # completa abriria un grupo NUEVO encima de la orden que MT5 puede
+        # estar por ejecutar (casi pasa con el grupo 204).
+        candidates += [
+            (p.created_ts, p.group_id) for p in self._active_pending()
+            if p.symbol == symbol and p.chat_id == chat_id
+            and (direction is None or p.direction == direction.upper())
+            and (account_name is None or p.account_name == account_name)
         ]
         if not candidates:
             return None
@@ -772,8 +971,34 @@ class TradeManager:
         # coarse resolution on some platforms (e.g. ~15.6ms on Windows) and two
         # groups opened back-to-back can share an opened_ts — max() would
         # otherwise return the first (older) tied element.
-        newest = max(candidates, key=lambda t: (t.opened_ts, t.group_id))
-        return newest.group_id
+        return max(candidates)[1]
+
+    def _active_pending(self) -> list[PendingGroup]:
+        """Pendientes aun dentro de su ventana de espera (los vencidos solo se
+        conservan para adoptar una ejecucion muy tardia, ver _expire_pending)."""
+        return [p for p in self._pending.values() if not p.expired and p.cancel_reason is None]
+
+    def _cancel_expired_pendings(self, chat_id: Optional[str], raw_text: str, *, direction: Optional[str] = None,
+                                 symbol: Optional[str] = None) -> None:
+        """Un pendiente vencido sigue vigilado por si MT5 lo ejecuta muy tarde:
+        un cierre del canal debe alcanzarlo tambien, o esa ejecucion tardia se
+        adoptaria y quedaria abierta contra la instruccion del canal."""
+        if chat_id is None:
+            return
+        for p in self._pending.values():
+            if p.expired and p.cancel_reason is None and p.chat_id == chat_id \
+                    and (direction is None or p.direction == direction.upper()) \
+                    and (symbol is None or p.symbol == symbol):
+                p.cancel_reason = raw_text
+
+    def _group_symbol_direction(self, group_id: int) -> Optional[tuple[str, str]]:
+        leg = next((t for t in self.trades.values() if t.group_id == group_id), None)
+        if leg is not None:
+            return leg.symbol, leg.direction
+        pending = self._pending.get(group_id)
+        if pending is not None:
+            return pending.symbol, pending.direction
+        return None
 
     def find_active_groups_for_chat(self, chat_id: str) -> list[int]:
         """
@@ -792,14 +1017,14 @@ class TradeManager:
         """
         if chat_id is None:
             return []
-        candidates = [t for t in self.trades.values() if t.chat_id == chat_id]
-        group_ids = sorted(
-            {t.group_id for t in candidates},
-            key=lambda gid: min(
-                (t.opened_ts, t.group_id) for t in candidates if t.group_id == gid
-            ),
-        )
-        return group_ids
+        first_seen: dict[int, float] = {}
+        for t in self.trades.values():
+            if t.chat_id == chat_id:
+                first_seen[t.group_id] = min(first_seen.get(t.group_id, t.opened_ts), t.opened_ts)
+        for p in self._active_pending():
+            if p.chat_id == chat_id:
+                first_seen[p.group_id] = min(first_seen.get(p.group_id, p.created_ts), p.created_ts)
+        return sorted(first_seen, key=lambda gid: (first_seen[gid], gid))
 
     def _filter_groups_by_direction(self, group_ids: list[int], direction_hint: str) -> tuple[list[int], list[int]]:
         """
@@ -812,8 +1037,8 @@ class TradeManager:
         """
         kept, excluded = [], []
         for group_id in group_ids:
-            leg = next((t for t in self.trades.values() if t.group_id == group_id), None)
-            if leg is not None and leg.direction == direction_hint:
+            meta = self._group_symbol_direction(group_id)
+            if meta is not None and meta[1] == direction_hint:
                 kept.append(group_id)
             else:
                 excluded.append(group_id)
@@ -827,10 +1052,13 @@ class TradeManager:
         duplicado reciente a ignorar, o una reapertura legitima (BUY o SELL) a
         abrir aparte — ver REOPEN_COOLDOWN_SECONDS.
         """
-        legs = [t for t in self.trades.values() if t.group_id == group_id]
-        if not legs:
+        opened = [t.opened_ts for t in self.trades.values() if t.group_id == group_id]
+        pending = self._pending.get(group_id)
+        if pending is not None:
+            opened.append(pending.created_ts)
+        if not opened:
             return None
-        return time.time() - min(t.opened_ts for t in legs)
+        return time.time() - min(opened)
 
     async def run_forever(self) -> None:
         LOOP_INTERVAL = 0.1
@@ -853,6 +1081,7 @@ class TradeManager:
         try:
             client = self.mt5._client_for(account)
             positions = await self._call(client.positions_get) or []
+            snapshot_ts = time.time()
             pos_by_ticket = {p.ticket: p for p in positions}
 
             # Detect closed tickets for this account (TP1 hit, SL hit, or manual close).
@@ -941,6 +1170,15 @@ class TradeManager:
 
             ACTIVE_TRADES.set(len(self.trades))
 
+            # Posiciones propias (TM-GRP*) que MT5 tiene y self.trades no: una
+            # apertura confirmada tarde o una huerfana. Reutiliza la foto de
+            # positions_get de este tick -- cero llamadas extra a MT5.
+            try:
+                await self._reconcile_untracked_positions(account, client, positions, snapshot_ts=snapshot_ts)
+            except Exception as e:
+                log.error("[TM] error reconciliando posiciones sin gestion en cuenta %s: %s",
+                          account.get("name"), e, exc_info=True)
+
             # Cierre parcial externo: el ticket SIGUE en positions_get (no es
             # el caso de arriba) pero su volumen vivo bajo respecto al ultimo
             # tick, sin que el propio sistema lo haya pedido (TP2 partial y
@@ -995,6 +1233,410 @@ class TradeManager:
 
         except Exception as e:
             log.error("[TM] error gestionando cuenta %s: %s", account.get("name"), e)
+
+    PENDING_RETENTION_SECONDS = 3600.0
+
+    async def _reconcile_untracked_positions(self, account: dict, client, positions,
+                                             snapshot_ts: Optional[float] = None) -> None:
+        """
+        Adopta posiciones propias (magic + comment TM-GRP{id}-{leg}) que MT5
+        tiene abiertas y self.trades no conoce, y vence los grupos pendientes
+        cuya ventana de espera paso. Corre en cada tick con la foto de
+        positions_get que el tick ya tomo (snapshot_ts = cuando se tomo): si MT5
+        no responde, no corre, asi que un "no esta" aqui siempre se apoya en una
+        consulta real -- y solo cuenta si la foto es posterior al vencimiento.
+
+        Antes reconcile_from_mt5 era lo unico que adoptaba posiciones, y solo
+        al arrancar: las del grupo 204 (2026-10-05) quedaron sin gestion hasta
+        cerrarse solas por su TP original.
+
+        Nunca cierra una posicion por su cuenta -- las unicas excepciones son
+        una pierna tardia de un grupo que el canal ya pidio cerrar, o una
+        pierna tardia de una señal que ya se copio en otro grupo.
+        """
+        now = time.time()
+        snapshot_ts = now if snapshot_ts is None else snapshot_ts
+        name = account["name"]
+        seen_now = set()
+        visible_legs = set()  # (group_id, leg) propias sin gestion en esta foto, adoptadas o no
+        to_adopt = []
+        for pos in positions:
+            if getattr(pos, "magic", None) != MAGIC:
+                continue
+            ticket = pos.ticket
+            if ticket in self.trades or ticket in self._mgmt_closing:
+                continue
+            parsed = parse_group_comment(getattr(pos, "comment", ""))
+            if parsed is None:
+                continue  # comment de otro formato: reconcile_from_mt5 ya los reporta al arrancar
+            group_id, leg = parsed
+            visible_legs.add((group_id, leg))
+            if group_id in self._opening_groups:
+                continue  # open_group la esta registrando ahora mismo
+            key = (name, ticket)
+            seen_now.add(key)
+            first_seen = self._untracked_seen.setdefault(key, now)
+            if now - first_seen >= self.adopt_grace_seconds:
+                to_adopt.append((key, pos, group_id, leg))
+        for key in [k for k in self._untracked_seen if k[0] == name and k not in seen_now]:
+            self._untracked_seen.pop(key, None)
+
+        for key, pos, group_id, leg in to_adopt:
+            if pos.ticket in self.trades:
+                continue  # una adopcion anterior de este mismo tick ya la registro
+            self._untracked_seen.pop(key, None)
+            pending = self._pending.get(group_id)
+            if pending is not None and pending.account_name == name and leg in pending.unconfirmed_legs:
+                await self._adopt_pending_leg(account, client, pending, pos, leg)
+            else:
+                await self._adopt_orphan_position(account, client, pos, group_id, leg)
+
+        for pending in [p for p in self._pending.values() if p.account_name == name]:
+            if (not pending.expired and pending.unconfirmed_legs and snapshot_ts >= pending.deadline_ts
+                    and not any((pending.group_id, l) in visible_legs for l in pending.unconfirmed_legs)):
+                await self._expire_pending(account, client, pending)
+            if not pending.unconfirmed_legs:
+                # Nada mas que confirmar (las piernas sin enviar solo se abren
+                # dentro de una adopcion; si quedaron aqui es que esa adopcion
+                # fallo a mitad de camino y no hay quien las abra).
+                self._pending.pop(pending.group_id, None)
+            elif pending.expired and now - pending.created_ts > self.PENDING_RETENTION_SECONDS:
+                self._pending.pop(pending.group_id, None)
+
+    async def _close_late_leg(self, account: dict, client, pending: PendingGroup, trade: ManagedTrade,
+                              why: str) -> None:
+        """Cierra una pierna confirmada tarde que ya no debe quedar abierta y
+        avisa el resultado. Si el cierre falla, queda bajo gestion normal."""
+        channel_name = resolve_channel_name(pending.chat_id, self._channel_names())
+        log.warning("[TM][PENDING] cerrando pierna tardia group_id=%s leg=%s ticket=%s: %s",
+                    pending.group_id, trade.leg, trade.ticket, why)
+        self._mgmt_closing.add(trade.ticket)
+        deal_info = None
+        try:
+            try:
+                ok = await self._force_full_close(account, client, trade.ticket)
+            except MT5CallTimeoutError:
+                ok = False
+            if ok:
+                deal_info = await self._get_close_deal_info(client, trade.ticket, trade)
+                self.trades.pop(trade.ticket, None)
+        finally:
+            self._mgmt_closing.discard(trade.ticket)
+        pnl = deal_info["profit"] if deal_info else None
+        result = (f"Cerrada (resultado {pnl:+.2f})." if ok and pnl is not None else
+                  "Cerrada." if ok else
+                  "NO se pudo cerrar: queda bajo gestion normal, revisar en MT5.")
+        await self._notify(
+            "pending_leg_closed", channel="both", group_id=pending.group_id, chat_id=pending.chat_id,
+            channel_name=channel_name, leg=trade.leg, ticket=trade.ticket, entry_price=trade.entry_price,
+            closed=ok, pnl_money=pnl,
+            message=(f"⚠️ CIERRE DE APERTURA TARDIA — Canal: {channel_name} (grupo {pending.group_id})\n"
+                     f"MT5 confirmo tarde la pierna '{trade.leg}' (ticket={trade.ticket}, entrada "
+                     f"{self._fmt_price(trade.entry_price)}), pero {why}. {result}"),
+        )
+        if any(t.group_id == pending.group_id for t in self.trades.values()):
+            await self._persist_group(pending.group_id)
+        else:
+            await self._close_group_in_store(pending.group_id)
+
+    def _late_leg_close_reason(self, pending: PendingGroup) -> Optional[str]:
+        """Por que una pierna tardia de `pending` no debe quedar abierta, o None."""
+        if pending.cancel_reason is not None:
+            return f"el canal ya habia pedido cerrar (\"{pending.cancel_reason}\")"
+        if pending.expired:
+            others = sorted({t.group_id for t in self.trades.values()
+                             if t.group_id != pending.group_id and t.account_name == pending.account_name
+                             and t.chat_id == pending.chat_id and t.symbol == pending.symbol
+                             and t.direction == pending.direction and t.opened_ts >= pending.created_ts})
+            if others:
+                return f"la señal ya se habia copiado en el grupo {others[-1]} (evita duplicar la exposicion)"
+        return None
+
+    async def _apply_be_if_owed(self, account: dict, client, pending_or_none, trade: ManagedTrade) -> None:
+        """BE que la pierna adoptada se perdio mientras no estaba gestionada: su
+        tp1 ya toco TP (runner), o el canal pidio BE/parcial sobre el grupo."""
+        owed = (trade.leg == "runner" and trade.group_id in self._tp1_hit_groups) or \
+            (pending_or_none is not None and pending_or_none.be_requested)
+        if not owed or trade.be_applied:
+            return
+        try:
+            result = await self._move_group_legs_to_be(account, client, [trade], reason="BE-adopcion-tardia")
+        except Exception as e:
+            log.error("[TM][PENDING] fallo aplicando BE a ticket=%s: %s", trade.ticket, e)
+            result = {"leg_ok": {trade.leg: False}}
+        if result and not result["leg_ok"].get(trade.leg):
+            note = f"No se pudo mover '{trade.leg}' a break-even: revisar en MT5."
+            if pending_or_none is not None:
+                pending_or_none.notes.append(note)
+            else:
+                log.error("[TM][ORPHAN] %s ticket=%s", note, trade.ticket)
+
+    async def _sync_broker_levels(self, client, trade: ManagedTrade, pos) -> bool:
+        """Lleva SL/TP de MT5 a los niveles que el grupo tiene en memoria (la
+        orden pudo salir con los del fast). Si falla, la memoria se alinea con
+        MT5 en vez de quedar desincronizada (ver planned-sl desync, 2026-09-10)."""
+        desired_tp = self._broker_tp_for_leg(trade.leg, trade.tp1_price, trade.tp2_price)
+        live_sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        live_tp = float(getattr(pos, "tp", 0.0) or 0.0)
+        if abs(live_sl - trade.planned_sl) <= 1e-9 and abs(live_tp - desired_tp) <= 1e-9:
+            return True
+        try:
+            res = await self._call(client.order_send, {"action": 6, "position": trade.ticket,
+                                                       "sl": float(trade.planned_sl), "tp": float(desired_tp)})
+            if res and getattr(res, "retcode", None) in (10009, 10025):  # 10025: ya los tenia (redondeo)
+                return True
+            log.error("[TM][PENDING] SL/TP no aplicados a ticket=%s (retcode=%s)", trade.ticket,
+                      getattr(res, "retcode", None))
+        except Exception as e:
+            log.error("[TM][PENDING] fallo aplicando SL/TP a ticket=%s: %s", trade.ticket, e)
+        trade.planned_sl = live_sl
+        return False
+
+    async def _adopt_pending_leg(self, account: dict, client, pending: PendingGroup, pos, leg: str) -> None:
+        entry = float(getattr(pos, "price_open", 0.0) or pending.price)
+        trade = self._insert_leg(account, pending.group_id, leg, pos.ticket, symbol=pending.symbol,
+                                 direction=pending.direction, sl=pending.sl, tp1=pending.tp1, tp2=pending.tp2,
+                                 entry_price=entry, chat_id=pending.chat_id)
+        pending.unconfirmed_legs.discard(leg)
+        why_close = self._late_leg_close_reason(pending)
+        if why_close is not None:
+            pending.unsent_legs.clear()  # no abrir mas piernas de un grupo que no debe seguir
+            await self._close_late_leg(account, client, pending, trade, why_close)
+            return
+
+        log.warning("[TM][PENDING] group_id=%s leg=%s confirmada tarde por MT5 (ticket=%s entrada=%s) -- adoptando",
+                    pending.group_id, leg, pos.ticket, entry)
+        if not await self._sync_broker_levels(client, trade, pos):
+            pending.notes.append(f"No se pudieron aplicar los SL/TP actuales a '{leg}' en MT5: revisar.")
+        await self._apply_be_if_owed(account, client, pending, trade)
+        for unsent in list(pending.unsent_legs):
+            await self._open_late_leg(account, client, pending, unsent, reference_entry=entry)
+        await self._persist_group(pending.group_id)
+        await self._maybe_finish_pending(account, pending)
+
+    async def _open_late_leg(self, account: dict, client, pending: PendingGroup, leg: str, *,
+                             reference_entry: float) -> None:
+        """
+        Abre una pierna que nunca se llego a enviar porque la anterior quedo sin
+        confirmar (tipicamente el runner tras un tp1 confirmado tarde). Solo
+        dentro de la ventana del pendiente, sin cierre pedido por el canal, con
+        el precio todavia dentro de TOLERANCE_PIPS de la entrada ya ejecutada y
+        sin haber pasado tp1 -- la misma tolerancia que open_group acepta.
+        """
+        if leg in pending.unsent_legs:
+            pending.unsent_legs.remove(leg)
+        if pending.cancel_reason is not None or pending.expired:
+            return
+        if pending.be_requested:
+            # El canal ya esta asegurando ganancia (BE/parcial): abrir ahora una
+            # pierna nueva a precio de mercado con el SL original iria en contra.
+            pending.notes.append(f"La pierna '{leg}' no se abrio: el canal ya habia pedido BE/cierre parcial.")
+            return
+        is_buy = pending.direction == "BUY"
+        try:
+            price = await self._get_price_with_retry(client, pending.symbol, pending.direction)
+        except Exception as e:
+            log.error("[TM][PENDING] sin precio para abrir '%s' tarde en group_id=%s: %s", leg, pending.group_id, e)
+            price = 0.0
+        point = 0.1 if pending.symbol.upper().startswith("XAU") else 0.00001
+        tolerance = pips_to_price(pending.symbol, self._cfg_float("TOLERANCE_PIPS", 30.0), point)
+        past_tp1 = pending.tp1 is not None and ((price >= pending.tp1) if is_buy else (price <= pending.tp1))
+        if not price or abs(price - reference_entry) > tolerance or past_tp1:
+            log.warning("[TM][PENDING] '%s' de group_id=%s no se abre tarde: precio=%s entrada=%s tolerancia=%s tp1=%s",
+                        leg, pending.group_id, price, reference_entry, tolerance, pending.tp1)
+            pending.notes.append(f"La pierna '{leg}' no se abrio: el precio ya se habia alejado de la entrada.")
+            return
+        try:
+            filling_modes = filling_modes_for(await self._call(client.symbol_info, pending.symbol))
+        except Exception:
+            filling_modes = filling_modes_for(None)
+        if pending.cancel_reason is not None or pending.expired:
+            return  # el canal pidio cerrar mientras se preparaba la orden
+        req = self._leg_request(account, pending.group_id, leg, symbol=pending.symbol, order_type=0 if is_buy else 1,
+                                price=price, sl=pending.sl, tp1=pending.tp1, tp2=pending.tp2)
+        log.debug("[TM][OPEN] req tardio account=%s group_id=%s leg=%s req=%s", account.get("name"), pending.group_id, leg, req)
+        res, outcome = await self._send_open_order(client, req, filling_modes, leg=leg, group_id=pending.group_id)
+        if outcome == "sent" and res and getattr(res, "retcode", None) == 10009:
+            trade = self._insert_leg(account, pending.group_id, leg, int(res.order), symbol=pending.symbol,
+                                     direction=pending.direction, sl=pending.sl, tp1=pending.tp1, tp2=pending.tp2,
+                                     entry_price=price, chat_id=pending.chat_id)
+            why_close = self._late_leg_close_reason(pending)
+            if why_close is not None:  # el cierre llego mientras se enviaba la orden
+                await self._close_late_leg(account, client, pending, trade, why_close)
+        elif outcome in ("timeout", "error"):
+            # Otra vez sin confirmar: se vigila igual que la primera.
+            pending.unconfirmed_legs.add(leg)
+            pending.failure_kind = outcome
+            pending.deadline_ts = time.time() + self._pending_timeout_seconds(outcome)
+        else:
+            pending.notes.append(f"La pierna '{leg}' fue rechazada por MT5 "
+                                 f"(retcode={getattr(res, 'retcode', None)}).")
+
+    async def _maybe_finish_pending(self, account: dict, pending: PendingGroup) -> None:
+        """Cuando ya no queda ninguna pierna por confirmar, anuncia la apertura
+        con lo que realmente quedo abierto (una sola vez)."""
+        if pending.unconfirmed_legs or pending.unsent_legs:
+            return
+        legs = [t for t in self.trades.values() if t.group_id == pending.group_id]
+        if not legs:
+            return
+        entry = next((t.entry_price for t in legs if t.leg == "tp1"), legs[0].entry_price) or pending.price
+        waited = time.time() - pending.created_ts
+        note = f"(MT5 confirmo la apertura con {waited:.0f}s de retraso.)"
+        if pending.notes:
+            note += " " + " ".join(pending.notes)
+        await self._notify_group_opened(account, pending.group_id, symbol=pending.symbol, direction=pending.direction,
+                                        sl=pending.sl, tp1=pending.tp1, tp2=pending.tp2, entry_price=entry,
+                                        chat_id=pending.chat_id, note=note)
+        self._pending.pop(pending.group_id, None)
+
+    async def _positions_snapshot(self, client) -> Optional[list]:
+        try:
+            return list(await self._call(client.positions_get) or [])
+        except Exception as e:
+            log.warning("[TM][PENDING] positions_get fallo verificando antes de reenviar: %s", e)
+            return None
+
+    async def _expire_pending(self, account: dict, client, pending: PendingGroup) -> None:
+        """
+        Vence la ventana de un grupo pendiente con una foto real de MT5 que no
+        muestra la pierna. Tras un error de conexion (la orden pudo no salir)
+        se reenvia UNA vez si una consulta fresca confirma que sigue sin estar
+        y el precio sigue dentro de tolerancia; tras un timeout nunca (la
+        terminal la tiene: en los 3 casos reales se ejecuto). El registro se
+        conserva PENDING_RETENTION_SECONDS: si MT5 la ejecuta aun mas tarde, se
+        adopta con canal y niveles, pero sin abrir piernas nuevas.
+        """
+        missing = sorted(pending.unconfirmed_legs)
+        if pending.cancel_reason is not None:
+            # El canal ya pidio cerrar: no hay nada que anunciar como fallido.
+            log.info("[TM][PENDING] group_id=%s vencio con cierre ya pedido; se sigue vigilando por si aparece",
+                     pending.group_id)
+            pending.expired = True
+            pending.unsent_legs.clear()
+            return
+        if pending.failure_kind == "error" and not pending.resend_attempted:
+            fresh = await self._positions_snapshot(client)
+            if fresh is None:
+                pending.deadline_ts = time.time() + 10.0  # sin verificacion no se reenvia nada
+                return
+            fresh_legs = {parse_group_comment(getattr(p, "comment", "")) for p in fresh
+                          if getattr(p, "magic", None) == MAGIC}
+            if any((pending.group_id, l) in fresh_legs for l in missing):
+                return  # aparecio: la adopcion del proximo tick se encarga
+            pending.resend_attempted = True
+            reference = next((t.entry_price for t in self.trades.values()
+                              if t.group_id == pending.group_id and t.entry_price), pending.price)
+            for leg in reversed(missing):
+                pending.unconfirmed_legs.discard(leg)
+                pending.unsent_legs.insert(0, leg)
+            log.warning("[TM][PENDING] group_id=%s: %s no aparecio tras error de conexion -- reenviando una vez",
+                        pending.group_id, missing)
+            for leg in list(pending.unsent_legs):
+                await self._open_late_leg(account, client, pending, leg, reference_entry=reference)
+            if pending.unconfirmed_legs:
+                return  # el reenvio quedo sin confirmar: nueva ventana
+            pending.unsent_legs.clear()
+            not_opened = [l for l in missing if not any(t.group_id == pending.group_id and t.leg == l
+                                                         for t in self.trades.values())]
+            if not not_opened:
+                await self._persist_group(pending.group_id)
+                await self._maybe_finish_pending(account, pending)
+                return
+            # El reenvio no salio (precio fuera de tolerancia o rechazo): la
+            # orden original pudo llegar igual, asi que se sigue vigilando en el
+            # registro vencido -- si aparece, se adopta con su canal.
+            pending.unconfirmed_legs.update(not_opened)
+            missing = not_opened
+
+        pending.expired = True
+        pending.unsent_legs.clear()
+        waited = time.time() - pending.created_ts
+        legs = [t for t in self.trades.values() if t.group_id == pending.group_id]
+        channel_name = resolve_channel_name(pending.chat_id, self._channel_names())
+        if legs:
+            entry = legs[0].entry_price
+            note = (f"(La pierna {', '.join(missing)} no se ejecuto en MT5 -- verificado durante {waited:.0f}s; "
+                    f"el grupo sigue gestionado solo con {', '.join(t.leg for t in legs)}.)")
+            if pending.notes:
+                note += " " + " ".join(pending.notes)
+            await self._notify_group_opened(account, pending.group_id, symbol=pending.symbol,
+                                            direction=pending.direction, sl=pending.sl, tp1=pending.tp1,
+                                            tp2=pending.tp2, entry_price=entry or pending.price,
+                                            chat_id=pending.chat_id, note=note)
+            return
+        await self._notify(
+            "open_failed", channel="both", symbol=pending.symbol, leg=missing[0] if missing else None,
+            group_id=pending.group_id, reason="not_executed", chat_id=pending.chat_id, channel_name=channel_name,
+            message=(f"Grupo {pending.group_id} ({pending.symbol} {pending.direction}, cuenta {pending.account_name}): "
+                     f"MT5 no ejecuto la orden -- verificado en MT5 durante {waited:.0f}s. Señal no copiada en esta "
+                     f"cuenta. Si MT5 la ejecutara aun mas tarde, se adoptara y se avisara."
+                     + (" " + " ".join(pending.notes) if pending.notes else "")),
+        )
+
+    async def _adopt_orphan_position(self, account: dict, client, pos, group_id: int, leg: str) -> None:
+        """
+        Posicion propia sin pierna pendiente que la explique (p. ej. una orden
+        duplicada, o una ejecucion posterior a un fallo inesperado de
+        open_group). Se pone bajo gestion con los niveles y el canal de su
+        grupo si se conocen (otra pierna viva o el state_store); si no, con su
+        SL/TP de MT5 y sin canal -- avisando que los cierres del canal no la
+        alcanzaran.
+        """
+        name = account["name"]
+        entry = float(getattr(pos, "price_open", 0.0) or 0.0)
+        direction = "BUY" if getattr(pos, "type", 0) == 0 else "SELL"
+        sibling = next((t for t in self.trades.values() if t.group_id == group_id and t.account_name == name), None)
+        doc = None
+        if sibling is None and self.state_store:
+            try:
+                doc, _ = await self._maybe_await(self.state_store.load_group(group_id))
+                if doc is not None and doc.get("account_name") != name:
+                    doc = None
+            except Exception as e:
+                log.warning("[TM][ORPHAN] fallo leyendo group_id=%s del store: %s", group_id, e)
+                doc = None
+        levels_synced = True
+        if sibling is not None:
+            source = "group"
+            trade = self._insert_leg(account, group_id, leg, pos.ticket, symbol=pos.symbol, direction=direction,
+                                     sl=sibling.planned_sl, tp1=sibling.tp1_price, tp2=sibling.tp2_price,
+                                     entry_price=entry, chat_id=sibling.chat_id)
+            levels_synced = await self._sync_broker_levels(client, trade, pos)
+        elif doc is not None and doc.get("legs", {}).get(leg) is not None:
+            source = "store"  # estado completo (BE, trailing) tal como se persistio
+            self._reconstruct_leg_from_doc(account, doc, leg, pos)
+            trade = self.trades[pos.ticket]
+            if trade.entry_price is None:
+                trade.entry_price = entry
+        else:
+            source = "store" if doc is not None else None
+            tp = float(getattr(pos, "tp", 0.0) or 0.0) or None
+            tp1, tp2 = (tp, None) if leg == "tp1" else (None, tp)
+            if doc is not None:
+                tp1, tp2 = doc.get("tp1_price", tp1), doc.get("tp2_price", tp2)
+            trade = self._insert_leg(account, group_id, leg, pos.ticket, symbol=pos.symbol, direction=direction,
+                                     sl=float(getattr(pos, "sl", 0.0) or 0.0), tp1=tp1, tp2=tp2,
+                                     entry_price=entry, chat_id=doc.get("chat_id") if doc is not None else None)
+        self._next_group_id = max(self._next_group_id, group_id + 1)
+        await self._apply_be_if_owed(account, client, None, trade)
+        await self._persist_group(group_id)
+        log.warning("[TM][ORPHAN] posicion sin gestion adoptada: cuenta=%s ticket=%s group_id=%s leg=%s origen=%s",
+                    name, pos.ticket, group_id, leg, source)
+        channel_name = resolve_channel_name(trade.chat_id, self._channel_names())
+        warning = ("" if trade.chat_id is not None else
+                   " No se conoce su canal de origen: los mensajes de cierre del canal NO la alcanzaran -- "
+                   "revisar manualmente.")
+        if not levels_synced:
+            warning += " No se pudieron aplicar en MT5 los SL/TP de su grupo: conserva los propios, revisar."
+        await self._notify(
+            "orphan_position_adopted", channel="both", group_id=group_id, leg=leg, ticket=pos.ticket,
+            account=name, symbol=pos.symbol, direction=direction, entry_price=entry, sl=trade.planned_sl,
+            chat_id=trade.chat_id, channel_name=channel_name, source=source,
+            message=(f"⚠️ POSICION SIN GESTION DETECTADA — Cuenta {name} (grupo {group_id}, pierna '{leg}')\n"
+                     f"{pos.symbol} {direction} ticket={pos.ticket}, entrada {self._fmt_price(entry)}, "
+                     f"SL {self._fmt_price(trade.planned_sl)}. Ahora queda bajo gestion.{warning}"),
+        )
 
     DEAL_REASON_TP = 5
     DEAL_REASON_SL = 4
@@ -1054,8 +1696,27 @@ class TradeManager:
         resultado del intento de BE que sigue.
         """
         TP1_HITS.inc()
+        self._tp1_hit_groups.add(tp1_leg.group_id)
         runner = next((t for t in self.trades.values() if t.group_id == tp1_leg.group_id and t.leg == "runner"), None)
         if not runner:
+            # Grupo sin runner abierto (no se abrio, o sigue sin confirmar --
+            # si aparece, _apply_be_if_owed lo pone en BE al adoptarlo). El TP1
+            # se notifica igual: antes se perdia en silencio.
+            deal_info = await self._get_close_deal_info(client, tp1_leg.ticket, tp1_leg)
+            channel_name = resolve_channel_name(tp1_leg.chat_id, self._channel_names())
+            close_price = deal_info["price"] if deal_info else None
+            close_volume = deal_info["volume"] if deal_info else None
+            pnl_money = deal_info["profit"] if deal_info else None
+            message = build_tp1_hit_message(
+                channel_name=channel_name, group_id=tp1_leg.group_id, symbol=tp1_leg.symbol,
+                direction=tp1_leg.direction, close_price=close_price, close_volume=close_volume,
+                pnl_money=pnl_money, account_currency="USD",
+            ).replace("SL movido a break-even", "Grupo sin runner abierto")
+            await self._notify(
+                "tp1_hit", channel="both", group_id=tp1_leg.group_id, symbol=tp1_leg.symbol, runner_ticket=None,
+                chat_id=tp1_leg.chat_id, channel_name=channel_name, close_price=close_price,
+                close_volume=close_volume, pnl_money=pnl_money, message=message,
+            )
             return
 
         deal_info = await self._get_close_deal_info(client, tp1_leg.ticket, tp1_leg)
@@ -1617,6 +2278,21 @@ class TradeManager:
         message_builder = message_builder or build_close_now_message
         try:
             legs = [t for t in self.trades.values() if t.group_id == group_id]
+            pending = self._pending.get(group_id)
+            if pending is not None:
+                # La pierna sin confirmar se cierra en cuanto MT5 la muestre
+                # (_adopt_pending_leg), no se adopta.
+                pending.cancel_reason = raw_text
+                if not legs:
+                    channel_name = resolve_channel_name(chat_id, self._channel_names())
+                    await self._notify(
+                        "pending_close_requested", channel="both", group_id=group_id, chat_id=chat_id,
+                        channel_name=channel_name, raw_text=raw_text, action=action,
+                        message=(f"⚠️ CIERRE SOLICITADO — Canal: {channel_name} (grupo {group_id})\n"
+                                 f"Motivo: \"{raw_text}\"\nEl grupo seguia sin confirmar en MT5: si la orden "
+                                 f"se ejecuto, se cerrara en cuanto aparezca."),
+                    )
+                    return {"group_id": group_id, "status": "pending_cancelled"}
             account = self._ensure_account_dict(legs[0].account_name)
             if not account:
                 log.error("[TM][MGMT] no se pudo resolver la cuenta para group_id=%s chat_id=%s", group_id, chat_id)
@@ -1718,10 +2394,13 @@ class TradeManager:
         if chat_id is None:
             return []
         opposite = "SELL" if direction.upper() == "BUY" else "BUY"
+        self._cancel_expired_pendings(chat_id, f"Señal {direction.upper()} {symbol} contraria", direction=opposite,
+                                      symbol=symbol)
         targets = []
         for group_id in self.find_active_groups_for_chat(chat_id):
             legs = [t for t in self.trades.values() if t.group_id == group_id]
-            if not legs or legs[0].symbol != symbol or legs[0].direction != opposite:
+            meta = self._group_symbol_direction(group_id)
+            if meta is None or meta[0] != symbol or meta[1] != opposite:
                 continue
             if any(t.be_applied for t in legs):
                 log.info("[TM][OPPOSITE] grupo %s %s ya protegido en BE, se deja correr pese a señal %s",
@@ -1749,6 +2428,8 @@ class TradeManager:
         de gestion -- no un simbolo, y no solo el grupo mas reciente -- y
         aplica la accion segun su propia semantica (ver cada rama abajo).
         """
+        if action == "close_now":
+            self._cancel_expired_pendings(chat_id, raw_text, direction=direction_hint)
         group_ids = self.find_active_groups_for_chat(chat_id)
         if not group_ids:
             log.info("[TM][MGMT] no_active_trade chat_id=%s action=%s text=%r", chat_id, action, raw_text[:80])
@@ -1789,6 +2470,20 @@ class TradeManager:
                   for group_id in group_ids)
             ))
             return {"status": "completed", "results": results}
+
+        # Cierre parcial / BE sobre un grupo sin ninguna pierna confirmada en MT5
+        # no tiene sobre que actuar; los grupos con piernas reales siguen normal.
+        if action in ("close_partial_now", "move_sl_be_now"):
+            # Piernas aun sin confirmar: se recuerda el pedido y se aplica al
+            # adoptarlas (BE; y no se abre un runner nuevo tardio -- ver
+            # _open_late_leg). Las piernas ya confirmadas siguen el camino normal.
+            for g in group_ids:
+                if g in self._pending:
+                    self._pending[g].be_requested = True
+            pending_only = [g for g in group_ids if not any(t.group_id == g for t in self.trades.values())]
+            if pending_only:
+                log.info("[TM][MGMT] %s: grupos %s aun sin confirmar en MT5 -- BE al confirmarse", action, pending_only)
+                group_ids = [g for g in group_ids if g not in pending_only]
 
         if action == "close_partial_now":
             # Fix 2: `percent` viene de una extraccion LLM (Ollama) sobre texto
@@ -2014,6 +2709,10 @@ class TradeManager:
                 return {"group_id": group_id, "status": "failed", "reason": "account_unresolved"}
             client = self.mt5._client_for(account)
             runner = next((t for t in legs if t.leg == "runner"), None)
+            if not runner and group_id in self._pending:
+                # Runner aun sin confirmar en MT5 (recibira BE al adoptarse, ver
+                # be_requested): proteger ya la pierna tp1 que si esta abierta.
+                runner = next((t for t in legs if t.leg == "tp1"), None)
             if not runner:
                 await self._notify(
                     "mgmt_no_runner_leg",
@@ -2034,7 +2733,7 @@ class TradeManager:
             # el runner si se protege, y esa pierna se come una
             # perdida completa que BE habria evitado.
             tp1_leg = next((t for t in legs if t.leg == "tp1"), None)
-            legs_to_move = [runner] + ([tp1_leg] if tp1_leg else [])
+            legs_to_move = [runner] + ([tp1_leg] if tp1_leg and tp1_leg is not runner else [])
             try:
                 be_result = await self._move_group_legs_to_be(account, client, legs_to_move, reason="mgmt-fallback-BE")
             except MT5CallTimeoutError:

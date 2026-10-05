@@ -1839,12 +1839,17 @@ async def test_open_group_notifies_and_returns_none_when_order_send_times_out(mo
 
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
-    assert group_id is None
+    # 2026-10-05: a timeout no longer drops the group on the spot (group 204's
+    # order filled 99s later) -- the channel learns immediately that the open is
+    # unconfirmed, and learns it failed only once a real MT5 snapshot says so.
+    assert group_id is not None
     assert len(tm.trades) == 0
+    assert [e for e, _ in notifier.events] == ["open_pending"]
+    tm._pending[group_id].deadline_ts = 0
+    await tm._tick_once_account(ACCOUNT)
     events = [kwargs for event, kwargs in notifier.events if event in ("open_aborted", "open_failed")]
     assert len(events) == 1
-    assert events[0].get("reason") in ("timeout", "mt5_timeout") or "timeout" in events[0].get("message", "").lower() \
-        or "no respondio" in events[0].get("message", "").lower()
+    assert events[0].get("reason") == "not_executed"
 
 
 def _fake_result(retcode):
@@ -2016,21 +2021,24 @@ async def test_open_group_timeout_still_reverts_when_order_genuinely_never_fille
 
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
-    assert group_id is None
+    assert group_id is not None  # pending, not dropped
     assert len(tm.trades) == 0
     assert len(sim.positions) == 0
+    tm._pending[group_id].deadline_ts = 0
+    await tm._tick_once_account(ACCOUNT)
+    assert len(sim.positions) == 0  # a timeout is never resent (the terminal has the order)
     events = [kwargs for event, kwargs in notifier.events if event == "open_failed"]
     assert len(events) == 1
-    # Must not falsely claim a revert happened when nothing needed reverting.
-    assert "se revirtieron" not in events[0]["message"].lower() or "no hab" in events[0]["message"].lower() \
-        or "no habia" in events[0]["message"].lower()
+    assert "verificado en mt5" in events[0]["message"].lower()
+    assert tm.find_active_group_for_symbol("XAUUSD", chat_id=None) is None
 
 
 @pytest.mark.asyncio
 async def test_open_group_timeout_on_second_leg_reconciles_first_leg_ticket_for_revert(monkeypatch):
     """When tp1 opens fine but runner times out AND genuinely never filled,
-    the real tp1 ticket (already known) must still get reverted -- this path
-    was already correct before the fix, must stay correct after."""
+    tp1 is no longer reverted (2026-10-05): closing it only paid the spread and
+    threw away a valid trade. It stays managed; once MT5 confirms the runner
+    never executed, the group is announced as tp1-only."""
     monkeypatch.setenv("MT5_CALL_TIMEOUT_SECONDS", "0.05")
     sim = SimuladorMT5()
     sim.price = 2500.0
@@ -2051,9 +2059,15 @@ async def test_open_group_timeout_on_second_leg_reconciles_first_leg_ticket_for_
 
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
-    assert group_id is None
-    assert len(tm.trades) == 0
-    assert len(sim.positions) == 0  # tp1 was correctly reverted
+    assert group_id is not None
+    assert [t.leg for t in tm.trades.values()] == ["tp1"]
+    assert len(sim.positions) == 1  # tp1 kept, under management
+    tm._pending[group_id].deadline_ts = 0
+    await tm._tick_once_account(ACCOUNT)
+    opened = [kwargs for event, kwargs in notifier.events if event == "group_opened"]
+    assert len(opened) == 1
+    assert "solo con tp1" in opened[0]["message"]
+    assert not [e for e, _ in notifier.events if e == "open_failed"]
 
 
 @pytest.mark.asyncio
@@ -2078,13 +2092,15 @@ async def test_open_group_notifies_open_failed_on_unexpected_exception_after_tp1
     real_order_send = sim.order_send
     call_count = {"n": 0}
 
-    def order_send_runner_raises(req):
+    def order_send_counting(req):
         call_count["n"] += 1
-        if call_count["n"] == 1:
-            return real_order_send(req)  # tp1 opens for real
-        raise RuntimeError("unexpected RPyC EOFError-like failure")
+        return real_order_send(req)
 
-    sim.order_send = order_send_runner_raises
+    def channel_names_raises():
+        raise RuntimeError("unexpected failure after both legs opened")
+
+    sim.order_send = order_send_counting
+    tm._channel_names = channel_names_raises
 
     group_id = await tm.open_group(ACCOUNT, symbol="XAUUSD", direction="BUY", sl=2490.0, tp1=2510.0, tp2=2530.0)
 
@@ -2094,7 +2110,6 @@ async def test_open_group_notifies_open_failed_on_unexpected_exception_after_tp1
     assert events[0]["reason"] == "unexpected_error"
     # tp1's real orphaned position must be surfaced, not silently lost.
     assert "si se abrieron en mt5" in events[0]["message"].lower()
-    assert len(sim.positions) == 1  # tp1 really is still open in MT5, unmanaged
 
 
 @pytest.mark.asyncio
