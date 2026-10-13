@@ -3,6 +3,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: atp-redis
+    restart: unless-stopped
     ports:
       - "6380:6379"
     command: ["redis-server", "--appendonly", "yes"]
@@ -17,6 +18,7 @@ services:
   mt5_acct1:
     image: gmag11/metatrader5_vnc:2.3
     container_name: atp-mt5-acct1
+    restart: unless-stopped
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
       - PASSWORD=${MT5_WEB_PASS}
@@ -72,6 +74,7 @@ services:
     # usan por la red interna como mt5_acct2:8001 (host/port en ACCOUNTS_JSON).
     image: gmag11/metatrader5_vnc:2.3
     container_name: atp-mt5-acct2
+    restart: unless-stopped
     environment:
       - CUSTOM_USER=${MT5_WEB_USER}
       - PASSWORD=${MT5_WEB_PASS}
