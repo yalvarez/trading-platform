@@ -638,6 +638,24 @@ class TradeManager:
             )
             return None
 
+    ALL_LEGS = ("tp1", "runner")
+
+    def _account_legs(self, account: dict) -> tuple:
+        """Piernas que abre cada senal en esta cuenta (ACCOUNTS_JSON "legs").
+
+        Cuenta live de $130 (2026-10-19): con dos piernas de 0.01 cada senal
+        arriesgaba $30-42 y, ya sin balance, el runner fallaba por margen
+        (10019) y se revertia el grupo entero. ["tp1"] abre solo la pierna
+        que cierra completa en TP1. Ausente o invalido = las dos piernas.
+        """
+        legs = account.get("legs")
+        if legs is None:
+            return self.ALL_LEGS
+        if not isinstance(legs, list) or not legs or any(l not in self.ALL_LEGS for l in legs):
+            log.warning("[TM] cuenta %s: legs=%r invalido, se abren las dos piernas", account.get("name"), legs)
+            return self.ALL_LEGS
+        return tuple(l for l in self.ALL_LEGS if l in legs)
+
     def _leg_request(self, account: dict, group_id: int, leg: str, *, symbol: str, order_type: int, price: float,
                      sl: float, tp1: Optional[float], tp2: Optional[float]) -> dict:
         return {
@@ -744,7 +762,7 @@ class TradeManager:
                                       order_type: int, sl: float, tp1: Optional[float], tp2: Optional[float],
                                       price: float, chat_id: Optional[str], filling_modes: list) -> Optional[int]:
         tickets = {}
-        legs_order = ("tp1", "runner")
+        legs_order = self._account_legs(account)
         for leg in legs_order:
             req = self._leg_request(account, group_id, leg, symbol=symbol, order_type=order_type, price=price,
                                     sl=sl, tp1=tp1, tp2=tp2)
@@ -813,7 +831,7 @@ class TradeManager:
             self._insert_leg(account, group_id, leg, ticket, symbol=symbol, direction=direction, sl=sl,
                              tp1=tp1, tp2=tp2, entry_price=price, chat_id=chat_id)
         log.info("[TM] group %s opened: tp1=%s runner=%s symbol=%s dir=%s sl=%s tp1_price=%s tp2_price=%s",
-                  group_id, tickets["tp1"], tickets["runner"], symbol, direction, sl, tp1, tp2)
+                  group_id, tickets.get("tp1"), tickets.get("runner"), symbol, direction, sl, tp1, tp2)
         await self._notify_group_opened(account, group_id, symbol=symbol, direction=direction, sl=sl, tp1=tp1,
                                         tp2=tp2, entry_price=price, chat_id=chat_id)
         await self._persist_group(group_id)
@@ -2737,9 +2755,10 @@ class TradeManager:
                 return {"group_id": group_id, "status": "failed", "reason": "account_unresolved"}
             client = self.mt5._client_for(account)
             runner = next((t for t in legs if t.leg == "runner"), None)
-            if not runner and group_id in self._pending:
+            if not runner and (group_id in self._pending or "runner" not in self._account_legs(account)):
                 # Runner aun sin confirmar en MT5 (recibira BE al adoptarse, ver
-                # be_requested): proteger ya la pierna tp1 que si esta abierta.
+                # be_requested), o cuenta configurada sin runner: proteger ya la
+                # pierna tp1 que si esta abierta.
                 runner = next((t for t in legs if t.leg == "tp1"), None)
             if not runner:
                 await self._notify(
