@@ -25,7 +25,10 @@ services:
       - CUSTOM_USER=${MT5_WEB_USER}
       - PASSWORD=${MT5_WEB_PASS}
     ports:
-      - "3001:3000"
+      # VNC web (KasmVNC, basic auth sobre HTTP plano): solo loopback desde el
+      # incidente 2026-11-06. Acceso: ssh -L 3001:127.0.0.1:3001 illuminatis-vps
+      # y abrir http://localhost:3001
+      - "127.0.0.1:3001:3000"
       # Solo loopback: 8001 es el servidor RPyC de mt5linux en modo classic
       # (ejecucion de codigo arbitrario en la terminal = control total de la
       # cuenta). Estuvo publicado en 0.0.0.0 con decenas de conexiones
@@ -81,7 +84,8 @@ services:
       - CUSTOM_USER=${MT5_WEB_USER}
       - PASSWORD=${MT5_WEB_PASS}
     ports:
-      - "3003:3000"
+      # VNC solo loopback (ver mt5_acct1): ssh -L 3003:127.0.0.1:3003 illuminatis-vps
+      - "127.0.0.1:3003:3000"
       # Solo loopback, igual que mt5_acct1 (RPyC classic = control total de la
       # cuenta). Acceso manual: ssh -L 9082:127.0.0.1:9082 root@illuminatis-vps
       - "127.0.0.1:9082:8001"
@@ -106,8 +110,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./services/telegram_ingestor/telegram_ingestor.session:/app/services/telegram_ingestor/telegram_ingestor.session:rw
-    ports:
-      - "8070:8000"
+    # Sin "ports": el ingestor no sirve HTTP (antes publicaba 8070:8000 sin
+    # nada escuchando dentro).
 
   router_parser:
     build:
@@ -164,7 +168,10 @@ services:
     env_file:
       - .env
     ports:
-      - "8100:8100"
+      # Solo loopback: abre/cierra posiciones reales; nadie lo usa desde fuera
+      # (en sus logs solo habia escaneres de internet). Uso: curl en el VPS o
+      # ssh -L 8100:127.0.0.1:8100 illuminatis-vps
+      - "127.0.0.1:8100:8100"
     depends_on:
       mt5_acct1:
         condition: service_healthy
