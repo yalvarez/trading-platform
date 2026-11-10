@@ -17,6 +17,25 @@ services:
       timeout: 3s
       retries: 10
   # =========================
+  postgres:
+    # El trading-platform ya NO usa Postgres (config_db es solo env), pero este
+    # contenedor guarda bases de otros proyectos del VPS (promotores, jce_odoo,
+    # odoo_test, master-app-db). Se mantiene aqui para que compose lo gestione
+    # (como huerfano, un "up --remove-orphans" lo borraria).
+    image: postgres:15
+    container_name: atp-postgres
+    restart: always
+    # Sin "environment": el cluster ya esta inicializado en el volumen y la
+    # imagen solo usa POSTGRES_* al crear uno nuevo. No escribir contrasenas
+    # aqui: el repo es publico.
+    ports:
+      # Solo loopback: estuvo publicado en 0.0.0.0:7232 con un superusuario de
+      # contrasena conocida (incidente 2026-11-06). Acceso desde el PC:
+      #   ssh -L 7232:127.0.0.1:7232 illuminatis-vps  -> localhost:7232
+      - "127.0.0.1:7232:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  # =========================
   mt5_acct1:
     image: gmag11/metatrader5_vnc:2.3
     container_name: atp-mt5-acct1
@@ -205,6 +224,7 @@ services:
         condition: service_started
 
 volumes:
+  pgdata:
   redis_data:
   mt5_acct1_config:
   mt5_acct2_config:
