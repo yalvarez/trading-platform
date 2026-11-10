@@ -4,8 +4,10 @@ services:
     image: redis:7-alpine
     container_name: atp-redis
     restart: unless-stopped
-    ports:
-      - "6380:6379"
+    # Sin "ports": Redis solo se usa por la red interna de compose
+    # (redis:6379). Estuvo publicado en 0.0.0.0:6380 sin contrasena y un
+    # gusano lo uso para instalar un minero de Monero y un escaner de Redis
+    # (incidente 2026-11-06). No volver a publicarlo.
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
